@@ -1,0 +1,3 @@
+comment = 'Postgresql sharding via pg_pathman, postgres_fdw, LR and others'
+default_version = '0.0.1'
+relocatable = false
