@@ -1,36 +1,46 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_shardman" to load this file. \quit
 
--- types & tables
-
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'remove_node');
 -- command status
-CREATE TYPE cmd_status AS ENUM ('waiting', 'failed', 'success');
+CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'in progress', 'success');
 
 CREATE TABLE cmd_log (
-	id serial PRIMARY KEY,
+	id bigserial PRIMARY KEY,
 	cmd_type cmd NOT NULL,
-	cmd_status cmd_status DEFAULT 'waiting' NOT NULL
+	status cmd_status DEFAULT 'waiting' NOT NULL
 );
+
+-- Notify shardman master bgw about new commands
+CREATE FUNCTION notify_shardmaster() RETURNS trigger AS $$
+BEGIN
+	NOTIFY shardman_cmd_log_update;
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER cmd_log_update
+	AFTER INSERT ON cmd_log
+	FOR EACH STATEMENT
+	EXECUTE PROCEDURE notify_shardmaster();
+
 
 -- probably better to keep opts in an array field, but working with arrays from
 -- libpq is not very handy
 CREATE TABLE cmd_opts (
-	cmd_id int REFERENCES cmd_log(id),
+	cmd_id bigint REFERENCES cmd_log(id),
 	opt text NOT NULL
 );
 
--- Probably later we should provide as flexible interface as libpq does for
--- specifying connstrings
+-- list of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
 	connstring text
 );
 
--- functions
+-- Interface functions
 
--- TODO: try to connect immediately and ensure that its id (if any) is not
+-- TODO: during the initial connection, ensure that nodes id (if any) is not
 -- present in the cluster
 CREATE FUNCTION add_node(connstring text) RETURNS void AS $$
 DECLARE

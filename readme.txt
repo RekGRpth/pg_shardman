@@ -11,6 +11,5 @@ add to postgresql.conf
 shared_preload_libraries = '$libdir/pg_shardman'
 
 restart postgres server and run
-create schema if not exists shardman;
 drop extension if exists pg_shardman;
-create extension pg_shardman with schema shardman;
+create extension pg_shardman;

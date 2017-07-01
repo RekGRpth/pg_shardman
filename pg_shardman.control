@@ -1,3 +1,7 @@
 comment = 'Postgresql sharding via pg_pathman, postgres_fdw, LR and others'
 default_version = '0.0.1'
+# TODO: make it relocatable; for that, we need
+# * learn the scheme when connecting from another node
+# * somehow avoid @extschema@ at init sql at all
 relocatable = false
+schema = shardman
