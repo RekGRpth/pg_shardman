@@ -26,6 +26,8 @@
 #include "commands/extension.h"
 #include "libpq-fe.h"
 
+#include "pg_shardman.h"
+
 
 /* ensure that extension won't load against incompatible version of Postgres */
 PG_MODULE_MAGIC;
@@ -35,10 +37,8 @@ typedef struct Cmd
 	int64 id;
 	char *cmd_type;
 	char *status;
+	char **opts; /* array of n options, opts[n] is NULL */
 } Cmd;
-
-extern void _PG_init(void);
-extern void shardmaster_main(Datum main_arg);
 
 static Cmd *next_cmd(void);
 static void update_cmd_status(int64 id, const char *new_status);
@@ -132,10 +132,13 @@ shardmaster_main(Datum main_arg)
 	/* main loop */
 	while (!got_sigterm)
 	{
+		/* TODO: new mem ctxt for every command */
 		while ((cmd = next_cmd()) != NULL)
 		{
 			update_cmd_status(cmd->id, "in progress");
-			elog(LOG, "Working on command %ld, %s", cmd->id, cmd->cmd_type);
+			elog(LOG, "Working on command %ld, %s, opts are", cmd->id, cmd->cmd_type);
+			for (char **opts = cmd->opts; *opts; opts++)
+				elog(LOG, "%s", *opts);
 			update_cmd_status(cmd->id, "success");
 		}
 		wait_notify(conn);
@@ -239,24 +242,44 @@ next_cmd(void)
 		" status = 'in progress') t2 using (id);";
 	e = SPI_execute(cmd_sql, true, 0);
 	if (e < 0)
-	{
 		elog(FATAL, "Stmt failed: %s", cmd_sql);
-	}
 
 	if (SPI_processed > 0)
 	{
 		HeapTuple tuple = SPI_tuptable->vals[0];
 		TupleDesc rowdesc = SPI_tuptable->tupdesc;
 		bool isnull;
-		const char *cmd_type = (SPI_getvalue(tuple, rowdesc,
-											 SPI_fnumber(rowdesc, "cmd_type")));
+		uint64 i;
 
+		/* copy the command itself to callee context */
 		MemoryContext spicxt = MemoryContextSwitchTo(oldcxt);
 		cmd = palloc(sizeof(Cmd));
 		cmd->id = DatumGetInt64(SPI_getbinval(tuple, rowdesc,
 											  SPI_fnumber(rowdesc, "id"),
 											  &isnull));
-		cmd->cmd_type = pstrdup(cmd_type);
+		cmd->cmd_type = SPI_getvalue(tuple, rowdesc,
+									 SPI_fnumber(rowdesc, "cmd_type"));
+		MemoryContextSwitchTo(spicxt);
+
+		/* Now get options. cmd_sql will be freed by SPI_finish */
+		cmd_sql = psprintf("select opt from shardman.cmd_opts where"
+						   " cmd_id = %ld order by id;", cmd->id);
+		e = SPI_execute(cmd_sql, true, 0);
+		if (e < 0)
+			elog(FATAL, "Stmt failed: %s", cmd_sql);
+
+		MemoryContextSwitchTo(oldcxt);
+		/* +1 for NULL in the end */
+		cmd->opts = palloc((SPI_processed + 1) * sizeof(char*));
+		for (i = 0; i < SPI_processed; i++)
+		{
+			tuple = SPI_tuptable->vals[i];
+			rowdesc = SPI_tuptable->tupdesc;
+			cmd->opts[i] = SPI_getvalue(tuple, rowdesc,
+										SPI_fnumber(rowdesc, "opt"));
+		}
+		cmd->opts[i] = NULL;
+
 		MemoryContextSwitchTo(spicxt);
 	}
 

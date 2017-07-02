@@ -27,7 +27,9 @@ CREATE TRIGGER cmd_log_inserts
 
 -- probably better to keep opts in an array field, but working with arrays from
 -- libpq is not very handy
+-- opts must be inserted sequentially, we order by them by id
 CREATE TABLE cmd_opts (
+	id bigserial PRIMARY KEY,
 	cmd_id bigint REFERENCES cmd_log(id),
 	opt text NOT NULL
 );
@@ -48,7 +50,7 @@ DECLARE
 BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'add_node')
 										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (c_id, connstring);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, connstring);
 END
 $$ LANGUAGE plpgsql;
 
