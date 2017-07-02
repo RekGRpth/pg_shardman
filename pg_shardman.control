@@ -5,3 +5,4 @@ default_version = '0.0.1'
 # * somehow avoid @extschema@ at init sql at all
 relocatable = false
 schema = shardman
+requires = 'pg_pathman, postgres_fdw'

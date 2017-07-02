@@ -19,7 +19,7 @@ BEGIN
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
-CREATE TRIGGER cmd_log_update
+CREATE TRIGGER cmd_log_inserts
 	AFTER INSERT ON cmd_log
 	FOR EACH STATEMENT
 	EXECUTE PROCEDURE notify_shardmaster();
