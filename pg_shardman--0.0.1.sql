@@ -4,7 +4,7 @@
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'remove_node');
 -- command status
-CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'in progress', 'success');
+CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress', 'success');
 
 CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
@@ -40,6 +40,31 @@ CREATE TABLE nodes (
 	connstring text
 );
 
+-- Currently it is used just to store node id, in general we can keep any local
+-- node metadata here. If is ever used extensively, probably hstore suits better.
+CREATE TABLE local_meta (
+	k text NOT NULL, -- key
+	v text -- value
+);
+INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
+
+-- Internal functions
+
+-- Get local node id. NULL means node is not in the cluster yet.
+CREATE FUNCTION get_node_id() RETURNS int AS $$
+	SELECT v::int FROM @extschema@.local_meta WHERE k = 'node_id';
+$$ LANGUAGE sql;
+
+-- Exclude node from the cluster
+CREATE FUNCTION reset_node_id() RETURNS void AS $$
+	UPDATE @extschema@.local_meta SET v = NULL WHERE k = 'node_id';
+$$ LANGUAGE sql;
+
+-- Set local node id.
+CREATE FUNCTION set_node_id(node_id int) RETURNS void AS $$
+	UPDATE @extschema@.local_meta SET v = node_id WHERE k = 'node_id';
+$$ LANGUAGE sql;
+
 -- Interface functions
 
 -- TODO: during the initial connection, ensure that nodes id (if any) is not
@@ -52,10 +77,4 @@ BEGIN
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, connstring);
 END
-$$ LANGUAGE plpgsql;
-
-CREATE FUNCTION pg_shardman_hello() RETURNS VOID AS	$$
-BEGIN
-	RAISE NOTICE 'Aye, hi from shardman!';
-END;
 $$ LANGUAGE plpgsql;

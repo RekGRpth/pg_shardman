@@ -46,7 +46,10 @@ static PGconn *listen_cmd_log_inserts(void);
 static void wait_notify(PGconn *conn);
 static void shardmaster_sigterm(SIGNAL_ARGS);
 static void shardmaster_sigusr1(SIGNAL_ARGS);
-static void pg_shardman_installed(void);
+static void check_for_sigterm(void);
+static void pg_shardman_installed_local(void);
+static void add_node(Cmd *cmd);
+static bool node_in_cluster(int id);
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sigterm = false;
@@ -55,6 +58,13 @@ static volatile sig_atomic_t got_sigusr1 = false;
 /* GUC variables */
 static bool shardman_master = false;
 static char *shardman_master_dbname = "postgres";
+static int shardman_cmd_retry_naptime = 10000;
+
+/* just global vars */
+/* Connection to local server for LISTEN notifications. Is is global for easy
+ * cleanup after receiving SIGTERM.
+ */
+static PGconn *conn;
 
 /*
  * Entrypoint of the module. Define variables and register background worker.
@@ -91,6 +101,17 @@ _PG_init()
 		NULL, NULL, NULL
 		);
 
+	DefineCustomIntVariable("shardman.cmd_retry_naptime",
+							"Sleep time in millisec between retrying to execute failing command",
+							NULL,
+							&shardman_cmd_retry_naptime,
+							10000,
+							0,
+							INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
 	if (shardman_master)
 	{
 		/* register shardmaster */
@@ -113,13 +134,12 @@ void
 shardmaster_main(Datum main_arg)
 {
 	Cmd *cmd;
-	PGconn     *conn;
 	elog(LOG, "Shardmaster started");
 
 	/* Connect to the database to use SPI*/
 	BackgroundWorkerInitializeConnection(shardman_master_dbname, NULL);
 	/* sanity check */
-	pg_shardman_installed();
+	pg_shardman_installed_local();
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGTERM, shardmaster_sigterm);
@@ -130,7 +150,7 @@ shardmaster_main(Datum main_arg)
 	conn = listen_cmd_log_inserts();
 
 	/* main loop */
-	while (!got_sigterm)
+	while (1948)
 	{
 		/* TODO: new mem ctxt for every command */
 		while ((cmd = next_cmd()) != NULL)
@@ -139,20 +159,15 @@ shardmaster_main(Datum main_arg)
 			elog(LOG, "Working on command %ld, %s, opts are", cmd->id, cmd->cmd_type);
 			for (char **opts = cmd->opts; *opts; opts++)
 				elog(LOG, "%s", *opts);
-			update_cmd_status(cmd->id, "success");
+			if (strcmp(cmd->cmd_type, "add_node") == 0)
+				add_node(cmd);
+			else
+				elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
 		wait_notify(conn);
-		if (got_sigusr1)
-		{
-			elog(LOG, "SIGUSR1 arrived, aborting current command");
-			update_cmd_status(cmd->id, "canceled");
-			got_sigusr1 = false;
-		}
+		check_for_sigterm();
 	}
 
-	elog(LOG, "Shardmaster received SIGTERM, exiting");
-	PQfinish(conn);
-	proc_exit(0);
 }
 
 /*
@@ -321,7 +336,7 @@ update_cmd_status(int64 id, const char *new_status)
  * this point
  */
 static void
-pg_shardman_installed(void)
+pg_shardman_installed_local(void)
 {
 	bool installed = true;
 
@@ -358,4 +373,142 @@ static void
 shardmaster_sigusr1(SIGNAL_ARGS)
 {
 	got_sigusr1 = true;
+}
+
+/*
+ * Cleanup and exit in case of SIGTERM
+ */
+static void
+check_for_sigterm(void)
+{
+	if (got_sigterm)
+	{
+		elog(LOG, "Shardmaster received SIGTERM, exiting");
+		PQfinish(conn);
+		proc_exit(0);
+	}
+}
+
+/*
+ * Adding node consists of
+ * - verifying that the node is not present in the cluster at the moment
+ * - subscription creation
+ * - setting node id
+ * - adding node to 'nodes' table
+ */
+static void add_node(Cmd *cmd)
+{
+	PGconn *conn = NULL;
+	const char *conninfo = cmd->opts[0];
+    PGresult *res = NULL;
+	bool pg_shardman_installed;
+
+	elog(LOG, "Adding node %s", conninfo);
+	/* Try to execute command indefinitely until it succeeded or canceled */
+	while (!got_sigusr1 && !got_sigterm)
+	{
+		conn = PQconnectdb(conninfo);
+		if (PQstatus(conn) != CONNECTION_OK)
+		{
+			elog(NOTICE, "Connection to add_node node failed: %s",
+				 PQerrorMessage(conn));
+			goto attempt_failed;
+		}
+
+		/* Check if our extension is installed on the node */
+		res = PQexec(conn,
+					 "select installed_version from pg_available_extensions"
+					 " where name = 'pg_shardman';");
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			elog(NOTICE, "Failed to check whether pg_shardman is installed on"
+				 " node to add%s", PQerrorMessage(conn));
+			goto attempt_failed;
+		}
+		pg_shardman_installed = PQntuples(res) == 1 && !PQgetisnull(res, 0, 0);
+		PQclear(res);
+
+		if (pg_shardman_installed)
+		{
+			/* extension is installed, so we have to check whether this node
+			 * is already in the cluster */
+			res = PQexec(conn, "select shardman.get_node_id();");
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			{
+				elog(NOTICE, "Failed to get node id, %s", PQerrorMessage(conn));
+				goto attempt_failed;
+			}
+			int node_id = atoi(PQgetvalue(res, 0, 0));
+			if (node_in_cluster(node_id))
+			{
+				elog(WARNING, "node %d with connstring %s is already in cluster,"
+					 " won't add it.", node_id, conninfo);
+				PQclear(res);
+				PQfinish(conn);
+				update_cmd_status(cmd->id, "failed");
+				return;
+			}
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+		update_cmd_status(cmd->id, "success");
+		return;
+
+attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
+		if (res != NULL)
+			PQclear(res);
+		if (conn != NULL)
+			PQfinish(conn);
+
+		elog(LOG, "Attempt to execute add_node failed, sleeping and retrying");
+		pg_usleep(shardman_cmd_retry_naptime * 1000);
+	}
+
+	check_for_sigterm();
+
+	/* Command canceled via sigusr1 */
+	elog(LOG, "Command %ld canceled", cmd->id);
+	update_cmd_status(cmd->id, "canceled");
+	got_sigusr1 = false;
+	return;
+}
+
+/*
+ * Returns true, if node 'id' is in the cluster, false otherwise.
+ */
+static bool
+node_in_cluster(int id)
+{
+	int e;
+	char *sql = "select id from shardman.nodes;";
+	bool res = false;
+	HeapTuple tuple;
+	TupleDesc rowdesc;
+	uint64 i;
+	bool isnull;
+
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	e = SPI_exec(sql, 0);
+	if (e < 0)
+		elog(FATAL, "Stmt failed: %s", sql);
+
+	rowdesc = SPI_tuptable->tupdesc;
+	for (i = 0; i < SPI_processed; i++)
+	{
+		tuple = SPI_tuptable->vals[i];
+		if (id == DatumGetInt32(SPI_getbinval(tuple, rowdesc,
+											  SPI_fnumber(rowdesc, "id"),
+											  &isnull)))
+			res = true;
+	}
+
+	PopActiveSnapshot();
+	SPI_finish();
+	CommitTransactionCommand();
+
+	return res;
 }
