@@ -43,6 +43,7 @@ typedef struct Cmd
 static Cmd *next_cmd(void);
 static void update_cmd_status(int64 id, const char *new_status);
 static PGconn *listen_cmd_log_inserts(void);
+static void publicate_metadata(void);
 static void wait_notify(PGconn *conn);
 static void shardmaster_sigterm(SIGNAL_ARGS);
 static void shardmaster_sigusr1(SIGNAL_ARGS);
@@ -60,11 +61,11 @@ static bool shardman_master = false;
 static char *shardman_master_dbname = "postgres";
 static int shardman_cmd_retry_naptime = 10000;
 
-/* just global vars */
+/* Just global vars. */
 /* Connection to local server for LISTEN notifications. Is is global for easy
  * cleanup after receiving SIGTERM.
  */
-static PGconn *conn;
+static PGconn *conn = NULL;
 
 /*
  * Entrypoint of the module. Define variables and register background worker.
@@ -125,6 +126,7 @@ _PG_init()
 		shardmaster_worker.bgw_notify_pid = 0;
 		RegisterBackgroundWorker(&shardmaster_worker);
 	}
+	/* TODO: clean up publications if we were master before */
 }
 
 /*
@@ -134,7 +136,7 @@ void
 shardmaster_main(Datum main_arg)
 {
 	Cmd *cmd;
-	elog(LOG, "Shardmaster started");
+	shmn_elog(LOG, "Shardmaster started");
 
 	/* Connect to the database to use SPI*/
 	BackgroundWorkerInitializeConnection(shardman_master_dbname, NULL);
@@ -147,6 +149,7 @@ shardmaster_main(Datum main_arg)
     /* We're now ready to receive signals */
     BackgroundWorkerUnblockSignals();
 
+	publicate_metadata();
 	conn = listen_cmd_log_inserts();
 
 	/* main loop */
@@ -156,18 +159,41 @@ shardmaster_main(Datum main_arg)
 		while ((cmd = next_cmd()) != NULL)
 		{
 			update_cmd_status(cmd->id, "in progress");
-			elog(LOG, "Working on command %ld, %s, opts are", cmd->id, cmd->cmd_type);
+			shmn_elog(LOG, "Working on command %ld, %s, opts are",
+				 cmd->id, cmd->cmd_type);
 			for (char **opts = cmd->opts; *opts; opts++)
-				elog(LOG, "%s", *opts);
+				shmn_elog(LOG, "%s", *opts);
 			if (strcmp(cmd->cmd_type, "add_node") == 0)
 				add_node(cmd);
 			else
-				elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
+				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
 		wait_notify(conn);
 		check_for_sigterm();
 	}
 
+}
+
+/*
+ * Create publication on tables with metadata.
+ */
+void
+publicate_metadata(void)
+{
+	const char *cmd_sql = "select shardman.create_meta_pub();";
+	int e;
+
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	e = SPI_execute(cmd_sql, true, 0);
+	if (e < 0)
+		shmn_elog(FATAL, "Stmt failed: %s", cmd_sql);
+
+	PopActiveSnapshot();
+	SPI_finish();
+	CommitTransactionCommand();
 }
 
 /*
@@ -177,7 +203,6 @@ shardmaster_main(Datum main_arg)
 PGconn *
 listen_cmd_log_inserts(void)
 {
-	PGconn *conn;
 	char *conninfo;
 	PGresult   *res;
 
@@ -186,13 +211,13 @@ listen_cmd_log_inserts(void)
 	pfree(conninfo);
 	/* Check to see that the backend connection was successfully made */
 	if (PQstatus(conn) != CONNECTION_OK)
-		elog(FATAL, "Connection to database failed: %s",
+		shmn_elog(FATAL, "Connection to local database failed: %s",
 			 PQerrorMessage(conn));
 
 	res = PQexec(conn, "LISTEN shardman_cmd_log_update");
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		elog(FATAL, "LISTEN command failed: %s", PQerrorMessage(conn));
+		shmn_elog(FATAL, "LISTEN command failed: %s", PQerrorMessage(conn));
 	}
     PQclear(res);
 
@@ -212,7 +237,7 @@ wait_notify(PGconn *conn)
 
 	sock = PQsocket(conn);
 	if (sock < 0)
-		elog(FATAL, "Couldn't get sock from pgconn");
+		shmn_elog(FATAL, "Couldn't get sock from pgconn");
 
 	FD_ZERO(&input_mask);
 	FD_SET(sock, &input_mask);
@@ -221,14 +246,14 @@ wait_notify(PGconn *conn)
 	{
 		if (errno == EINTR)
 			return; /* signal has arrived */
-		elog(FATAL, "select() failed: %s", strerror(errno));
+		shmn_elog(FATAL, "select() failed: %s", strerror(errno));
 	}
 
 	PQconsumeInput(conn);
 	/* eat all notifications at once */
 	while ((notify = PQnotifies(conn)) != NULL)
 	{
-		elog(LOG, "NOTIFY %s received from backend PID %d",
+		shmn_elog(LOG, "NOTIFY %s received from backend PID %d",
 			 notify->relname, notify->be_pid);
 		PQfreemem(notify);
 	}
@@ -257,7 +282,7 @@ next_cmd(void)
 		" status = 'in progress') t2 using (id);";
 	e = SPI_execute(cmd_sql, true, 0);
 	if (e < 0)
-		elog(FATAL, "Stmt failed: %s", cmd_sql);
+		shmn_elog(FATAL, "Stmt failed: %s", cmd_sql);
 
 	if (SPI_processed > 0)
 	{
@@ -281,7 +306,7 @@ next_cmd(void)
 						   " cmd_id = %ld order by id;", cmd->id);
 		e = SPI_execute(cmd_sql, true, 0);
 		if (e < 0)
-			elog(FATAL, "Stmt failed: %s", cmd_sql);
+			shmn_elog(FATAL, "Stmt failed: %s", cmd_sql);
 
 		MemoryContextSwitchTo(oldcxt);
 		/* +1 for NULL in the end */
@@ -323,7 +348,7 @@ update_cmd_status(int64 id, const char *new_status)
 	pfree(sql);
 	if (e < 0)
 	{
-		elog(FATAL, "Stmt failed: %s", sql);
+		shmn_elog(FATAL, "Stmt failed: %s", sql);
 	}
 
 	PopActiveSnapshot();
@@ -345,12 +370,13 @@ pg_shardman_installed_local(void)
 	if (get_extension_oid("pg_shardman", true) == InvalidOid)
 	{
 		installed = false;
-		elog(WARNING, "pg_shardman library is preloaded, but extenstion is not created");
+		shmn_elog(WARNING, "pg_shardman library is preloaded, but extenstion is not created");
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	/* shardmaster won't run without extension */
+	/* TODO: unregister bgw? */
 	if (!installed)
 		proc_exit(1);
 }
@@ -383,8 +409,9 @@ check_for_sigterm(void)
 {
 	if (got_sigterm)
 	{
-		elog(LOG, "Shardmaster received SIGTERM, exiting");
-		PQfinish(conn);
+		shmn_elog(LOG, "Shardmaster received SIGTERM, exiting");
+		if (conn != NULL)
+			PQfinish(conn);
 		proc_exit(0);
 	}
 }
@@ -402,15 +429,16 @@ static void add_node(Cmd *cmd)
 	const char *conninfo = cmd->opts[0];
     PGresult *res = NULL;
 	bool pg_shardman_installed;
+	int node_id;
 
-	elog(LOG, "Adding node %s", conninfo);
+	shmn_elog(LOG, "Adding node %s", conninfo);
 	/* Try to execute command indefinitely until it succeeded or canceled */
 	while (!got_sigusr1 && !got_sigterm)
 	{
 		conn = PQconnectdb(conninfo);
 		if (PQstatus(conn) != CONNECTION_OK)
 		{
-			elog(NOTICE, "Connection to add_node node failed: %s",
+			shmn_elog(NOTICE, "Connection to add_node node failed: %s",
 				 PQerrorMessage(conn));
 			goto attempt_failed;
 		}
@@ -421,7 +449,7 @@ static void add_node(Cmd *cmd)
 					 " where name = 'pg_shardman';");
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			elog(NOTICE, "Failed to check whether pg_shardman is installed on"
+			shmn_elog(NOTICE, "Failed to check whether pg_shardman is installed on"
 				 " node to add%s", PQerrorMessage(conn));
 			goto attempt_failed;
 		}
@@ -435,22 +463,37 @@ static void add_node(Cmd *cmd)
 			res = PQexec(conn, "select shardman.get_node_id();");
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			{
-				elog(NOTICE, "Failed to get node id, %s", PQerrorMessage(conn));
+				shmn_elog(NOTICE, "Failed to get node id, %s", PQerrorMessage(conn));
 				goto attempt_failed;
 			}
-			int node_id = atoi(PQgetvalue(res, 0, 0));
+			node_id = atoi(PQgetvalue(res, 0, 0));
+			PQclear(res);
 			if (node_in_cluster(node_id))
 			{
-				elog(WARNING, "node %d with connstring %s is already in cluster,"
+				shmn_elog(WARNING, "node %d with connstring %s is already in cluster,"
 					 " won't add it.", node_id, conninfo);
-				PQclear(res);
 				PQfinish(conn);
 				update_cmd_status(cmd->id, "failed");
 				return;
 			}
 		}
 
+		/* Now, when we are sure that node is not in the cluster, we reinstall
+		 * the extension to reset its state, whether is was installed before
+		 * or not.
+		 */
+		res = PQexec(conn, "drop extension if exists pg_shardman; "
+					 " create extension pg_shardman;");
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			shmn_elog(NOTICE, "Failed to reinstall pg_shardman, %s", PQerrorMessage(conn));
+			goto attempt_failed;
+		}
 		PQclear(res);
+
+		/* TODO */
+
+		/* done */
 		PQfinish(conn);
 		update_cmd_status(cmd->id, "success");
 		return;
@@ -461,14 +504,14 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 		if (conn != NULL)
 			PQfinish(conn);
 
-		elog(LOG, "Attempt to execute add_node failed, sleeping and retrying");
-		pg_usleep(shardman_cmd_retry_naptime * 1000);
+		shmn_elog(LOG, "Attempt to execute add_node failed, sleeping and retrying");
+		pg_usleep(shardman_cmd_retry_naptime * 1000L);
 	}
 
 	check_for_sigterm();
 
 	/* Command canceled via sigusr1 */
-	elog(LOG, "Command %ld canceled", cmd->id);
+	shmn_elog(LOG, "Command %ld canceled", cmd->id);
 	update_cmd_status(cmd->id, "canceled");
 	got_sigusr1 = false;
 	return;
@@ -481,7 +524,7 @@ static bool
 node_in_cluster(int id)
 {
 	int e;
-	char *sql = "select id from shardman.nodes;";
+	const char *sql = "select id from shardman.nodes;";
 	bool res = false;
 	HeapTuple tuple;
 	TupleDesc rowdesc;
@@ -492,9 +535,9 @@ node_in_cluster(int id)
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	e = SPI_exec(sql, 0);
+	e = SPI_execute(sql, true, 0);
 	if (e < 0)
-		elog(FATAL, "Stmt failed: %s", sql);
+		shmn_elog(FATAL, "Stmt failed: %s", sql);
 
 	rowdesc = SPI_tuptable->tupdesc;
 	for (i = 0; i < SPI_processed; i++)

@@ -12,5 +12,7 @@ for port in $master_port "${worker_ports[@]}"; do
     psql -p $port -c "drop extension if exists pg_shardman;"
     psql -p $port -c "create extension pg_shardman cascade;"
 done
+# to restart master bgw
+restart_nodes
 
 psql

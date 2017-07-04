@@ -1,8 +1,9 @@
 EXTENSION = pg_shardman        # the extension name
-DATA = pg_shardman--0.0.1.sql  # script files to install with CREATE EXTENSION
+# This file will be executed by CREATE EXTENSION, so let pgxs install it.
+DATA = pg_shardman--0.0.1.sql
 
 MODULE_big = pg_shardman
-OBJS = src/pg_shardman.o
+OBJS = src/pg_shardman.o src/pg_shardman_cleanup.o
 
 PG_CPPFLAGS += -Isrc/include
 

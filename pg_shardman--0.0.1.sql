@@ -50,6 +50,53 @@ INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
 
 -- Internal functions
 
+-- These tables will be replicated to worker nodes, notifying them about changes.
+-- Called on master.
+CREATE FUNCTION create_meta_pub() RETURNS void AS $$
+BEGIN
+	IF NOT EXISTS (SELECT * FROM pg_publication WHERE pubname = 'shardman_meta_pub') THEN
+		CREATE PUBLICATION shardman_meta_pub FOR TABLE shardman.nodes;
+	END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- These tables will be replicated to worker nodes, notifying them about changes.
+-- Called on worker nodes.
+CREATE FUNCTION create_meta_sub() RETURNS void AS $$
+BEGIN
+	IF NOT EXISTS (SELECT * FROM pg_publication WHERE pubname = 'shardman_meta_pub') THEN
+		CREATE PUBLICATION shardman_meta_pub FOR TABLE shardman.nodes;
+	END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Remove all our logical replication stuff in case of drop extension.
+-- Dropping extension cleanup is not that easy:
+--  - pg offers event triggers sql_drop, dd_command_end and ddl_command_start
+--  - sql_drop looks like what we need, but we we can't do it from deleting
+--    extension itself -- the trigger will be already deleted at the moment we
+--    need it.
+--  - same with dd_command_end
+--  - ddl_command_start apparently doesn't provide us with info what exactly
+--    is happening, I mean its impossible to learn with plpgsql what extension
+--    is deleting.
+--  - because of that I resort to C function which examines parse tree and if
+--    it is our extension is deleting, it calls plpgsql cleanup func
+CREATE OR REPLACE FUNCTION pg_shardman_cleanup() RETURNS void  AS $$
+DECLARE
+	pub RECORD;
+BEGIN
+	FOR pub IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'shardman_%' LOOP
+		EXECUTE 'DROP PUBLICATION ' || quote_ident(pub.pubname);
+	END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION pg_shardman_cleanup_c() RETURNS event_trigger
+    AS 'pg_shardman' LANGUAGE C;
+CREATE EVENT TRIGGER cleanup_lr_trigger ON ddl_command_start
+	WHEN TAG in ('DROP EXTENSION')
+	EXECUTE PROCEDURE pg_shardman_cleanup_c();
+
 -- Get local node id. NULL means node is not in the cluster yet.
 CREATE FUNCTION get_node_id() RETURNS int AS $$
 	SELECT v::int FROM @extschema@.local_meta WHERE k = 'node_id';
