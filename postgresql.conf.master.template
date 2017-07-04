@@ -1,0 +1,10 @@
+log_min_messages = INFO
+client_min_messages = LOG
+
+# for logical repl
+wal_level = logical
+
+shared_preload_libraries='pg_pathman, pg_shardman'
+
+shardman.master = on
+shardman.master_dbname = ars

@@ -1,0 +1,6 @@
+shared_preload_libraries='pg_pathman, pg_shardman'
+
+log_min_messages = INFO
+client_min_messages = LOG
+
+wal_level = logical
