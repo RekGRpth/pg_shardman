@@ -13,6 +13,8 @@ master_port=5432
 # declare -a worker_ports=()
 declare -a worker_datadirs=("${HOME}/postgres/data2")
 declare -a worker_ports=("5433")
+# declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3")
+# declare -a worker_ports=("5433" "5434")
 
 #------------------------------------------------------------
 PATH="$PATH:${pgpath}bin/"
@@ -37,6 +39,7 @@ function stop_nodes()
 
 function restart_nodes()
 {
+    echo "Restarting nodes"
     for ((i=0; i<${#worker_datadirs[@]}; ++i)); do
 	datadir="${worker_datadirs[i]}"
 	port="${worker_ports[i]}"

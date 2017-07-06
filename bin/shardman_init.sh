@@ -15,7 +15,7 @@ for datadir in $master_datadir "${worker_datadirs[@]}"; do
 done
 
 cat postgresql.conf.master.template >> ${master_datadir}/postgresql.conf
-for worker_datadir in $worker_datadirs; do
+for worker_datadir in "${worker_datadirs[@]}"; do
     cat postgresql.conf.worker.template >> ${worker_datadir}/postgresql.conf
 done
 

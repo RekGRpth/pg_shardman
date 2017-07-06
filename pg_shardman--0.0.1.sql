@@ -1,6 +1,33 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_shardman" to load this file. \quit
 
+-- Functions here use some gucs defined in .so, so we have to ensure that the
+-- library is actually loaded.
+DO $$
+BEGIN
+-- Yes, malicious user might have another extension containing 'pg_shardman'...
+-- Probably better just call no-op func from the library
+    IF strpos(current_setting('shared_preload_libraries'), 'pg_shardman') = 0 THEN
+        RAISE EXCEPTION 'pg_shardman must be loaded via shared_preload_libraries. Refusing to proceed.';
+    END IF;
+END
+$$;
+
+-- list of nodes present in the cluster
+CREATE TABLE nodes (
+	id serial PRIMARY KEY,
+	connstring text,
+	active bool NOT NULL -- if false, we haven't yet finished adding it
+);
+
+-- Currently it is used just to store node id, in general we can keep any local
+-- node metadata here. If is ever used extensively, probably hstore suits better.
+CREATE TABLE local_meta (
+	k text NOT NULL, -- key
+	v text -- value
+);
+INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
+
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'remove_node');
 -- command status
@@ -9,7 +36,10 @@ CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress', 
 CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
 	cmd_type cmd NOT NULL,
-	status cmd_status DEFAULT 'waiting' NOT NULL
+	status cmd_status DEFAULT 'waiting' NOT NULL,
+	-- only for add_node cmd -- generated id for newly added node. Cleaner
+	-- to keep that is separate table...
+	node_id int REFERENCES nodes(id)
 );
 
 -- Notify shardman master bgw about new commands
@@ -34,19 +64,6 @@ CREATE TABLE cmd_opts (
 	opt text NOT NULL
 );
 
--- list of nodes present in the cluster
-CREATE TABLE nodes (
-	id serial PRIMARY KEY,
-	connstring text
-);
-
--- Currently it is used just to store node id, in general we can keep any local
--- node metadata here. If is ever used extensively, probably hstore suits better.
-CREATE TABLE local_meta (
-	k text NOT NULL, -- key
-	v text -- value
-);
-INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
 
 -- Internal functions
 
@@ -63,11 +80,45 @@ $$ LANGUAGE plpgsql;
 -- These tables will be replicated to worker nodes, notifying them about changes.
 -- Called on worker nodes.
 CREATE FUNCTION create_meta_sub() RETURNS void AS $$
+DECLARE
+	master_connstring text;
 BEGIN
-	IF NOT EXISTS (SELECT * FROM pg_publication WHERE pubname = 'shardman_meta_pub') THEN
-		CREATE PUBLICATION shardman_meta_pub FOR TABLE shardman.nodes;
-	END IF;
+	SELECT pg_settings.setting into master_connstring from pg_settings
+		WHERE NAME = 'shardman.master_connstring';
+	-- Note that 'CONNECTION $1...' USING master_connstring won't work here
+	EXECUTE format('CREATE SUBSCRIPTION shardman_meta_sub CONNECTION %L PUBLICATION shardman_meta_pub', master_connstring);
 END;
+$$ LANGUAGE plpgsql;
+
+-- If for cmd cmd_id we haven't yet inserted new node, do that; mark it as passive
+-- for now, we still need to setup lr and set its id on the node itself
+-- Return generated or existing node id
+CREATE FUNCTION insert_node(connstring text, cmd_id bigint) RETURNS int AS $$
+DECLARE
+	n_id int;
+BEGIN
+	SELECT node_id FROM @extschema@.cmd_log INTO n_id WHERE id = cmd_id;
+	IF n_id IS NULL THEN
+		INSERT INTO @extschema@.nodes VALUES (DEFAULT, quote_literal(connstring), false)
+			RETURNING id INTO n_id;
+		UPDATE @extschema@.cmd_log SET node_id = n_id WHERE id = cmd_id;
+	END IF;
+	RETURN n_id;
+END
+$$ LANGUAGE plpgsql;
+
+-- Create logical pgoutput replication slot, if not exists
+CREATE FUNCTION create_repslot(slot_name text) RETURNS void AS $$
+DECLARE
+	slot_exists bool;
+BEGIN
+	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
+				   WHERE slot_name=%L)', slot_name) INTO slot_exists;
+	IF NOT slot_exists THEN
+		EXECUTE format('SELECT * FROM pg_create_logical_replication_slot(%L, %L)',
+					   slot_name, 'pgoutput');
+	END IF;
+END
 $$ LANGUAGE plpgsql;
 
 -- Remove all our logical replication stuff in case of drop extension.
@@ -84,10 +135,17 @@ $$ LANGUAGE plpgsql;
 --    it is our extension is deleting, it calls plpgsql cleanup func
 CREATE OR REPLACE FUNCTION pg_shardman_cleanup() RETURNS void  AS $$
 DECLARE
-	pub RECORD;
+	pub record;
+	sub record;
 BEGIN
 	FOR pub IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'shardman_%' LOOP
-		EXECUTE 'DROP PUBLICATION ' || quote_ident(pub.pubname);
+		EXECUTE format('DROP PUBLICATION %I', pub.pubname);
+	END LOOP;
+	FOR sub IN SELECT subname FROM pg_subscription WHERE subname LIKE 'shardman_%' LOOP
+		-- we are managing rep slots manually, so we need to detach it beforehand
+		EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', sub.subname);
+		EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', sub.subname);
+		EXECUTE format('DROP SUBSCRIPTION %I', sub.subname);
 	END LOOP;
 END;
 $$ LANGUAGE plpgsql;
@@ -111,6 +169,7 @@ $$ LANGUAGE sql;
 CREATE FUNCTION set_node_id(node_id int) RETURNS void AS $$
 	UPDATE @extschema@.local_meta SET v = node_id WHERE k = 'node_id';
 $$ LANGUAGE sql;
+
 
 -- Interface functions
 

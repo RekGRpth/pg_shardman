@@ -43,14 +43,16 @@ typedef struct Cmd
 static Cmd *next_cmd(void);
 static void update_cmd_status(int64 id, const char *new_status);
 static PGconn *listen_cmd_log_inserts(void);
-static void publicate_metadata(void);
+static char *void_spi(char *sql);
 static void wait_notify(PGconn *conn);
 static void shardmaster_sigterm(SIGNAL_ARGS);
 static void shardmaster_sigusr1(SIGNAL_ARGS);
 static void check_for_sigterm(void);
 static void pg_shardman_installed_local(void);
 static void add_node(Cmd *cmd);
+static int insert_node(const char *connstring, int64 cmd_id);
 static bool node_in_cluster(int id);
+static void activate_node(int64 cmd_id, int node_id);
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sigterm = false;
@@ -59,6 +61,7 @@ static volatile sig_atomic_t got_sigusr1 = false;
 /* GUC variables */
 static bool shardman_master = false;
 static char *shardman_master_dbname = "postgres";
+static char *shardman_master_connstring = "";
 static int shardman_cmd_retry_naptime = 10000;
 
 /* Just global vars. */
@@ -92,11 +95,23 @@ _PG_init()
 
 	DefineCustomStringVariable(
 		"shardman.master_dbname",
-		"Name of the database with extension on master node, shardmaster bgw"
-		"will connect to it",
+		"Active only if shardman.master is on. Name of the database with"
+		" on master node, shardmaster bgw will connect to it",
 		NULL,
 		&shardman_master_dbname,
 		"postgres",
+		PGC_POSTMASTER,
+		0,
+		NULL, NULL, NULL
+		);
+
+	DefineCustomStringVariable(
+		"shardman.master_connstring",
+		"Active only if shardman.master is on. Connstring to reach master from"
+		"worker nodes to set up logical replication",
+		NULL,
+		&shardman_master_connstring,
+		"",
 		PGC_POSTMASTER,
 		0,
 		NULL, NULL, NULL
@@ -120,7 +135,8 @@ _PG_init()
 		shardmaster_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
 		shardmaster_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-		shardmaster_worker.bgw_restart_time = 10;
+		/* shardmaster_worker.bgw_restart_time = 10; */
+		shardmaster_worker.bgw_restart_time = BGW_NEVER_RESTART;
 		sprintf(shardmaster_worker.bgw_library_name, "pg_shardman");
 		sprintf(shardmaster_worker.bgw_function_name, "shardmaster_main");
 		shardmaster_worker.bgw_notify_pid = 0;
@@ -149,7 +165,7 @@ shardmaster_main(Datum main_arg)
     /* We're now ready to receive signals */
     BackgroundWorkerUnblockSignals();
 
-	publicate_metadata();
+	void_spi("select shardman.create_meta_pub();");
 	conn = listen_cmd_log_inserts();
 
 	/* main loop */
@@ -175,25 +191,19 @@ shardmaster_main(Datum main_arg)
 }
 
 /*
- * Create publication on tables with metadata.
+ * Execute statement via SPI if without looking at the result. Returns the
+ * query itself.
  */
-void
-publicate_metadata(void)
+char *void_spi(char *sql)
 {
-	const char *cmd_sql = "select shardman.create_meta_pub();";
 	int e;
 
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
-
-	e = SPI_execute(cmd_sql, true, 0);
+	SPI_PROLOG;
+	e = SPI_exec(sql, 0);
 	if (e < 0)
-		shmn_elog(FATAL, "Stmt failed: %s", cmd_sql);
-
-	PopActiveSnapshot();
-	SPI_finish();
-	CommitTransactionCommand();
+		shmn_elog(FATAL, "Stmt failed: %s", sql);
+	SPI_EPILOG;
+	return sql;
 }
 
 /*
@@ -203,12 +213,12 @@ publicate_metadata(void)
 PGconn *
 listen_cmd_log_inserts(void)
 {
-	char *conninfo;
+	char *connstring;
 	PGresult   *res;
 
-	conninfo = psprintf("dbname = %s", shardman_master_dbname);
-	conn = PQconnectdb(conninfo);
-	pfree(conninfo);
+	connstring = psprintf("dbname = %s", shardman_master_dbname);
+	conn = PQconnectdb(connstring);
+	pfree(connstring);
 	/* Check to see that the backend connection was successfully made */
 	if (PQstatus(conn) != CONNECTION_OK)
 		shmn_elog(FATAL, "Connection to local database failed: %s",
@@ -268,21 +278,19 @@ wait_notify(PGconn *conn)
 Cmd *
 next_cmd(void)
 {
-	const char *cmd_sql;
+	const char *sql;
 	Cmd *cmd = NULL;
 	MemoryContext oldcxt = CurrentMemoryContext;
 	int e;
 
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
+	SPI_PROLOG;
 
-	cmd_sql = "select * from shardman.cmd_log t1 join"
+	sql = "select * from shardman.cmd_log t1 join"
 		" (select MIN(id) id from shardman.cmd_log where status = 'waiting' OR"
 		" status = 'in progress') t2 using (id);";
-	e = SPI_execute(cmd_sql, true, 0);
+	e = SPI_execute(sql, true, 0);
 	if (e < 0)
-		shmn_elog(FATAL, "Stmt failed: %s", cmd_sql);
+		shmn_elog(FATAL, "Stmt failed: %s", sql);
 
 	if (SPI_processed > 0)
 	{
@@ -301,12 +309,12 @@ next_cmd(void)
 									 SPI_fnumber(rowdesc, "cmd_type"));
 		MemoryContextSwitchTo(spicxt);
 
-		/* Now get options. cmd_sql will be freed by SPI_finish */
-		cmd_sql = psprintf("select opt from shardman.cmd_opts where"
+		/* Now get options. sql will be freed by SPI_finish */
+		sql = psprintf("select opt from shardman.cmd_opts where"
 						   " cmd_id = %ld order by id;", cmd->id);
-		e = SPI_execute(cmd_sql, true, 0);
+		e = SPI_execute(sql, true, 0);
 		if (e < 0)
-			shmn_elog(FATAL, "Stmt failed: %s", cmd_sql);
+			shmn_elog(FATAL, "Stmt failed: %s", sql);
 
 		MemoryContextSwitchTo(oldcxt);
 		/* +1 for NULL in the end */
@@ -323,10 +331,7 @@ next_cmd(void)
 		MemoryContextSwitchTo(spicxt);
 	}
 
-	PopActiveSnapshot();
-	SPI_finish();
-	CommitTransactionCommand();
-
+	SPI_EPILOG;
 	return cmd;
 }
 
@@ -338,10 +343,8 @@ update_cmd_status(int64 id, const char *new_status)
 {
 	char *sql;
 	int e;
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
 
+	SPI_PROLOG;
 	sql = psprintf("update shardman.cmd_log set status = '%s' where id = %ld;",
 				   new_status, id);
 	e = SPI_exec(sql, 0);
@@ -350,10 +353,7 @@ update_cmd_status(int64 id, const char *new_status)
 	{
 		shmn_elog(FATAL, "Stmt failed: %s", sql);
 	}
-
-	PopActiveSnapshot();
-	SPI_finish();
-	CommitTransactionCommand();
+	SPI_EPILOG;
 }
 
 /*
@@ -370,7 +370,8 @@ pg_shardman_installed_local(void)
 	if (get_extension_oid("pg_shardman", true) == InvalidOid)
 	{
 		installed = false;
-		shmn_elog(WARNING, "pg_shardman library is preloaded, but extenstion is not created");
+		shmn_elog(WARNING, "pg_shardman library is preloaded, but extenstion"
+				  "is not created");
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -419,6 +420,8 @@ check_for_sigterm(void)
 /*
  * Adding node consists of
  * - verifying that the node is not present in the cluster at the moment
+ * - extension recreation
+ * - repl slot recreation
  * - subscription creation
  * - setting node id
  * - adding node to 'nodes' table
@@ -426,16 +429,17 @@ check_for_sigterm(void)
 static void add_node(Cmd *cmd)
 {
 	PGconn *conn = NULL;
-	const char *conninfo = cmd->opts[0];
+	const char *connstring = cmd->opts[0];
     PGresult *res = NULL;
 	bool pg_shardman_installed;
 	int node_id;
+	char *sql;
 
-	shmn_elog(LOG, "Adding node %s", conninfo);
+	shmn_elog(LOG, "Adding node %s", connstring);
 	/* Try to execute command indefinitely until it succeeded or canceled */
 	while (!got_sigusr1 && !got_sigterm)
 	{
-		conn = PQconnectdb(conninfo);
+		conn = PQconnectdb(connstring);
 		if (PQstatus(conn) != CONNECTION_OK)
 		{
 			shmn_elog(NOTICE, "Connection to add_node node failed: %s",
@@ -450,7 +454,7 @@ static void add_node(Cmd *cmd)
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
 			shmn_elog(NOTICE, "Failed to check whether pg_shardman is installed on"
-				 " node to add%s", PQerrorMessage(conn));
+				 " node to add: %s", PQerrorMessage(conn));
 			goto attempt_failed;
 		}
 		pg_shardman_installed = PQntuples(res) == 1 && !PQgetisnull(res, 0, 0);
@@ -466,36 +470,71 @@ static void add_node(Cmd *cmd)
 				shmn_elog(NOTICE, "Failed to get node id, %s", PQerrorMessage(conn));
 				goto attempt_failed;
 			}
-			node_id = atoi(PQgetvalue(res, 0, 0));
-			PQclear(res);
-			if (node_in_cluster(node_id))
+
+			if (!PQgetisnull(res, 0, 0))
 			{
-				shmn_elog(WARNING, "node %d with connstring %s is already in cluster,"
-					 " won't add it.", node_id, conninfo);
-				PQfinish(conn);
-				update_cmd_status(cmd->id, "failed");
-				return;
+				/* Node is in cluster. Is it active in our cluster? */
+				node_id = atoi(PQgetvalue(res, 0, 0));
+				PQclear(res);
+				if (node_in_cluster(node_id))
+				{
+					shmn_elog(WARNING, "node %d with connstring %s is already"
+							  " in cluster, won't add it.", node_id, connstring);
+					PQfinish(conn);
+					update_cmd_status(cmd->id, "failed");
+					return;
+				}
 			}
+			else
+				PQclear(res);
 		}
 
-		/* Now, when we are sure that node is not in the cluster, we reinstall
-		 * the extension to reset its state, whether is was installed before
-		 * or not.
+		/*
+		 * Now add node to 'nodes' table, if we haven't done that yet, and
+		 * record that we did so for this cmd
 		 */
-		res = PQexec(conn, "drop extension if exists pg_shardman; "
+		node_id = insert_node(connstring, cmd->id);
+
+		/*
+		 * reinstall the extension to reset its state, whether is was
+		 * installed before or not.
+		 */
+		res = PQexec(conn, "drop extension if exists pg_shardman;"
 					 " create extension pg_shardman;");
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
-			shmn_elog(NOTICE, "Failed to reinstall pg_shardman, %s", PQerrorMessage(conn));
+			shmn_elog(NOTICE, "Failed to reinstall pg_shardman, %s",
+					  PQerrorMessage(conn));
 			goto attempt_failed;
 		}
 		PQclear(res);
 
-		/* TODO */
+		/* Create replication slot, if not yet */
+		sql = psprintf("select shardman.create_repslot('shardman_meta_sub_%d');",
+					   node_id);
+		void_spi(sql);
+		pfree(sql);
+
+		/* Create subscription and set node it on itself */
+		sql = psprintf(
+			"create subscription shardman_meta_sub connection '%s'"
+			"publication shardman_meta_pub with (create_slot = false,"
+			"slot_name = 'shardman_meta_sub_%d');"
+			"select shardman.set_node_id(%d);",
+			shardman_master_connstring, node_id, node_id);
+		res = PQexec(conn, sql);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			shmn_elog(NOTICE, "Failed to create subscription and set node id, %s",
+					  PQerrorMessage(conn));
+			goto attempt_failed;
+		}
+		pg_shardman_installed = PQntuples(res) == 1 && !PQgetisnull(res, 0, 0);
+		PQclear(res);
 
 		/* done */
 		PQfinish(conn);
-		update_cmd_status(cmd->id, "success");
+		activate_node(cmd->id, node_id);
 		return;
 
 attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
@@ -511,30 +550,51 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 	check_for_sigterm();
 
 	/* Command canceled via sigusr1 */
+	got_sigusr1 = false;
 	shmn_elog(LOG, "Command %ld canceled", cmd->id);
 	update_cmd_status(cmd->id, "canceled");
-	got_sigusr1 = false;
 	return;
 }
 
+/* See sql func */
+static int
+insert_node(const char *connstring, int64 cmd_id)
+{
+	char *sql = psprintf("select shardman.insert_node('%s', %ld)",
+							 connstring, cmd_id);
+	int e;
+	int node_id;
+	bool isnull;
+
+	SPI_PROLOG;
+	e = SPI_exec(sql, 0);
+	pfree(sql);
+	if (e < 0)
+		/* TODO: closing connections on such failures? */
+		shmn_elog(FATAL, "Stmt failed: %s", sql);
+	node_id = DatumGetInt32(
+		SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
+					  &isnull));
+	SPI_EPILOG;
+
+	return node_id;
+}
+
 /*
- * Returns true, if node 'id' is in the cluster, false otherwise.
+ * Returns true, if node 'id' is active in our cluster, false otherwise.
  */
 static bool
 node_in_cluster(int id)
 {
 	int e;
-	const char *sql = "select id from shardman.nodes;";
+	const char *sql = "select id from shardman.nodes where active;";
 	bool res = false;
 	HeapTuple tuple;
 	TupleDesc rowdesc;
 	uint64 i;
 	bool isnull;
 
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
-
+	SPI_PROLOG;
 	e = SPI_execute(sql, true, 0);
 	if (e < 0)
 		shmn_elog(FATAL, "Stmt failed: %s", sql);
@@ -548,10 +608,26 @@ node_in_cluster(int id)
 											  &isnull)))
 			res = true;
 	}
-
-	PopActiveSnapshot();
-	SPI_finish();
-	CommitTransactionCommand();
+	SPI_EPILOG;
 
 	return res;
+}
+
+/*
+ * Mark add_node cmd as success and node as active, we must do that in one txn
+ */
+void activate_node(int64 cmd_id, int node_id)
+{
+	int e;
+	char *sql = psprintf(
+		"update shardman.nodes set active = true where id = %d;"
+		"update shardman.cmd_log set status = 'success' where id = %ld;",
+		node_id, cmd_id);
+
+	SPI_PROLOG;
+	e = SPI_exec(sql, 0);
+	pfree(sql);
+	if (e < 0)
+		shmn_elog(FATAL, "Stmt failed: %s", sql);
+	SPI_EPILOG;
 }
