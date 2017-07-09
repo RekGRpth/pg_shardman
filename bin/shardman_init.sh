@@ -3,6 +3,10 @@
 script_dir=`dirname "$(readlink -f "$0")"`
 source "${script_dir}/common.sh"
 
+echo $PATH
+cd $pathmanpath
+USE_PGXS=1 make install
+
 cd "${script_dir}/.."
 make clean
 make install

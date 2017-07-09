@@ -5,6 +5,7 @@ set -e
 # Params
 
 pgpath=~/postgres/install/vanilla/
+pathmanpath=~/postgres/pg_pathman
 
 master_datadir=~/postgres/data1
 master_port=5432

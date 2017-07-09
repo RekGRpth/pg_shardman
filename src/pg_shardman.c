@@ -49,10 +49,13 @@ static void shardmaster_sigterm(SIGNAL_ARGS);
 static void shardmaster_sigusr1(SIGNAL_ARGS);
 static void check_for_sigterm(void);
 static void pg_shardman_installed_local(void);
+
 static void add_node(Cmd *cmd);
 static int insert_node(const char *connstring, int64 cmd_id);
 static bool node_in_cluster(int id);
-static void activate_node(int64 cmd_id, int node_id);
+
+static void rm_node(Cmd *cmd);
+static bool is_node_active(int node_id);
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sigterm = false;
@@ -135,8 +138,8 @@ _PG_init()
 		shardmaster_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
 		shardmaster_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-		/* shardmaster_worker.bgw_restart_time = 10; */
-		shardmaster_worker.bgw_restart_time = BGW_NEVER_RESTART;
+		shardmaster_worker.bgw_restart_time = 10;
+		/* shardmaster_worker.bgw_restart_time = BGW_NEVER_RESTART; */
 		sprintf(shardmaster_worker.bgw_library_name, "pg_shardman");
 		sprintf(shardmaster_worker.bgw_function_name, "shardmaster_main");
 		shardmaster_worker.bgw_notify_pid = 0;
@@ -181,6 +184,8 @@ shardmaster_main(Datum main_arg)
 				shmn_elog(LOG, "%s", *opts);
 			if (strcmp(cmd->cmd_type, "add_node") == 0)
 				add_node(cmd);
+			else if (strcmp(cmd->cmd_type, "rm_node") == 0)
+				rm_node(cmd);
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
@@ -371,7 +376,7 @@ pg_shardman_installed_local(void)
 	{
 		installed = false;
 		shmn_elog(WARNING, "pg_shardman library is preloaded, but extenstion"
-				  "is not created");
+				  " is not created");
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -419,14 +424,18 @@ check_for_sigterm(void)
 
 /*
  * Adding node consists of
- * - verifying that the node is not present in the cluster at the moment
- * - extension recreation
- * - repl slot recreation
- * - subscription creation
- * - setting node id
- * - adding node to 'nodes' table
+ * - verifying the node is not 'active' in the cluster, i.e. 'nodes' table
+ * - adding node to the 'nodes' as not active, get its new id
+ * - reinstalling extenstion
+ * - recreating repslot
+ * - recreating subscription
+ * - setting node id on the node itself
+ * - marking node as active and cmd as success
+ * We do all this stuff to make all actions are idempodent to be able to retry
+ * them in case of any failure.
  */
-static void add_node(Cmd *cmd)
+void
+add_node(Cmd *cmd)
 {
 	PGconn *conn = NULL;
 	const char *connstring = cmd->opts[0];
@@ -473,7 +482,7 @@ static void add_node(Cmd *cmd)
 
 			if (!PQgetisnull(res, 0, 0))
 			{
-				/* Node is in cluster. Is it active in our cluster? */
+				/* Node is in cluster. Was it there before we started adding? */
 				node_id = atoi(PQgetvalue(res, 0, 0));
 				PQclear(res);
 				if (node_in_cluster(node_id))
@@ -529,12 +538,24 @@ static void add_node(Cmd *cmd)
 					  PQerrorMessage(conn));
 			goto attempt_failed;
 		}
-		pg_shardman_installed = PQntuples(res) == 1 && !PQgetisnull(res, 0, 0);
+
 		PQclear(res);
+		PQfinish(conn);
+
+		/*
+		 * Mark add_node cmd as success and node as active, we must do that in
+		 * one txn.
+		 */
+		sql = psprintf(
+			"update shardman.nodes set status = 'active' where id = %d;"
+			"update shardman.cmd_log set status = 'success' where id = %ld;",
+			node_id, cmd->id);
+		void_spi(sql);
+		pfree(sql);
 
 		/* done */
-		PQfinish(conn);
-		activate_node(cmd->id, node_id);
+		elog(INFO, "Node %s successfully added, it is assigned id %d",
+			 connstring, node_id);
 		return;
 
 attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
@@ -544,6 +565,7 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 			PQfinish(conn);
 
 		shmn_elog(LOG, "Attempt to execute add_node failed, sleeping and retrying");
+		/* TODO: sleep using waitlatch? */
 		pg_usleep(shardman_cmd_retry_naptime * 1000L);
 	}
 
@@ -581,53 +603,72 @@ insert_node(const char *connstring, int64 cmd_id)
 }
 
 /*
- * Returns true, if node 'id' is active in our cluster, false otherwise.
+ * Returns true, if node 'id' is in cluster and not in add_in_progress state
  */
 static bool
 node_in_cluster(int id)
 {
-	int e;
-	const char *sql = "select id from shardman.nodes where active;";
-	bool res = false;
-	HeapTuple tuple;
-	TupleDesc rowdesc;
-	uint64 i;
-	bool isnull;
+	char *sql = psprintf(
+		"select id from shardman.nodes where id = %d and status != 'add_in_progress';",
+		id);
+	bool res;
 
 	SPI_PROLOG;
-	e = SPI_execute(sql, true, 0);
-	if (e < 0)
+	if (SPI_execute(sql, true, 0) < 0)
 		shmn_elog(FATAL, "Stmt failed: %s", sql);
+	pfree(sql);
+	res = SPI_processed == 1;
 
-	rowdesc = SPI_tuptable->tupdesc;
-	for (i = 0; i < SPI_processed; i++)
-	{
-		tuple = SPI_tuptable->vals[i];
-		if (id == DatumGetInt32(SPI_getbinval(tuple, rowdesc,
-											  SPI_fnumber(rowdesc, "id"),
-											  &isnull)))
-			res = true;
-	}
 	SPI_EPILOG;
-
 	return res;
 }
 
 /*
- * Mark add_node cmd as success and node as active, we must do that in one txn
+ * Remove node, losing all data on it. We
+ * - ensure that there is active node with given id in the cluster
+ * - mark node as rm_in_progress and commit so this reaches node via LR
+ * - wait a bit to let it unsubscribe
+ * - drop replication slot, remove node row and mark cmd as success
+ * Everything is idempotent. Note that we are not allowed to remove repl slot
+ * when the walsender connection is alive, that's why we sleep here.
  */
-void activate_node(int64 cmd_id, int node_id)
+void
+rm_node(Cmd *cmd)
 {
-	int e;
-	char *sql = psprintf(
-		"update shardman.nodes set active = true where id = %d;"
-		"update shardman.cmd_log set status = 'success' where id = %ld;",
-		node_id, cmd_id);
+	int node_id = atoi(cmd->opts[0]);
+	char *sql;
 
-	SPI_PROLOG;
-	e = SPI_exec(sql, 0);
+	if (!node_in_cluster(node_id))
+	{
+		shmn_elog(WARNING, "node %d not in cluster, won't rm it.", node_id);
+		update_cmd_status(cmd->id, "failed");
+		return;
+	}
+
+	sql = psprintf(
+		"update shardman.nodes set status = 'rm_in_progress' where id = %d;",
+		node_id);
+	void_spi(sql);
 	pfree(sql);
-	if (e < 0)
-		shmn_elog(FATAL, "Stmt failed: %s", sql);
-	SPI_EPILOG;
+
+	/* Let node drop the subscription */
+	pg_usleep(2 * 1000000L);
+
+	/*
+	 * It is extremely unlikely that node still keeps walsender process
+	 * connected but ignored our node status update, so this should succeed.
+	 * If not, bgw exits, but postmaster will restart us to try again.
+	 * TODO: at this stage, user can't cancel command at all, this should be
+	 * fixed.
+	 */
+	sql = psprintf(
+		"select shardman.drop_repslot('shardman_meta_sub_%d');"
+		/* keep silent cmd_log fk constraint */
+		"update shardman.cmd_log set node_id = null where node_id = %d;"
+		"delete from shardman.nodes where id = %d;"
+		"update shardman.cmd_log set status = 'success' where id = %ld;",
+		node_id, node_id, node_id, cmd->id);
+	void_spi(sql);
+	pfree(sql);
+	elog(INFO, "Node %d successfully removed", node_id);
 }

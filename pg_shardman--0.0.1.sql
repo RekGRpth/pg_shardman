@@ -13,12 +13,32 @@ BEGIN
 END
 $$;
 
+-- active is the normal mode, others needed only for proper node add and removal
+CREATE TYPE node_status AS ENUM ('active', 'add_in_progress', 'rm_in_progress');
+
 -- list of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
 	connstring text,
-	active bool NOT NULL -- if false, we haven't yet finished adding it
+	status node_status NOT NULL
 );
+
+-- Master is removing us, so reset our state, removing all subscriptions. A bit
+-- tricky part: we can't DROP SUBSCRIPTION here, because that would mean
+-- shooting (sending SIGTERM) ourselvers (to replication apply worker) in the
+-- leg.  So for now we just disable subscription, worker will stop after the end
+-- of transaction. Later we should delete subscriptions fully.
+CREATE FUNCTION rm_node_worker_side() RETURNS TRIGGER AS $$
+BEGIN
+	PERFORM shardman.pg_shardman_cleanup(false);
+	RETURN NULL;
+END
+$$ language plpgsql;
+CREATE TRIGGER rm_node_worker_side AFTER UPDATE ON shardman.nodes
+	FOR EACH ROW WHEN (OLD.status = 'active' AND NEW.status = 'rm_in_progress')
+	EXECUTE PROCEDURE rm_node_worker_side();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.nodes ENABLE REPLICA TRIGGER rm_node_worker_side;
 
 -- Currently it is used just to store node id, in general we can keep any local
 -- node metadata here. If is ever used extensively, probably hstore suits better.
@@ -29,7 +49,7 @@ CREATE TABLE local_meta (
 INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
 
 -- available commands
-CREATE TYPE cmd AS ENUM ('add_node', 'remove_node');
+CREATE TYPE cmd AS ENUM ('add_node', 'rm_node');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress', 'success');
 
@@ -37,8 +57,9 @@ CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
 	cmd_type cmd NOT NULL,
 	status cmd_status DEFAULT 'waiting' NOT NULL,
-	-- only for add_node cmd -- generated id for newly added node. Cleaner
-	-- to keep that is separate table...
+	-- only for add_node cmd -- generated id for newly added node. Exists only
+	-- when node adding is in progress or node is active. Cleaner to keep this
+	-- in separate table...
 	node_id int REFERENCES nodes(id)
 );
 
@@ -99,7 +120,8 @@ DECLARE
 BEGIN
 	SELECT node_id FROM @extschema@.cmd_log INTO n_id WHERE id = cmd_id;
 	IF n_id IS NULL THEN
-		INSERT INTO @extschema@.nodes VALUES (DEFAULT, quote_literal(connstring), false)
+		INSERT INTO @extschema@.nodes
+			VALUES (DEFAULT, quote_literal(connstring), 'add_in_progress')
 			RETURNING id INTO n_id;
 		UPDATE @extschema@.cmd_log SET node_id = n_id WHERE id = cmd_id;
 	END IF;
@@ -115,8 +137,21 @@ BEGIN
 	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
 				   WHERE slot_name=%L)', slot_name) INTO slot_exists;
 	IF NOT slot_exists THEN
-		EXECUTE format('SELECT * FROM pg_create_logical_replication_slot(%L, %L)',
+		EXECUTE format('SELECT pg_create_logical_replication_slot(%L, %L)',
 					   slot_name, 'pgoutput');
+	END IF;
+END
+$$ LANGUAGE plpgsql;
+
+-- Drop replication slot, if it exists
+CREATE FUNCTION drop_repslot(slot_name text) RETURNS void AS $$
+DECLARE
+	slot_exists bool;
+BEGIN
+	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
+				   WHERE slot_name=%L)', slot_name) INTO slot_exists;
+	IF slot_exists THEN
+		EXECUTE format('SELECT pg_drop_replication_slot(%L)', slot_name);
 	END IF;
 END
 $$ LANGUAGE plpgsql;
@@ -133,10 +168,12 @@ $$ LANGUAGE plpgsql;
 --    is deleting.
 --  - because of that I resort to C function which examines parse tree and if
 --    it is our extension is deleting, it calls plpgsql cleanup func
-CREATE OR REPLACE FUNCTION pg_shardman_cleanup() RETURNS void  AS $$
+CREATE OR REPLACE FUNCTION pg_shardman_cleanup(drop_subs bool DEFAULT true)
+	RETURNS void AS $$
 DECLARE
 	pub record;
 	sub record;
+	rs record;
 BEGIN
 	FOR pub IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'shardman_%' LOOP
 		EXECUTE format('DROP PUBLICATION %I', pub.pubname);
@@ -145,7 +182,13 @@ BEGIN
 		-- we are managing rep slots manually, so we need to detach it beforehand
 		EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', sub.subname);
 		EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', sub.subname);
-		EXECUTE format('DROP SUBSCRIPTION %I', sub.subname);
+		IF drop_subs THEN
+			EXECUTE format('DROP SUBSCRIPTION %I', sub.subname);
+		END IF;
+	END LOOP;
+	FOR rs IN SELECT slot_name FROM pg_replication_slots
+		WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
+		EXECUTE format('SELECT pg_drop_replication_slot(%L)', rs.slot_name);
 	END LOOP;
 END;
 $$ LANGUAGE plpgsql;
@@ -173,8 +216,7 @@ $$ LANGUAGE sql;
 
 -- Interface functions
 
--- TODO: during the initial connection, ensure that nodes id (if any) is not
--- present in the cluster
+-- Add a node. Its state will be reset, all shardman data lost.
 CREATE FUNCTION add_node(connstring text) RETURNS void AS $$
 DECLARE
 	c_id int;
@@ -182,5 +224,16 @@ BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'add_node')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, connstring);
+END
+$$ LANGUAGE plpgsql;
+
+-- Remove node. Its state will be reset, all shardman data lost.
+CREATE FUNCTION rm_node(node_id int) RETURNS void AS $$
+DECLARE
+	c_id int;
+BEGIN
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'rm_node')
+										   RETURNING id INTO c_id;
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
 END
 $$ LANGUAGE plpgsql;
