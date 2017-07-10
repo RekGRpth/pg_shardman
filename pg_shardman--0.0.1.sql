@@ -49,7 +49,7 @@ CREATE TABLE local_meta (
 INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
 
 -- available commands
-CREATE TYPE cmd AS ENUM ('add_node', 'rm_node');
+CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress', 'success');
 
@@ -213,6 +213,8 @@ CREATE FUNCTION set_node_id(node_id int) RETURNS void AS $$
 	UPDATE @extschema@.local_meta SET v = node_id WHERE k = 'node_id';
 $$ LANGUAGE sql;
 
+CREATE FUNCTION gen_create_table_sql(relation text) RETURNS text
+    AS 'pg_shardman' LANGUAGE C;
 
 -- Interface functions
 
@@ -235,5 +237,22 @@ BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'rm_node')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
+END
+$$ LANGUAGE plpgsql;
+
+-- Shard table with hash partitions. Params as in pathman, except for relation
+-- (master doesn't know oid of the table)
+CREATE FUNCTION create_hash_partitions(
+	node_id int, expr text, relation text, partitions_count int)
+	RETURNS void AS $$
+DECLARE
+	c_id int;
+BEGIN
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'create_hash_partitions')
+										   RETURNING id INTO c_id;
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, expr);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, partitions_count);
 END
 $$ LANGUAGE plpgsql;

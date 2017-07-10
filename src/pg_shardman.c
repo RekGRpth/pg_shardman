@@ -55,7 +55,8 @@ static int insert_node(const char *connstring, int64 cmd_id);
 static bool node_in_cluster(int id);
 
 static void rm_node(Cmd *cmd);
-static bool is_node_active(int node_id);
+
+static void create_hash_partitions(Cmd *cmd);
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sigterm = false;
@@ -444,7 +445,7 @@ add_node(Cmd *cmd)
 	int node_id;
 	char *sql;
 
-	shmn_elog(LOG, "Adding node %s", connstring);
+	shmn_elog(INFO, "Adding node %s", connstring);
 	/* Try to execute command indefinitely until it succeeded or canceled */
 	while (!got_sigusr1 && !got_sigterm)
 	{
@@ -638,6 +639,7 @@ rm_node(Cmd *cmd)
 	int node_id = atoi(cmd->opts[0]);
 	char *sql;
 
+	elog(INFO, "Removing node %d ", node_id);
 	if (!node_in_cluster(node_id))
 	{
 		shmn_elog(WARNING, "node %d not in cluster, won't rm it.", node_id);
@@ -671,4 +673,22 @@ rm_node(Cmd *cmd)
 	void_spi(sql);
 	pfree(sql);
 	elog(INFO, "Node %d successfully removed", node_id);
+}
+
+
+/*
+ * Partition table and get sql to create it;
+ * Add records about new table and partitions
+ */
+static void create_hash_partitions(Cmd *cmd)
+{
+	int node_id = atoi(cmd->opts[0]);
+	const char *expr = cmd->opts[1];
+	const char *relation = cmd->opts[2];
+	const char *partitions_count = atoi(cmd->opts[3]);
+	PGconn *conn = NULL;
+	PGresult *res = NULL;
+	char *sql;
+
+	shmn_elog(INFO, "Sharding table %s on node %d", relation, node_id);
 }

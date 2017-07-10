@@ -1,5 +1,5 @@
 log_min_messages = INFO
-client_min_messages = LOG
+client_min_messages = NOTICE
 
 # for logical repl
 wal_level = logical
