@@ -43,12 +43,14 @@ typedef struct Cmd
 static Cmd *next_cmd(void);
 static void update_cmd_status(int64 id, const char *new_status);
 static PGconn *listen_cmd_log_inserts(void);
-static char *void_spi(char *sql);
+static uint64 void_spi(char *sql);
 static void wait_notify(PGconn *conn);
 static void shardmaster_sigterm(SIGNAL_ARGS);
 static void shardmaster_sigusr1(SIGNAL_ARGS);
 static void check_for_sigterm(void);
 static void pg_shardman_installed_local(void);
+static void cmd_canceled(Cmd *cmd);
+static char *get_worker_node_connstring(int node_id);
 
 static void add_node(Cmd *cmd);
 static int insert_node(const char *connstring, int64 cmd_id);
@@ -169,7 +171,7 @@ shardmaster_main(Datum main_arg)
     /* We're now ready to receive signals */
     BackgroundWorkerUnblockSignals();
 
-	void_spi("select shardman.create_meta_pub();");
+	void_spi("select shardman.master_boot();");
 	conn = listen_cmd_log_inserts();
 
 	/* main loop */
@@ -187,6 +189,8 @@ shardmaster_main(Datum main_arg)
 				add_node(cmd);
 			else if (strcmp(cmd->cmd_type, "rm_node") == 0)
 				rm_node(cmd);
+			else if (strcmp(cmd->cmd_type, "create_hash_partitions") == 0)
+				create_hash_partitions(cmd);
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
@@ -197,19 +201,20 @@ shardmaster_main(Datum main_arg)
 }
 
 /*
- * Execute statement via SPI if without looking at the result. Returns the
- * query itself.
+ * Execute statement via SPI, when we are not particulary interested in the
+ * result. Returns the number of rows processed.
  */
-char *void_spi(char *sql)
+uint64
+void_spi(char *sql)
 {
-	int e;
+	uint64 rows_processed;
 
 	SPI_PROLOG;
-	e = SPI_exec(sql, 0);
-	if (e < 0)
+	if (SPI_exec(sql, 0) < 0)
 		shmn_elog(FATAL, "Stmt failed: %s", sql);
+	rows_processed = SPI_processed;
 	SPI_EPILOG;
-	return sql;
+	return rows_processed;
 }
 
 /*
@@ -366,7 +371,7 @@ update_cmd_status(int64 id, const char *new_status)
  * Verify that extension is installed locally. We must be connected to db at
  * this point
  */
-static void
+void
 pg_shardman_installed_local(void)
 {
 	bool installed = true;
@@ -392,7 +397,7 @@ pg_shardman_installed_local(void)
  * Signal handler for SIGTERM
  *		Set a flag to let the main loop to terminate.
  */
-static void
+void
 shardmaster_sigterm(SIGNAL_ARGS)
 {
 	got_sigterm = true;
@@ -402,7 +407,7 @@ shardmaster_sigterm(SIGNAL_ARGS)
  * Signal handler for SIGUSR1
  *		Set a flag to let the main loop to terminate.
  */
-static void
+void
 shardmaster_sigusr1(SIGNAL_ARGS)
 {
 	got_sigusr1 = true;
@@ -411,7 +416,7 @@ shardmaster_sigusr1(SIGNAL_ARGS)
 /*
  * Cleanup and exit in case of SIGTERM
  */
-static void
+void
 check_for_sigterm(void)
 {
 	if (got_sigterm)
@@ -421,6 +426,15 @@ check_for_sigterm(void)
 			PQfinish(conn);
 		proc_exit(0);
 	}
+}
+
+/* Command canceled via sigusr1 */
+void
+cmd_canceled(Cmd *cmd)
+{
+	got_sigusr1 = false;
+	shmn_elog(LOG, "Command %ld canceled", cmd->id);
+	update_cmd_status(cmd->id, "canceled");
 }
 
 /*
@@ -434,6 +448,7 @@ check_for_sigterm(void)
  * - marking node as active and cmd as success
  * We do all this stuff to make all actions are idempodent to be able to retry
  * them in case of any failure.
+ * TODO: node record might hang in 'add_in_progress' state, we should remove it.
  */
 void
 add_node(Cmd *cmd)
@@ -485,6 +500,7 @@ add_node(Cmd *cmd)
 			{
 				/* Node is in cluster. Was it there before we started adding? */
 				node_id = atoi(PQgetvalue(res, 0, 0));
+				elog(INFO, "NODE IN CLUSTER, %d", node_id);
 				PQclear(res);
 				if (node_in_cluster(node_id))
 				{
@@ -548,7 +564,7 @@ add_node(Cmd *cmd)
 		 * one txn.
 		 */
 		sql = psprintf(
-			"update shardman.nodes set status = 'active' where id = %d;"
+			"update shardman.nodes set worker_status = 'active' where id = %d;"
 			"update shardman.cmd_log set status = 'success' where id = %ld;",
 			node_id, cmd->id);
 		void_spi(sql);
@@ -569,14 +585,9 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 		/* TODO: sleep using waitlatch? */
 		pg_usleep(shardman_cmd_retry_naptime * 1000L);
 	}
-
 	check_for_sigterm();
 
-	/* Command canceled via sigusr1 */
-	got_sigusr1 = false;
-	shmn_elog(LOG, "Command %ld canceled", cmd->id);
-	update_cmd_status(cmd->id, "canceled");
-	return;
+	cmd_canceled(cmd);
 }
 
 /* See sql func */
@@ -610,7 +621,8 @@ static bool
 node_in_cluster(int id)
 {
 	char *sql = psprintf(
-		"select id from shardman.nodes where id = %d and status != 'add_in_progress';",
+		"select id from shardman.nodes where id = %d and (master OR"
+		" worker_status != 'add_in_progress');",
 		id);
 	bool res;
 
@@ -648,7 +660,7 @@ rm_node(Cmd *cmd)
 	}
 
 	sql = psprintf(
-		"update shardman.nodes set status = 'rm_in_progress' where id = %d;",
+		"update shardman.nodes set worker_status = 'rm_in_progress' where id = %d;",
 		node_id);
 	void_spi(sql);
 	pfree(sql);
@@ -677,18 +689,150 @@ rm_node(Cmd *cmd)
 
 
 /*
- * Partition table and get sql to create it;
- * Add records about new table and partitions
+ * Steps are:
+ * - Ensure table is not partitioned already;
+ * - Partition table and get sql to create it;
+ * - Add records about new table and partitions;
  */
 static void create_hash_partitions(Cmd *cmd)
 {
 	int node_id = atoi(cmd->opts[0]);
-	const char *expr = cmd->opts[1];
-	const char *relation = cmd->opts[2];
-	const char *partitions_count = atoi(cmd->opts[3]);
+	const char *relation = cmd->opts[1];
+	const char *expr = cmd->opts[2];
+	int partitions_count = atoi(cmd->opts[3]);
+	char *connstring;
 	PGconn *conn = NULL;
 	PGresult *res = NULL;
 	char *sql;
+	uint64 table_exists;
+	char *create_table_sql;
 
 	shmn_elog(INFO, "Sharding table %s on node %d", relation, node_id);
+
+	/* Check that table with such name is not already sharded */
+	sql = psprintf(
+		"select relation from shardman.tables where relation = '%s'",
+		relation);
+	table_exists = void_spi(sql);
+	if (table_exists)
+	{
+		shmn_elog(WARNING, "table %s already sharded, won't partition it.",
+				  relation);
+		update_cmd_status(cmd->id, "failed");
+		return;
+	}
+	/* connstring mem freed with ctxt */
+	if ((connstring = get_worker_node_connstring(node_id)) == NULL)
+	{
+		shmn_elog(WARNING, "create_hash_partitions failed, no such worker node: %d",
+				  node_id);
+		update_cmd_status(cmd->id, "failed");
+		return;
+	}
+
+	/* Note that we have to run statements in separate transactions, otherwise
+	 * we have a deadlock between pathman and pg_dump */
+	sql = psprintf("begin; select create_hash_partitions('%s', '%s', %d); end;"
+				   "select shardman.gen_create_table_sql('%s', '%s');",
+				   relation, expr, partitions_count, relation, connstring);
+
+	/* Try to execute command indefinitely until it succeeded or canceled */
+	while (!got_sigusr1 && !got_sigterm)
+	{
+		conn = PQconnectdb(connstring);
+		if (PQstatus(conn) != CONNECTION_OK)
+		{
+			shmn_elog(NOTICE, "Connection to node failed: %s",
+					  PQerrorMessage(conn));
+			goto attempt_failed;
+		}
+
+		/* Partition table and get sql to create it */
+		res = PQexec(conn, sql);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			shmn_elog(NOTICE, "Failed to partition table and get sql to create it: %s",
+					  PQerrorMessage(conn));
+			goto attempt_failed;
+		}
+		create_table_sql = PQgetvalue(res, 0, 0);
+
+		/* TODO: if master fails at this moment (which is extremely unlikely
+		 * though), after restart it will try to partition table again and
+		 * fail. We should check if the table is already partitioned and don't
+		 * do that again, except for, probably, the case when it was
+		 * partitioned by someone else.
+		 */
+		/*
+		 * Insert table to 'tables' table (no pun intended), insert partitions
+		 * and mark partitioning cmd as successfull
+		 */
+		sql = psprintf("insert into shardman.tables values"
+					   " ('%s', '%s', %d, $create_table$%s$create_table$, %d);"
+					   " update shardman.cmd_log set status = 'success'"
+					   " where id = %ld;",
+					   relation, expr, partitions_count, create_table_sql,
+					   node_id, cmd->id);
+		void_spi(sql);
+		pfree(sql);
+
+		PQclear(res); /* can't free any earlier, it stores sql */
+		PQfinish(conn);
+
+		/* done */
+		elog(INFO, "Table %s successfully partitioned", relation);
+		return;
+
+attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
+		if (res != NULL)
+			PQclear(res);
+		if (conn != NULL)
+			PQfinish(conn);
+
+		shmn_elog(LOG, "Attempt to execute create_hash_partitions failed,"
+				  " sleeping and retrying");
+		/* TODO: sleep using waitlatch? */
+		pg_usleep(shardman_cmd_retry_naptime * 1000L);
+	}
+	check_for_sigterm();
+
+	cmd_canceled(cmd);
+}
+
+/*
+ * Get connstring of worker node with id node_id. Memory is palloc'ed.
+ * NULL is returned, if there is no such node.
+ */
+char*
+get_worker_node_connstring(int node_id)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	char *sql = psprintf("select connstring from shardman.nodes where id = %d"
+						 " and worker", node_id);
+	char *res;
+
+	SPI_PROLOG;
+
+	if (SPI_execute(sql, true, 0) < 0)
+	{
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+	}
+	pfree(sql);
+
+	if (SPI_processed == 0)
+	{
+		res = NULL;
+	}
+	else
+	{
+		HeapTuple tuple = SPI_tuptable->vals[0];
+		TupleDesc rowdesc = SPI_tuptable->tupdesc;
+		/* We need to allocate connstring in our ctxt, not spi's */
+		MemoryContext spicxt = MemoryContextSwitchTo(oldcxt);
+		res = SPI_getvalue(tuple, rowdesc, 1);
+		MemoryContextSwitchTo(spicxt);
+	}
+
+	SPI_EPILOG;
+	return res;
 }

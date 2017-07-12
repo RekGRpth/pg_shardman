@@ -6,16 +6,17 @@ set -e
 
 pgpath=~/postgres/install/vanilla/
 pathmanpath=~/postgres/pg_pathman
+install_pathman=false
 
 master_datadir=~/postgres/data1
 master_port=5432
 
 # declare -a worker_datadirs=()
 # declare -a worker_ports=()
-declare -a worker_datadirs=("${HOME}/postgres/data2")
-declare -a worker_ports=("5433")
-# declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3")
-# declare -a worker_ports=("5433" "5434")
+# declare -a worker_datadirs=("${HOME}/postgres/data2")
+# declare -a worker_ports=("5433")
+declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3")
+declare -a worker_ports=("5433" "5434")
 
 #------------------------------------------------------------
 PATH="$PATH:${pgpath}bin/"

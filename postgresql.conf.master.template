@@ -1,10 +1,4 @@
-log_min_messages = INFO
-client_min_messages = NOTICE
-
-# for logical repl
-wal_level = logical
-
-shared_preload_libraries='pg_pathman, pg_shardman'
-
+# master-specific part
 shardman.master = on
 shardman.master_dbname = ars
+shardman.master_connstring = 'port=5432'

@@ -58,9 +58,9 @@ Datum
 gen_create_table_sql(PG_FUNCTION_ARGS)
 {
 	char pg_dump_path[MAXPGPATH];
-	Name db; /* current db name */
 	/* let the mmgr free that */
 	char *relation = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *connstring =  text_to_cstring(PG_GETARG_TEXT_PP(1));
 	const size_t chunksize = 5; /* read max that bytes at time */
 	/* how much already allocated *including header* */
 	size_t pallocated = VARHDRSZ + chunksize;
@@ -70,18 +70,16 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	FILE *fp;
 	size_t bytes_read;
 	SET_VARSIZE(sql, VARHDRSZ);
+	elog(INFO, "RUNNING GEN CREATE TABLE");
 
 	/* find pg_dump location */
 	if (find_my_exec("pg_dump", pg_dump_path) != 0)
 	{
 		elog(ERROR, "Failed to find pg_dump location");
 	}
-	/* find current db */
-	db = (Name) palloc(NAMEDATALEN);
-	namestrcpy(db, get_database_name(MyDatabaseId));
 
-	cmd = psprintf("%s -t '%s' --schema-only '%s' 2>&1",
-				   pg_dump_path, relation, (NameStr(*db)));
+	cmd = psprintf("%s -t '%s' --schema-only --dbname='%s' 2>&1",
+				   pg_dump_path, relation, connstring);
 
 	if ((fp = popen(cmd, "r")) == NULL)
 	{

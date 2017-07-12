@@ -14,13 +14,18 @@ END
 $$;
 
 -- active is the normal mode, others needed only for proper node add and removal
-CREATE TYPE node_status AS ENUM ('active', 'add_in_progress', 'rm_in_progress');
+CREATE TYPE worker_node_status AS ENUM ('active', 'add_in_progress', 'rm_in_progress');
 
 -- list of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
-	connstring text,
-	status node_status NOT NULL
+	connstring text NOT NULL UNIQUE,
+	worker_status worker_node_status,
+	-- While currently we don't support master and worker roles on one node,
+	-- potentially node can be either worker, master or both, so we need 3 bits.
+	-- One bool with NULL might be fine, but it seems a bit counter-intuitive.
+	worker bool NOT NULL DEFAULT true,
+	master bool NOT NULL DEFAULT false
 );
 
 -- Master is removing us, so reset our state, removing all subscriptions. A bit
@@ -33,12 +38,64 @@ BEGIN
 	PERFORM shardman.pg_shardman_cleanup(false);
 	RETURN NULL;
 END
-$$ language plpgsql;
+$$ LANGUAGE plpgsql;
 CREATE TRIGGER rm_node_worker_side AFTER UPDATE ON shardman.nodes
-	FOR EACH ROW WHEN (OLD.status = 'active' AND NEW.status = 'rm_in_progress')
+	FOR EACH ROW WHEN (OLD.worker_status = 'active' AND NEW.worker_status = 'rm_in_progress')
 	EXECUTE PROCEDURE rm_node_worker_side();
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.nodes ENABLE REPLICA TRIGGER rm_node_worker_side;
+
+-- sharded tables
+CREATE TABLE tables (
+	relation text PRIMARY KEY, -- table name
+	expr text NOT NULL,
+	partitions_count int NOT NULL,
+	create_sql text NOT NULL, -- sql to create the table
+	-- Node on which table was partitioned at the beginning. Used only during
+	-- initial tables inflation to distinguish between table owner and other
+	-- nodes, probably cleaner keep it in separate table.
+	initial_node int NOT NULL REFERENCES nodes(id)
+);
+
+-- On adding new table, create it on non-owner nodes using provided sql and
+-- partition
+CREATE FUNCTION new_table_worker_side() RETURNS TRIGGER AS $$
+BEGIN
+	IF NEW.initial_node != (SELECT shardman.get_node_id()) THEN
+		EXECUTE format('%s', NEW.create_sql);
+		EXECUTE format('select create_hash_partitions(%L, %L, %L);',
+					   NEW.relation, NEW.expr, NEW.partitions_count);
+	END IF;
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER new_table_worker_side AFTER INSERT ON shardman.tables
+	FOR EACH ROW EXECUTE PROCEDURE new_table_worker_side();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.tables ENABLE REPLICA TRIGGER new_table_worker_side;
+-- On master side, insert partitions
+CREATE FUNCTION new_table_master_side() RETURNS TRIGGER AS $$
+BEGIN
+	INSERT INTO shardman.partitions
+		-- part names look like tablename_partnum, partnums start from 0
+		SELECT NEW.relation || '_' || range.num AS part_name,
+			   NEW.relation AS relation,
+			   NEW.initial_node AS owner
+		  FROM
+				  (SELECT num FROM generate_series(0, NEW.partitions_count, 1)
+									   AS range(num)) AS range;
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER new_table_master_side AFTER INSERT ON shardman.tables
+	FOR EACH ROW EXECUTE PROCEDURE new_table_master_side();
+
+CREATE TABLE partitions (
+	part_name text PRIMARY KEY,
+	relation text NOT NULL REFERENCES tables(relation),
+	owner int REFERENCES nodes(id) -- node on which partition lies
+);
+
 
 -- Currently it is used just to store node id, in general we can keep any local
 -- node metadata here. If is ever used extensively, probably hstore suits better.
@@ -88,12 +145,44 @@ CREATE TABLE cmd_opts (
 
 -- Internal functions
 
+-- Called on shardmaster bgw start. Add itself to nodes table, set id, create
+-- publication.
+CREATE FUNCTION master_boot() RETURNS void AS $$
+DECLARE
+	-- If we have never booted as a master before, we have a work to do
+	init_master bool DEFAULT false;
+	master_connstring text;
+	master_id int;
+BEGIN
+	raise INFO 'Booting master';
+	PERFORM shardman.create_meta_pub();
+
+	master_id := shardman.get_node_id();
+	IF master_id IS NULL THEN
+		SELECT pg_settings.setting into master_connstring from pg_settings
+			WHERE NAME = 'shardman.master_connstring';
+		EXECUTE format(
+			'INSERT INTO @extschema@.nodes VALUES (DEFAULT, %L, NULL, false, true)
+			RETURNING id', master_connstring) INTO master_id;
+		PERFORM shardman.set_node_id(master_id);
+		init_master := true;
+	ELSE
+		EXECUTE 'SELECT NOT (SELECT master FROM shardman.nodes WHERE id = $1)'
+			INTO init_master USING master_id;
+		EXECUTE 'UPDATE shardman.nodes SET master = true WHERE id = $1' USING master_id;
+	END IF;
+	IF init_master THEN
+		-- TODO: set up lr channels
+	END IF;
+END $$ LANGUAGE plpgsql;
+
 -- These tables will be replicated to worker nodes, notifying them about changes.
 -- Called on master.
 CREATE FUNCTION create_meta_pub() RETURNS void AS $$
 BEGIN
 	IF NOT EXISTS (SELECT * FROM pg_publication WHERE pubname = 'shardman_meta_pub') THEN
-		CREATE PUBLICATION shardman_meta_pub FOR TABLE shardman.nodes;
+		CREATE PUBLICATION shardman_meta_pub FOR TABLE
+			shardman.nodes, shardman.tables;
 	END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -109,24 +198,6 @@ BEGIN
 	-- Note that 'CONNECTION $1...' USING master_connstring won't work here
 	EXECUTE format('CREATE SUBSCRIPTION shardman_meta_sub CONNECTION %L PUBLICATION shardman_meta_pub', master_connstring);
 END;
-$$ LANGUAGE plpgsql;
-
--- If for cmd cmd_id we haven't yet inserted new node, do that; mark it as passive
--- for now, we still need to setup lr and set its id on the node itself
--- Return generated or existing node id
-CREATE FUNCTION insert_node(connstring text, cmd_id bigint) RETURNS int AS $$
-DECLARE
-	n_id int;
-BEGIN
-	SELECT node_id FROM @extschema@.cmd_log INTO n_id WHERE id = cmd_id;
-	IF n_id IS NULL THEN
-		INSERT INTO @extschema@.nodes
-			VALUES (DEFAULT, quote_literal(connstring), 'add_in_progress')
-			RETURNING id INTO n_id;
-		UPDATE @extschema@.cmd_log SET node_id = n_id WHERE id = cmd_id;
-	END IF;
-	RETURN n_id;
-END
 $$ LANGUAGE plpgsql;
 
 -- Create logical pgoutput replication slot, if not exists
@@ -213,7 +284,25 @@ CREATE FUNCTION set_node_id(node_id int) RETURNS void AS $$
 	UPDATE @extschema@.local_meta SET v = node_id WHERE k = 'node_id';
 $$ LANGUAGE sql;
 
-CREATE FUNCTION gen_create_table_sql(relation text) RETURNS text
+-- If for cmd cmd_id we haven't yet inserted new node, do that; mark it as passive
+-- for now, we still need to setup lr and set its id on the node itself
+-- Return generated or existing node id
+CREATE FUNCTION insert_node(connstring text, cmd_id bigint) RETURNS int AS $$
+DECLARE
+	n_id int;
+BEGIN
+	SELECT node_id FROM @extschema@.cmd_log INTO n_id WHERE id = cmd_id;
+	IF n_id IS NULL THEN
+		INSERT INTO @extschema@.nodes
+			VALUES (DEFAULT, connstring, 'add_in_progress')
+			RETURNING id INTO n_id;
+		UPDATE @extschema@.cmd_log SET node_id = n_id WHERE id = cmd_id;
+	END IF;
+	RETURN n_id;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS text
     AS 'pg_shardman' LANGUAGE C;
 
 -- Interface functions

@@ -13,3 +13,6 @@ shared_preload_libraries = '$libdir/pg_shardman'
 restart postgres server and run
 drop extension if exists pg_shardman;
 create extension pg_shardman;
+
+The master itself can't be worker node for now, because it requires special
+handling of LR channels setup.
