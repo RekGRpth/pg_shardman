@@ -57,14 +57,20 @@ CREATE TABLE tables (
 	initial_node int NOT NULL REFERENCES nodes(id)
 );
 
--- On adding new table, create it on non-owner nodes using provided sql and
--- partition
+-- On adding new table, create this table on non-owner nodes using provided sql
+-- and partition it.
 CREATE FUNCTION new_table_worker_side() RETURNS TRIGGER AS $$
 BEGIN
 	IF NEW.initial_node != (SELECT shardman.get_node_id()) THEN
+		EXECUTE format ('DROP TABLE IF EXISTS %I CASCADE;', NEW.relation);
 		EXECUTE format('%s', NEW.create_sql);
-		EXECUTE format('select create_hash_partitions(%L, %L, %L);',
-					   NEW.relation, NEW.expr, NEW.partitions_count);
+		-- We are adding '_tmp' to default names, because
+		-- these partitions will be immediately replaced with foreign tables
+		-- having conventional names.
+		EXECUTE format('select create_hash_partitions(%L, %L, %L, true, %L);',
+					   NEW.relation, NEW.expr, NEW.partitions_count,
+					   (SELECT ARRAY(SELECT part_name FROM shardman.gen_part_names(
+						   NEW.relation, NEW.partitions_count, '_tmp'))));
 	END IF;
 	RETURN NULL;
 END
@@ -77,13 +83,10 @@ ALTER TABLE shardman.tables ENABLE REPLICA TRIGGER new_table_worker_side;
 CREATE FUNCTION new_table_master_side() RETURNS TRIGGER AS $$
 BEGIN
 	INSERT INTO shardman.partitions
-		-- part names look like tablename_partnum, partnums start from 0
-		SELECT NEW.relation || '_' || range.num AS part_name,
-			   NEW.relation AS relation,
-			   NEW.initial_node AS owner
-		  FROM
-				  (SELECT num FROM generate_series(0, NEW.partitions_count, 1)
-									   AS range(num)) AS range;
+	SELECT part_name, NEW.relation AS relation, NEW.initial_node AS owner
+	  FROM (SELECT part_name FROM shardman.gen_part_names(
+		  NEW.relation, NEW.partitions_count))
+			   AS partnames;
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
@@ -96,6 +99,99 @@ CREATE TABLE partitions (
 	owner int REFERENCES nodes(id) -- node on which partition lies
 );
 
+-- On adding new partition, create proper foreign server & foreign table and
+-- replace tmp (empty) partition with it.
+CREATE FUNCTION new_partition() RETURNS TRIGGER AS $$
+DECLARE
+	connstring text;
+	connstring_keywords text[];
+	connstring_vals text[];
+	server_opts text default '';
+	um_opts text default '';
+	server_opts_first_time_through bool DEFAULT true;
+	um_opts_first_time_through bool DEFAULT true;
+BEGIN
+	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
+		raise info 'creating foreign table';
+		SELECT nodes.connstring FROM shardman.nodes WHERE id = NEW.owner
+		  INTO connstring;
+		EXECUTE format('DROP SERVER IF EXISTS %I CASCADE;', NEW.part_name);
+		-- Options to postgres_fdw are specified in two places: user & password
+		-- in user mapping and everything else in create server. The problem is
+		-- that we use single connstring, however user mapping and server
+		-- doesn't understand this format, i.e. we can't say create server
+		-- ... options (dbname 'port=4848 host=blabla.org'). So we have to parse
+		-- the opts and pass them manually. libpq knows how to do it, but
+		-- doesn't expose that. On the other hand, quote_literal (which is
+		-- neccessary here) doesn't have handy C API. I resorted to have C
+		-- function which parses the opts and returns them in two parallel
+		-- arrays, and here we join them with quoting.
+		SELECT * FROM shardman.pq_conninfo_parse(connstring)
+		  INTO connstring_keywords, connstring_vals;
+		FOR i IN 1..(SELECT array_upper(connstring_keywords, 1)) LOOP
+			IF connstring_keywords[i] = 'client_encoding' OR
+				connstring_keywords[i] = 'fallback_application_name' THEN
+				CONTINUE; /* not allowed in postgres_fdw */
+			ELSIF connstring_keywords[i] = 'user' OR
+				connstring_keywords[i] = 'password' THEN -- user mapping option
+				IF NOT um_opts_first_time_through THEN
+					um_opts := um_opts || ', ';
+				END IF;
+				um_opts_first_time_through := false;
+				um_opts := um_opts ||
+					format('%s %L', connstring_keywords[i], connstring_vals[i]);
+			ELSE -- server option
+				IF NOT server_opts_first_time_through THEN
+					server_opts := server_opts || ', ';
+				END IF;
+				server_opts_first_time_through := false;
+				server_opts := server_opts ||
+					format('%s %L', connstring_keywords[i], connstring_vals[i]);
+			END IF;
+		END LOOP;
+		-- OPTIONS () is syntax error, so add OPTIONS only if we really have opts
+		IF server_opts != '' THEN
+			server_opts := format(' OPTIONS (%s)', server_opts);
+		END IF;
+		IF um_opts != '' THEN
+			um_opts := format(' OPTIONS (%s)', um_opts);
+		END IF;
+		raise log 'serv opts are %, um opts are %', server_opts, um_opts;
+		EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER
+					   postgres_fdw %s;', NEW.part_name, server_opts);
+		EXECUTE format('DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER %I;',
+					   NEW.part_name);
+		EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I
+					   %s;', NEW.part_name, um_opts);
+		EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', NEW.part_name);
+
+		-- Generate and execute CREATE FOREIGN TABLE sql statement which will
+		-- clone the existing local table schema. In constrast to
+		-- gen_create_table_sql, here we need only the header of the table,
+		-- i.e. its attributes. CHECK constraint for partition will be added
+		-- during the attachment, and other stuff doesn't seem to have much
+		-- sense on foreign table.
+		-- In fact, we should have CREATE FOREIGN TABLE (LIKE ...) to make this
+		-- sane.  We could also used here IMPORT FOREIGN SCHEMA, but it
+		-- unneccessary involves network (we already have this schema locally)
+		-- and dangerous: what if table was created and dropped before this
+		-- change reached us?
+		EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I',
+					   NEW.part_name,
+					   (select
+							shardman.reconstruct_table_attrs('partitioned_table_0_tmp')),
+					   NEW.part_name);
+		-- Finally, replace empty local tmp partition with foreign table
+		EXECUTE format('SELECT replace_hash_partition(%L, %L)',
+					   format('%s_tmp', NEW.part_name), NEW.part_name);
+	END IF;
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER new_partition AFTER INSERT ON shardman.partitions
+	FOR EACH ROW EXECUTE PROCEDURE new_partition();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_partition;
 
 -- Currently it is used just to store node id, in general we can keep any local
 -- node metadata here. If is ever used extensively, probably hstore suits better.
@@ -131,7 +227,6 @@ CREATE TRIGGER cmd_log_inserts
 	AFTER INSERT ON cmd_log
 	FOR EACH STATEMENT
 	EXECUTE PROCEDURE notify_shardmaster();
-
 
 -- probably better to keep opts in an array field, but working with arrays from
 -- libpq is not very handy
@@ -182,7 +277,7 @@ CREATE FUNCTION create_meta_pub() RETURNS void AS $$
 BEGIN
 	IF NOT EXISTS (SELECT * FROM pg_publication WHERE pubname = 'shardman_meta_pub') THEN
 		CREATE PUBLICATION shardman_meta_pub FOR TABLE
-			shardman.nodes, shardman.tables;
+			shardman.nodes, shardman.tables, shardman.partitions;
 	END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -302,8 +397,26 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- generate one-column table with partition names as 'tablename'_'partnum''suffix'
+CREATE FUNCTION gen_part_names(relation text, partitions_count int,
+							   suffix text DEFAULT '')
+	RETURNS TABLE(part_name text) AS $$
+BEGIN
+	RETURN QUERY SELECT relation || '_' || range.num || suffix AS partname
+		FROM
+		(SELECT num FROM generate_series(0, partitions_count - 1, 1)
+							 AS range(num)) AS range;
+END
+$$ LANGUAGE plpgsql;
+
 CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS text
     AS 'pg_shardman' LANGUAGE C;
+
+CREATE FUNCTION reconstruct_table_attrs(relation regclass)
+	RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
+
+CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals text[])
+	RETURNS record AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Interface functions
 

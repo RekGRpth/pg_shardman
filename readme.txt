@@ -16,3 +16,5 @@ create extension pg_shardman;
 
 The master itself can't be worker node for now, because it requires special
 handling of LR channels setup.
+
+ALTER TABLE for sharded tables is not supported for now.

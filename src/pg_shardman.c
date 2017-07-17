@@ -732,9 +732,11 @@ static void create_hash_partitions(Cmd *cmd)
 
 	/* Note that we have to run statements in separate transactions, otherwise
 	 * we have a deadlock between pathman and pg_dump */
-	sql = psprintf("begin; select create_hash_partitions('%s', '%s', %d); end;"
-				   "select shardman.gen_create_table_sql('%s', '%s');",
-				   relation, expr, partitions_count, relation, connstring);
+	sql = psprintf(
+		"begin; select create_hash_partitions('%s', '%s', %d); end;"
+		"select shardman.gen_create_table_sql('%s', '%s');",
+		relation, expr, partitions_count,
+		relation, connstring);
 
 	/* Try to execute command indefinitely until it succeeded or canceled */
 	while (!got_sigusr1 && !got_sigterm)
