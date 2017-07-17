@@ -64,13 +64,10 @@ BEGIN
 	IF NEW.initial_node != (SELECT shardman.get_node_id()) THEN
 		EXECUTE format ('DROP TABLE IF EXISTS %I CASCADE;', NEW.relation);
 		EXECUTE format('%s', NEW.create_sql);
-		-- We are adding '_tmp' to default names, because
-		-- these partitions will be immediately replaced with foreign tables
-		-- having conventional names.
 		EXECUTE format('select create_hash_partitions(%L, %L, %L, true, %L);',
 					   NEW.relation, NEW.expr, NEW.partitions_count,
 					   (SELECT ARRAY(SELECT part_name FROM shardman.gen_part_names(
-						   NEW.relation, NEW.partitions_count, '_tmp'))));
+						   NEW.relation, NEW.partitions_count))));
 	END IF;
 	RETURN NULL;
 END
@@ -110,6 +107,7 @@ DECLARE
 	um_opts text default '';
 	server_opts_first_time_through bool DEFAULT true;
 	um_opts_first_time_through bool DEFAULT true;
+	fdw_part_name text;
 BEGIN
 	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
 		raise info 'creating foreign table';
@@ -163,7 +161,10 @@ BEGIN
 					   NEW.part_name);
 		EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I
 					   %s;', NEW.part_name, um_opts);
-		EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', NEW.part_name);
+		-- We use _fdw suffix for foreign tables to avoid interleaving with real
+		-- ones.
+		SELECT format('%s_fdw', NEW.part_name) INTO fdw_part_name;
+		EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', fdw_part_name);
 
 		-- Generate and execute CREATE FOREIGN TABLE sql statement which will
 		-- clone the existing local table schema. In constrast to
@@ -176,14 +177,18 @@ BEGIN
 		-- unneccessary involves network (we already have this schema locally)
 		-- and dangerous: what if table was created and dropped before this
 		-- change reached us?
+
 		EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I',
-					   NEW.part_name,
-					   (select
-							shardman.reconstruct_table_attrs('partitioned_table_0_tmp')),
+					   fdw_part_name,
+					   (SELECT
+							shardman.reconstruct_table_attrs(
+								format('%I', NEW.part_name))),
 					   NEW.part_name);
 		-- Finally, replace empty local tmp partition with foreign table
 		EXECUTE format('SELECT replace_hash_partition(%L, %L)',
-					   format('%s_tmp', NEW.part_name), NEW.part_name);
+					   NEW.part_name, fdw_part_name);
+		-- And drop old empty table
+		EXECUTE format('DROP TABLE %I', NEW.part_name);
 	END IF;
 	RETURN NULL;
 END

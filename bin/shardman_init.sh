@@ -41,4 +41,6 @@ psql -p 5433 -c "INSERT INTO partitioned_table SELECT generate_series(1, 1000), 
 psql -c "select shardman.add_node('port=5433');"
 psql -c "select shardman.add_node('port=5434');"
 
+psql -c "select shardman.create_hash_partitions(2, 'partitioned_table', 'id', 2);"
+
 psql
