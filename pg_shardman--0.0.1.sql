@@ -8,7 +8,8 @@ BEGIN
 -- Yes, malicious user might have another extension containing 'pg_shardman'...
 -- Probably better just call no-op func from the library
     IF strpos(current_setting('shared_preload_libraries'), 'pg_shardman') = 0 THEN
-        RAISE EXCEPTION 'pg_shardman must be loaded via shared_preload_libraries. Refusing to proceed.';
+        RAISE EXCEPTION 'pg_shardman must be loaded via shared_preload_libraries. Refusing to
+						proceed.';
     END IF;
 END
 $$;
@@ -178,12 +179,13 @@ BEGIN
 		-- and dangerous: what if table was created and dropped before this
 		-- change reached us?
 
-		EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I',
+		EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I OPTIONS (table_name %L)',
 					   fdw_part_name,
 					   (SELECT
 							shardman.reconstruct_table_attrs(
 								format('%I', NEW.part_name))),
-					   NEW.part_name);
+						NEW.part_name,
+						NEW.part_name);
 		-- Finally, replace empty local tmp partition with foreign table
 		EXECUTE format('SELECT replace_hash_partition(%L, %L)',
 					   NEW.part_name, fdw_part_name);
