@@ -3,7 +3,7 @@ EXTENSION = pg_shardman        # the extension name
 DATA = pg_shardman--0.0.1.sql
 
 MODULE_big = pg_shardman
-OBJS = src/pg_shardman.o src/udf.o
+OBJS = src/pg_shardman.o src/udf.o src/shard.o
 
 PG_CPPFLAGS += -Isrc/include
 

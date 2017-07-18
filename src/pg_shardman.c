@@ -1,7 +1,8 @@
 /* -------------------------------------------------------------------------
  *
  * shardmaster.c
- *		Background worker executing sharding tasks.
+ *		Background worker accepting sharding tasks for execution and common
+ *		routines.
  *
  * -------------------------------------------------------------------------
  */
@@ -27,30 +28,18 @@
 #include "libpq-fe.h"
 
 #include "pg_shardman.h"
+#include "shard.h"
 
 
 /* ensure that extension won't load against incompatible version of Postgres */
 PG_MODULE_MAGIC;
 
-typedef struct Cmd
-{
-	int64 id;
-	char *cmd_type;
-	char *status;
-	char **opts; /* array of n options, opts[n] is NULL */
-} Cmd;
-
 static Cmd *next_cmd(void);
-static void update_cmd_status(int64 id, const char *new_status);
 static PGconn *listen_cmd_log_inserts(void);
-static uint64 void_spi(char *sql);
-static void wait_notify(PGconn *conn);
+static void wait_notify(void);
 static void shardmaster_sigterm(SIGNAL_ARGS);
 static void shardmaster_sigusr1(SIGNAL_ARGS);
-static void check_for_sigterm(void);
 static void pg_shardman_installed_local(void);
-static void cmd_canceled(Cmd *cmd);
-static char *get_worker_node_connstring(int node_id);
 
 static void add_node(Cmd *cmd);
 static int insert_node(const char *connstring, int64 cmd_id);
@@ -58,17 +47,15 @@ static bool node_in_cluster(int id);
 
 static void rm_node(Cmd *cmd);
 
-static void create_hash_partitions(Cmd *cmd);
-
 /* flags set by signal handlers */
-static volatile sig_atomic_t got_sigterm = false;
-static volatile sig_atomic_t got_sigusr1 = false;
+volatile sig_atomic_t got_sigterm = false;
+volatile sig_atomic_t got_sigusr1 = false;
 
 /* GUC variables */
-static bool shardman_master = false;
-static char *shardman_master_dbname = "postgres";
-static char *shardman_master_connstring = "";
-static int shardman_cmd_retry_naptime = 10000;
+bool shardman_master;
+char *shardman_master_dbname;
+char *shardman_master_connstring;
+int shardman_cmd_retry_naptime;
 
 /* Just global vars. */
 /* Connection to local server for LISTEN notifications. Is is global for easy
@@ -168,8 +155,8 @@ shardmaster_main(Datum main_arg)
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGTERM, shardmaster_sigterm);
 	pqsignal(SIGUSR1, shardmaster_sigusr1);
-    /* We're now ready to receive signals */
-    BackgroundWorkerUnblockSignals();
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
 
 	void_spi("select shardman.master_boot();");
 	conn = listen_cmd_log_inserts();
@@ -194,7 +181,7 @@ shardmaster_main(Datum main_arg)
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
-		wait_notify(conn);
+		wait_notify();
 		check_for_sigterm();
 	}
 
@@ -250,7 +237,7 @@ listen_cmd_log_inserts(void)
  * no notifcations, we also return.
  */
 void
-wait_notify(PGconn *conn)
+wait_notify()
 {
 	int			sock;
 	fd_set		input_mask;
@@ -270,6 +257,7 @@ wait_notify(PGconn *conn)
 		shmn_elog(FATAL, "select() failed: %s", strerror(errno));
 	}
 
+	/* TODO: what if connection broke? */
 	PQconsumeInput(conn);
 	/* eat all notifications at once */
 	while ((notify = PQnotifies(conn)) != NULL)
@@ -688,118 +676,6 @@ rm_node(Cmd *cmd)
 }
 
 
-/*
- * Steps are:
- * - Ensure table is not partitioned already;
- * - Partition table and get sql to create it;
- * - Add records about new table and partitions;
- */
-static void create_hash_partitions(Cmd *cmd)
-{
-	int node_id = atoi(cmd->opts[0]);
-	const char *relation = cmd->opts[1];
-	const char *expr = cmd->opts[2];
-	int partitions_count = atoi(cmd->opts[3]);
-	char *connstring;
-	PGconn *conn = NULL;
-	PGresult *res = NULL;
-	char *sql;
-	uint64 table_exists;
-	char *create_table_sql;
-
-	shmn_elog(INFO, "Sharding table %s on node %d", relation, node_id);
-
-	/* Check that table with such name is not already sharded */
-	sql = psprintf(
-		"select relation from shardman.tables where relation = '%s'",
-		relation);
-	table_exists = void_spi(sql);
-	if (table_exists)
-	{
-		shmn_elog(WARNING, "table %s already sharded, won't partition it.",
-				  relation);
-		update_cmd_status(cmd->id, "failed");
-		return;
-	}
-	/* connstring mem freed with ctxt */
-	if ((connstring = get_worker_node_connstring(node_id)) == NULL)
-	{
-		shmn_elog(WARNING, "create_hash_partitions failed, no such worker node: %d",
-				  node_id);
-		update_cmd_status(cmd->id, "failed");
-		return;
-	}
-
-	/* Note that we have to run statements in separate transactions, otherwise
-	 * we have a deadlock between pathman and pg_dump */
-	sql = psprintf(
-		"begin; select create_hash_partitions('%s', '%s', %d); end;"
-		"select shardman.gen_create_table_sql('%s', '%s');",
-		relation, expr, partitions_count,
-		relation, connstring);
-
-	/* Try to execute command indefinitely until it succeeded or canceled */
-	while (!got_sigusr1 && !got_sigterm)
-	{
-		conn = PQconnectdb(connstring);
-		if (PQstatus(conn) != CONNECTION_OK)
-		{
-			shmn_elog(NOTICE, "Connection to node failed: %s",
-					  PQerrorMessage(conn));
-			goto attempt_failed;
-		}
-
-		/* Partition table and get sql to create it */
-		res = PQexec(conn, sql);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			shmn_elog(NOTICE, "Failed to partition table and get sql to create it: %s",
-					  PQerrorMessage(conn));
-			goto attempt_failed;
-		}
-		create_table_sql = PQgetvalue(res, 0, 0);
-
-		/* TODO: if master fails at this moment (which is extremely unlikely
-		 * though), after restart it will try to partition table again and
-		 * fail. We should check if the table is already partitioned and don't
-		 * do that again, except for, probably, the case when it was
-		 * partitioned by someone else.
-		 */
-		/*
-		 * Insert table to 'tables' table (no pun intended), insert partitions
-		 * and mark partitioning cmd as successfull
-		 */
-		sql = psprintf("insert into shardman.tables values"
-					   " ('%s', '%s', %d, $create_table$%s$create_table$, %d);"
-					   " update shardman.cmd_log set status = 'success'"
-					   " where id = %ld;",
-					   relation, expr, partitions_count, create_table_sql,
-					   node_id, cmd->id);
-		void_spi(sql);
-		pfree(sql);
-
-		PQclear(res); /* can't free any earlier, it stores sql */
-		PQfinish(conn);
-
-		/* done */
-		elog(INFO, "Table %s successfully partitioned", relation);
-		return;
-
-attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
-		if (res != NULL)
-			PQclear(res);
-		if (conn != NULL)
-			PQfinish(conn);
-
-		shmn_elog(LOG, "Attempt to execute create_hash_partitions failed,"
-				  " sleeping and retrying");
-		/* TODO: sleep using waitlatch? */
-		pg_usleep(shardman_cmd_retry_naptime * 1000L);
-	}
-	check_for_sigterm();
-
-	cmd_canceled(cmd);
-}
 
 /*
  * Get connstring of worker node with id node_id. Memory is palloc'ed.
