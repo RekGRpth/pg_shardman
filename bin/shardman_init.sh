@@ -35,12 +35,6 @@ done
 
 restart_nodes
 
-psql -p 5433 -c "drop table if exists partitioned_table cascade;"
-psql -p 5433 -c "CREATE TABLE partitioned_table(id INT NOT NULL, payload REAL);"
-psql -p 5433 -c "INSERT INTO partitioned_table SELECT generate_series(1, 1000), random();"
-psql -c "select shardman.add_node('port=5433');"
-psql -c "select shardman.add_node('port=5434');"
-
-psql -c "select shardman.create_hash_partitions(2, 'partitioned_table', 'id', 2);"
+run_demo
 
 psql

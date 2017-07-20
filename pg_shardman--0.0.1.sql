@@ -155,7 +155,6 @@ BEGIN
 		IF um_opts != '' THEN
 			um_opts := format(' OPTIONS (%s)', um_opts);
 		END IF;
-		raise log 'serv opts are %, um opts are %', server_opts, um_opts;
 		EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER
 					   postgres_fdw %s;', NEW.part_name, server_opts);
 		EXECUTE format('DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER %I;',
@@ -363,6 +362,8 @@ BEGIN
 		WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
 		EXECUTE format('SELECT pg_drop_replication_slot(%L)', rs.slot_name);
 	END LOOP;
+
+	PERFORM shardman.reset_node_id();
 END;
 $$ LANGUAGE plpgsql;
 CREATE FUNCTION pg_shardman_cleanup_c() RETURNS event_trigger
