@@ -465,3 +465,6 @@ BEGIN
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, partitions_count);
 END
 $$ LANGUAGE plpgsql;
+-- Otherwise partitioned tables on worker nodes not will be dropped properly,
+-- see pathman's docs.
+ALTER EVENT TRIGGER pathman_ddl_trigger ENABLE ALWAYS;
