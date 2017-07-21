@@ -20,20 +20,31 @@
 /* epoll max events */
 #define MAX_EVENTS 64
 
+/* Bitmask for ensure_pqconn */
+#define ENSURE_PQCONN_SRC (1 << 0)
+#define ENSURE_PQCONN_DST (1 << 1)
+
+/* final result of 1 master partition move */
 typedef enum
 {
 	MOVEMPART_IN_PROGRESS,
 	MOVEMPART_FAILED,
 	MOVEMPART_SUCCESS
-} MoveMPartResult;
+} MoveMPartRes;
 
-/* result of one iteration of processing */
+/* result of one iteration of master partition moving */
 typedef enum
 {
 	EXECMOVEMPART_EPOLL, /* add me to epoll on epolled_fd on EPOLLIN */
 	EXECMOVEMPART_WAKEMEUP, /* wake me up again on waketm */
 	EXECMOVEMPART_DONE /* the work is done, never invoke me again */
 } ExecMoveMPartRes;
+
+/* Current step of 1 master partition move */
+typedef enum
+{
+	MOVEMPARTSTEP_START_TABLESYNC
+} MoveMPartStep;
 
 typedef struct
 {
@@ -47,7 +58,11 @@ typedef struct
 	 /* exec_move_mpart sets fd here when it wants to be wakened by epoll */
 	int fd_to_epoll;
 	int fd_in_epoll_set; /* socket *currently* in epoll set. -1 of none */
-	MoveMPartResult result;
+	PGconn *src_conn; /* connection to src */
+	PGconn *dst_conn; /* connection to dst */
+	MoveMPartStep curstep; /* current step */
+	ExecMoveMPartRes exec_res; /* result of the last iteration */
+	MoveMPartRes res; /* result of the whole move */
 } MoveMPartState;
 
 typedef struct
@@ -58,12 +73,19 @@ typedef struct
 
 static void init_mmp_state(MoveMPartState *mmps, const char *part_name,
 						   int32 dst_node);
+static void finalize_mmp_state(MoveMPartState *mmps);
 static void move_mparts(MoveMPartState *mmpss, int nparts);
 static int calc_timeout(struct timespec waketm, bool waketm_set);
 static void update_waketm(struct timespec *waketm, bool *waketm_set,
 						  MoveMPartState *mmps);
 static void epoll_subscribe(int epfd, MoveMPartState *mmps);
-static ExecMoveMPartRes exec_move_mpart(MoveMPartState *mmps);
+static void exec_move_mpart(MoveMPartState *mmps);
+static int start_tablesync(MoveMPartState *mmpts);
+static int ensure_pqconn(MoveMPartState *mmpts, int nodes);
+static int ensure_pqconn_intern(PGconn **conn, const char *connstr,
+								MoveMPartState *mmps);
+static void configure_retry(MoveMPartState *mmpts, int millis);
+static struct timespec timespec_now_plus_millis(int millis);
 
 /*
  * Steps are:
@@ -197,10 +219,13 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
  * - Sleep & check in connection to dest waiting for completion of final sync,
  *   i.e. when received_lsn is equal to remembered lsn on src.
  * - Now update metadata on master, mark cmd as complete and we are done.
+ *   src table will be dropped via metadata update
  *
  *  If we don't save progress (whether initial sync started or done, lsn,
  *  etc), we have to start everything from the ground if master reboots. This
- *  is arguably fine.
+ *  is arguably fine. There is also a very small chance that the command will
+ *  complete but fail before status is set to 'success', and after reboot will
+ *  fail because the partition was already moved.
  *
  */
 void
@@ -213,7 +238,18 @@ move_mpart(Cmd *cmd)
 	init_mmp_state(mmps, part_name, dst_node);
 
 	move_mparts(mmps, 1);
-	update_cmd_status(cmd->id, "success");
+	check_for_sigterm();
+	if (got_sigusr1)
+	{
+		cmd_canceled(cmd);
+		return;
+	}
+
+	Assert(mmps->res != MOVEMPART_IN_PROGRESS);
+	if (mmps->res == MOVEMPART_FAILED)
+		update_cmd_status(cmd->id, "failed");
+	else if (mmps->res == MOVEMPART_SUCCESS)
+		update_cmd_status(cmd->id, "success");
 }
 
 
@@ -231,7 +267,7 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 	{
 		shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
 				  part_name);
-		mmps->result = MOVEMPART_FAILED;
+		mmps->res = MOVEMPART_FAILED;
 		return;
 	}
 	mmps->dst_node = dst_node;
@@ -244,7 +280,7 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 	{
 		shmn_elog(WARNING, "Node %d doesn't exist, not moving %s to it",
 				  mmps->dst_node, part_name);
-		mmps->result = MOVEMPART_FAILED;
+		mmps->res = MOVEMPART_FAILED;
 		return;
 	}
 
@@ -256,11 +292,35 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 	mmps->fd_to_epoll = -1;
 	mmps->fd_in_epoll_set = -1;
 
-	mmps->result = MOVEMPART_IN_PROGRESS;
+	mmps->src_conn = NULL;
+	mmps->dst_conn = NULL;
+
+	mmps->curstep = MOVEMPARTSTEP_START_TABLESYNC;
+	mmps->res = MOVEMPART_IN_PROGRESS;
 }
 
 /*
- * Move partitions as specified in move_mpart_states list
+ * Close pq connections, if any.
+ */
+static void finalize_mmp_state(MoveMPartState *mmps)
+{
+	if (mmps->src_conn != NULL)
+	{
+		PQfinish(mmps->src_conn);
+		mmps->src_conn = NULL;
+	}
+	if (mmps->dst_conn != NULL)
+	{
+		PQfinish(mmps->dst_conn);
+		mmps->dst_conn = NULL;
+	}
+}
+
+/*
+ * Move partitions as specified in move_mpart_states array. Results (and
+ * general state is saved in this array too. Tries to move all parts until
+ * all have failed/succeeded or sigusr1/sigterm is caugth.
+ *
  */
 void
 move_mparts(MoveMPartState *mmpss, int nparts)
@@ -289,7 +349,7 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	waketm_set = true;
 	for (i = 0; i < nparts; i++)
 	{
-		if (mmpss[i].result != MOVEMPART_FAILED)
+		if (mmpss[i].res != MOVEMPART_FAILED)
 		{
 			MoveMPartStateNode *mmps_node = palloc(sizeof(MoveMPartStateNode));
 			elog(DEBUG4, "Adding task %s to timeout list", mmpss[i].part_name);
@@ -303,7 +363,7 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 		shmn_elog(FATAL, "epoll_create1 failed");
 
 	/* TODO: check for signals */
-	while (unfinished_moves > 0)
+	while (unfinished_moves > 0 && !got_sigusr1 && !got_sigterm)
 	{
 		timeout = calc_timeout(waketm, waketm_set);
 		e = epoll_wait(epfd, evlist, MAX_EVENTS, timeout);
@@ -328,7 +388,8 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 			if (timespeccmp(mmps->waketm, curtm) <= 0)
 			{
 				shmn_elog(DEBUG1, "%s is ready for exec", mmps->part_name);
-				switch (exec_move_mpart(mmps))
+				exec_move_mpart(mmps);
+				switch (mmps->exec_res)
 				{
 					case EXECMOVEMPART_WAKEMEUP:
 						/* We need to wake this task again, update waketm and
@@ -354,6 +415,20 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 		}
 	}
 
+	/*
+	 * Free list. This not necessary though, we are finishing cmd and
+	 * everything will be freed soon.
+	 */
+	slist_foreach_modify(iter, &timeout_states)
+	{
+		MoveMPartStateNode *mmps_node =
+				slist_container(MoveMPartStateNode, list_node, iter.cur);
+		slist_delete_current(&iter);
+		pfree(mmps_node);
+	}
+	/* But this is important, as libpq manages memory on its own */
+	for (i = 0; i < nparts; i++)
+		finalize_mmp_state(&mmpss[i]);
 	close(epfd);
 }
 
@@ -431,9 +506,104 @@ epoll_subscribe(int epfd, MoveMPartState *mmps)
  * Actually run MoveMPart state machine. Return value says when (if ever)
  * we want to be executed again.
  */
-ExecMoveMPartRes
+void
 exec_move_mpart(MoveMPartState *mmps)
 {
+	switch (mmps->curstep)
+	{
+		case MOVEMPARTSTEP_START_TABLESYNC:
+			if (start_tablesync(mmps) == -1)
+				return;
+			break;
+	}
 	shmn_elog(DEBUG1, "Partition %s is moved", mmps->part_name);
-	return	EXECMOVEMPART_DONE;
+	mmps->res =	MOVEMPART_SUCCESS;
+	mmps->exec_res = EXECMOVEMPART_DONE;
+}
+
+
+/*
+ * Set up logical replication between src and dst. If anything goes wrong,
+ * it configures mmps properly and returns -1, otherwise 0.
+ */
+int
+start_tablesync(MoveMPartState *mmps)
+{
+	if (ensure_pqconn(mmps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
+		return -1;
+	return 0;
+}
+
+/*
+ * Ensure that pq connection to src and dst node is CONNECTION_OK. nodes
+ * is a bitmask specifying with which nodes -- src, dst or both -- connection
+ * must be ensured. -1 is returned if we have failed to establish connection;
+ * mmps is then configured to sleep retry time. 0 is returned if ok.
+ */
+int
+ensure_pqconn(MoveMPartState *mmps, int nodes)
+{
+	if ((nodes & ENSURE_PQCONN_SRC) &&
+		(ensure_pqconn_intern(&mmps->src_conn, mmps->src_connstr, mmps) == -1))
+		return -1;
+	if ((nodes & ENSURE_PQCONN_DST) &&
+		(ensure_pqconn_intern(&mmps->dst_conn, mmps->dst_connstr, mmps) == -1))
+		return -1;
+	return 0;
+}
+
+/*
+ * Working horse of ensure_pqconn
+ */
+int
+ensure_pqconn_intern(PGconn **conn, const char *connstr,
+					   MoveMPartState *mmps)
+{
+	if (*conn != NULL &&
+		PQstatus(*conn) != CONNECTION_OK)
+	{
+		PQfinish(*conn);
+		*conn = NULL;
+	}
+	if (*conn == NULL)
+	{
+		*conn = PQconnectdb(connstr);
+		if (PQstatus(*conn) != CONNECTION_OK)
+		{
+			shmn_elog(NOTICE, "Connection to node failed: %s",
+					  PQerrorMessage(*conn));
+			/* not checking for not enough memory error :( */
+			PQfinish(*conn);
+			*conn = NULL;
+			configure_retry(mmps, shardman_cmd_retry_naptime);
+			return -1;
+		}
+		shmn_elog(DEBUG1, "Connection to %s established", connstr);
+	}
+	return 0;
+}
+
+
+/*
+ * Configure mmps so that main loop wakes us again after given retry millis.
+ */
+static void configure_retry(MoveMPartState *mmps, int millis)
+{
+	mmps->waketm = timespec_now_plus_millis(millis);
+	mmps->exec_res = EXECMOVEMPART_WAKEMEUP;
+}
+
+/*
+ * Get current time + given milliseconds. Fails with PG elog(FATAL) if gettime
+ * failed. Not very generic, yes, but exactly what we need.
+ */
+struct timespec timespec_now_plus_millis(int millis)
+{
+	struct timespec t;
+	int e;
+
+	if ((e = clock_gettime(CLOCK_MONOTONIC, &t)) == -1)
+		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
+
+	return timespec_add_millis(t, millis);
 }
