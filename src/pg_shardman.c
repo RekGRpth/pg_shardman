@@ -714,3 +714,39 @@ get_worker_node_connstring(int node_id)
 	SPI_EPILOG;
 	return res;
 }
+
+/*
+ * Get node id on which given partition is stored. -1 is returned if there is
+ * no such partition.
+ */
+int32
+get_partition_owner(const char *part_name)
+{
+	char *sql;
+	bool isnull;
+	int owner;
+
+	SPI_PROLOG;
+	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
+		"select owner from shardman.partitions where part_name = '%s';",
+		part_name);
+
+	if (SPI_execute(sql, true, 0) < 0)
+	{
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+	}
+
+	if (SPI_processed == 0)
+	{
+		owner = -1;
+	}
+	else
+	{
+		owner =	DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc,
+											1, &isnull));
+	}
+
+	SPI_EPILOG;
+	return owner;
+}

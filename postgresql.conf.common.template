@@ -1,6 +1,9 @@
 shared_preload_libraries = 'pg_pathman, pg_shardman'
 
-log_min_messages = INFO
+# just to suppress logging
+autovacuum = off
+
+log_min_messages = DEBUG1
 # client_min_messages = NOTICE
 client_min_messages = INFO
 

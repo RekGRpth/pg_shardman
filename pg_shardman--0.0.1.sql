@@ -111,7 +111,6 @@ DECLARE
 	fdw_part_name text;
 BEGIN
 	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
-		raise info 'creating foreign table';
 		SELECT nodes.connstring FROM shardman.nodes WHERE id = NEW.owner
 		  INTO connstring;
 		EXECUTE format('DROP SERVER IF EXISTS %I CASCADE;', NEW.part_name);
@@ -208,7 +207,8 @@ CREATE TABLE local_meta (
 INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
 
 -- available commands
-CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions');
+CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
+						 'move_mpart');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress', 'success');
 
@@ -466,6 +466,21 @@ BEGIN
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, partitions_count);
 END
 $$ LANGUAGE plpgsql;
+
+-- Move master partition to another node. Params:
+-- 'part_name' is name of the partition to move
+-- 'dest' is id of the destination node
+CREATE FUNCTION move_mpart(part_name text, dest int) RETURNS int AS $$
+DECLARE
+	c_id int;
+BEGIN
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_mpart')
+										   RETURNING id INTO c_id;
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
+	RETURN c_id;
+END $$ LANGUAGE plpgsql;
+
 -- Otherwise partitioned tables on worker nodes not will be dropped properly,
 -- see pathman's docs.
 ALTER EVENT TRIGGER pathman_ddl_trigger ENABLE ALWAYS;

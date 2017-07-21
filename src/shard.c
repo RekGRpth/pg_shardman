@@ -7,8 +7,56 @@
  */
 #include "postgres.h"
 #include "libpq-fe.h"
+#include "lib/ilist.h"
+
+#include <time.h>
+#include <limits.h>
+#include <sys/epoll.h>
 
 #include "shard.h"
+#include "timeutils.h"
+
+typedef enum
+{
+	MOVEMPART_IN_PROGRESS,
+	MOVEMPART_FAILED,
+	MOVEMPART_SUCCESS
+} MoveMPartResult;
+
+/* result of one iteration of processing */
+typedef enum
+{
+	EXECMOVEMPART_EPOLL, /* add me to epoll on epolled_fd on EPOLLIN */
+	EXECMOVEMPART_WAKEMEUP, /* wake me up again on waketm */
+	EXECMOVEMPART_DONE /* the work is done, never invoke me again */
+} ExecMoveMPartRes;
+
+typedef struct
+{
+	const char *part_name; /* partition name */
+	int32 src_node; /* node we are moving partition from */
+	int32 dst_node; /* node we are moving partition to */
+	char *src_connstr;
+	char *dst_connstr;
+	struct timespec waketm; /* wake me up at waketm to do the job */
+	/* We need to epoll only on socket with dst to wait for copy */
+	 /* exec_move_mpart sets fd here when it wants to be wakened by epoll */
+	int fd_to_epoll;
+	int fd_in_epoll_set; /* socket *currently* in epoll set. -1 of none */
+	MoveMPartResult result;
+} MoveMPartState;
+
+typedef struct
+{
+	slist_node list_node;
+	MoveMPartState *mmps;
+} MoveMPartStateNode;
+
+static void init_mmp_state(MoveMPartState *mmps, const char *part_name,
+						   int32 dst_node);
+static void move_mparts(MoveMPartState *mmpss, int nparts);
+static int calc_timeout(slist_head *timeout_states);
+static ExecMoveMPartRes exec_move_mpart(MoveMPartState *mmps);
 
 /*
  * Steps are:
@@ -124,13 +172,14 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 	cmd_canceled(cmd);
 }
 
-
 /*
  * Move master partition to specified node. We
  * - Disable subscription on destination, otherwise we can't drop rep slot on
      source.
  * - Idempotently create publication and repl slot on source.
- * - Idempotently create table and subscription on destination.
+ * - Idempotently create table and async subscription on destination.
+ *   We use async subscription, because sync would block table while copy is
+ *   in progress. But with async, we have to lock the table after initial sync.
  * - Now inital copy has started, remember that at least in ram to retry
  *   from this point if network fails.
  * - Sleep & check in connection to the dest waiting for completion of the
@@ -145,9 +194,150 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
  *  If we don't save progress (whether initial sync started or done, lsn,
  *  etc), we have to start everything from the ground if master reboots. This
  *  is arguably fine.
+ *
  */
 void
 move_mpart(Cmd *cmd)
+{
+	char *part_name = cmd->opts[0];
+	int32 dst_node = atoi(cmd->opts[1]);
+
+	MoveMPartState *mmps = palloc(sizeof(MoveMPartState));
+	init_mmp_state(mmps, part_name, dst_node);
+
+	move_mparts(mmps, 1);
+	update_cmd_status(cmd->id, "success");
+}
+
+
+/*
+ * Fill MoveMPartState, retrieving needed data. If something goes wrong, we
+ * don't bother to fill the rest of fields.
+ */
+void
+init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
+{
+	int e;
+
+	mmps->part_name = part_name;
+	if ((mmps->src_node = get_partition_owner(part_name)) == -1)
+	{
+		shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
+				  part_name);
+		mmps->result = MOVEMPART_FAILED;
+		return;
+	}
+	mmps->dst_node = dst_node;
+
+	/* src_connstr is surely not NULL since src_node is referenced by
+	   part_name */
+	mmps->src_connstr = get_worker_node_connstr(mmps->src_node);
+	mmps->dst_connstr = get_worker_node_connstr(mmps->dst_node);
+	if (mmps->dst_connstr == NULL)
+	{
+		shmn_elog(WARNING, "Node %d doesn't exist, not moving %s to it",
+				  mmps->dst_node, part_name);
+		mmps->result = MOVEMPART_FAILED;
+		return;
+	}
+
+	/* Task is ready to be processed right now */
+	if ((e = clock_gettime(CLOCK_MONOTONIC, &mmps->waketm)) == -1)
+	{
+		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
+	}
+	mmps->fd_in_epoll_set = -1;
+
+	mmps->result = MOVEMPART_IN_PROGRESS;
+}
+
+/*
+ * Move partitions as specified in move_mpart_states list
+ */
+void
+move_mparts(MoveMPartState *mmpss, int nparts)
+{
+	/* list of sleeping mmp states we need to wake after specified timeout */
+	slist_head timeout_states = SLIST_STATIC_INIT(timeout_states);
+	slist_iter iter;
+
+	int timeout; /* at least one task will be ready after timeout millis */
+	int unfinished_moves = 0; /* number of not yet failed or succeeded tasks */
+	int i;
+	int e;
+	int epfd;
+
+	for (i = 0; i < nparts; i++)
+	{
+		if (mmpss[i].result != MOVEMPART_FAILED)
+		{
+			/* In the beginning, all tasks are ready immediately */
+			MoveMPartStateNode *mmps_node = palloc(sizeof(MoveMPartStateNode));
+			elog(DEBUG4, "Adding task %s to timeout list", mmpss[i].part_name);
+			mmps_node->mmps = &mmpss[i];
+			slist_push_head(&timeout_states, &mmps_node->list_node);
+			unfinished_moves++;
+		}
+	}
+
+	if ((epfd = epoll_create1(0)) == -1)
+	{
+		shmn_elog(FATAL, "epoll_create1 failed");
+	}
+
+	while (unfinished_moves > 0)
+	{
+		timeout = calc_timeout(&timeout_states);
+		unfinished_moves--;
+	}
+}
+
+/* Calculate when we need to wake if no epoll events are happening */
+int
+calc_timeout(slist_head *timeout_states)
+{
+	slist_iter iter;
+	struct timespec curtm;
+	int e;
+	int timeout = -1; /* If no tasks wait for us, don't wake */
+
+	slist_foreach(iter, timeout_states)
+	{
+		MoveMPartStateNode *mmps_node =
+			slist_container(MoveMPartStateNode, list_node, iter.cur);
+		MoveMPartState *mmps = mmps_node->mmps;
+		shmn_elog(DEBUG1, "Peeking into %s task wake time", mmps->part_name);
+		if ((e = clock_gettime(CLOCK_MONOTONIC, &curtm)) == -1)
+		{
+			shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
+		}
+		if (timespeccmp(curtm, mmps->waketm) >= 0)
+		{
+			shmn_elog(DEBUG1, "Task %s is already ready", mmps->part_name);
+			timeout = 0;
+			return timeout;
+		}
+		else
+		{
+			int diff = Max(0, timespec_diff_millis(mmps->waketm, curtm));
+			if (timeout == -1)
+				timeout = diff;
+			else
+				timeout = Min(timeout, diff);
+			shmn_elog(DEBUG1, "Timeout set to %d due to task %s ",
+					  timeout, mmps->part_name);
+		}
+	}
+
+	return timeout;
+}
+
+/*
+ * Actually run MoveMPart state machine. Return value says when (if ever)
+ * we want to be executed again.
+ */
+ExecMoveMPartRes
+exec_move_mpart(MoveMPartState *mmps)
 {
 
 }
