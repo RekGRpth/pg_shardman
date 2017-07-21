@@ -42,7 +42,7 @@ static void shardmaster_sigusr1(SIGNAL_ARGS);
 static void pg_shardman_installed_local(void);
 
 static void add_node(Cmd *cmd);
-static int insert_node(const char *connstring, int64 cmd_id);
+static int insert_node(const char *connstr, int64 cmd_id);
 static bool node_in_cluster(int id);
 
 static void rm_node(Cmd *cmd);
@@ -178,6 +178,8 @@ shardmaster_main(Datum main_arg)
 				rm_node(cmd);
 			else if (strcmp(cmd->cmd_type, "create_hash_partitions") == 0)
 				create_hash_partitions(cmd);
+			else if (strcmp(cmd->cmd_type, "move_mpart") == 0)
+				move_mpart(cmd);
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
@@ -211,12 +213,12 @@ void_spi(char *sql)
 PGconn *
 listen_cmd_log_inserts(void)
 {
-	char *connstring;
+	char *connstr;
 	PGresult   *res;
 
-	connstring = psprintf("dbname = %s", shardman_master_dbname);
-	conn = PQconnectdb(connstring);
-	pfree(connstring);
+	connstr = psprintf("dbname = %s", shardman_master_dbname);
+	conn = PQconnectdb(connstr);
+	pfree(connstr);
 	/* Check to see that the backend connection was successfully made */
 	if (PQstatus(conn) != CONNECTION_OK)
 		shmn_elog(FATAL, "Connection to local database failed: %s",
@@ -442,17 +444,17 @@ void
 add_node(Cmd *cmd)
 {
 	PGconn *conn = NULL;
-	const char *connstring = cmd->opts[0];
+	const char *connstr = cmd->opts[0];
     PGresult *res = NULL;
 	bool pg_shardman_installed;
-	int node_id;
+	int32 node_id;
 	char *sql;
 
-	shmn_elog(INFO, "Adding node %s", connstring);
+	shmn_elog(INFO, "Adding node %s", connstr);
 	/* Try to execute command indefinitely until it succeeded or canceled */
 	while (!got_sigusr1 && !got_sigterm)
 	{
-		conn = PQconnectdb(connstring);
+		conn = PQconnectdb(connstr);
 		if (PQstatus(conn) != CONNECTION_OK)
 		{
 			shmn_elog(NOTICE, "Connection to add_node node failed: %s",
@@ -488,12 +490,12 @@ add_node(Cmd *cmd)
 			{
 				/* Node is in cluster. Was it there before we started adding? */
 				node_id = atoi(PQgetvalue(res, 0, 0));
-				elog(INFO, "NODE IN CLUSTER, %d", node_id);
+				elog(DEBUG1, "node in cluster, %d", node_id);
 				PQclear(res);
 				if (node_in_cluster(node_id))
 				{
 					shmn_elog(WARNING, "node %d with connstring %s is already"
-							  " in cluster, won't add it.", node_id, connstring);
+							  " in cluster, won't add it.", node_id, connstr);
 					PQfinish(conn);
 					update_cmd_status(cmd->id, "failed");
 					return;
@@ -507,7 +509,7 @@ add_node(Cmd *cmd)
 		 * Now add node to 'nodes' table, if we haven't done that yet, and
 		 * record that we did so for this cmd
 		 */
-		node_id = insert_node(connstring, cmd->id);
+		node_id = insert_node(connstr, cmd->id);
 
 		/*
 		 * reinstall the extension to reset its state, whether is was
@@ -560,7 +562,7 @@ add_node(Cmd *cmd)
 
 		/* done */
 		elog(INFO, "Node %s successfully added, it is assigned id %d",
-			 connstring, node_id);
+			 connstr, node_id);
 		return;
 
 attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
@@ -580,12 +582,12 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 
 /* See sql func */
 static int
-insert_node(const char *connstring, int64 cmd_id)
+insert_node(const char *connstr, int64 cmd_id)
 {
 	char *sql = psprintf("select shardman.insert_node('%s', %ld)",
-							 connstring, cmd_id);
+							 connstr, cmd_id);
 	int e;
-	int node_id;
+	int32 node_id;
 	bool isnull;
 
 	SPI_PROLOG;
@@ -636,7 +638,7 @@ node_in_cluster(int id)
 void
 rm_node(Cmd *cmd)
 {
-	int node_id = atoi(cmd->opts[0]);
+	int32 node_id = atoi(cmd->opts[0]);
 	char *sql;
 
 	elog(INFO, "Removing node %d ", node_id);
@@ -678,11 +680,11 @@ rm_node(Cmd *cmd)
 
 
 /*
- * Get connstring of worker node with id node_id. Memory is palloc'ed.
+ * Get connstr of worker node with id node_id. Memory is palloc'ed.
  * NULL is returned, if there is no such node.
  */
 char*
-get_worker_node_connstring(int node_id)
+get_worker_node_connstr(int node_id)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 	char *sql = psprintf("select connstring from shardman.nodes where id = %d"

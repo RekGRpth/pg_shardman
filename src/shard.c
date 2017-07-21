@@ -67,11 +67,11 @@ static ExecMoveMPartRes exec_move_mpart(MoveMPartState *mmps);
 void
 create_hash_partitions(Cmd *cmd)
 {
-	int node_id = atoi(cmd->opts[0]);
+	int32 node_id = atoi(cmd->opts[0]);
 	const char *relation = cmd->opts[1];
 	const char *expr = cmd->opts[2];
 	int partitions_count = atoi(cmd->opts[3]);
-	char *connstring;
+	char *connstr;
 	PGconn *conn = NULL;
 	PGresult *res = NULL;
 	char *sql;
@@ -92,8 +92,8 @@ create_hash_partitions(Cmd *cmd)
 		update_cmd_status(cmd->id, "failed");
 		return;
 	}
-	/* connstring mem freed with ctxt */
-	if ((connstring = get_worker_node_connstring(node_id)) == NULL)
+	/* connstr mem freed with ctxt */
+	if ((connstr = get_worker_node_connstr(node_id)) == NULL)
 	{
 		shmn_elog(WARNING, "create_hash_partitions failed, no such worker node: %d",
 				  node_id);
@@ -107,12 +107,12 @@ create_hash_partitions(Cmd *cmd)
 		"begin; select create_hash_partitions('%s', '%s', %d); end;"
 		"select shardman.gen_create_table_sql('%s', '%s');",
 		relation, expr, partitions_count,
-		relation, connstring);
+		relation, connstr);
 
 	/* Try to execute command indefinitely until it succeeded or canceled */
 	while (!got_sigusr1 && !got_sigterm)
 	{
-		conn = PQconnectdb(connstring);
+		conn = PQconnectdb(connstr);
 		if (PQstatus(conn) != CONNECTION_OK)
 		{
 			shmn_elog(NOTICE, "Connection to node failed: %s",
