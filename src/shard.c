@@ -16,6 +16,9 @@
 #include "shard.h"
 #include "timeutils.h"
 
+/* epoll max events */
+#define MAX_EVENTS 64
+
 typedef enum
 {
 	MOVEMPART_IN_PROGRESS,
@@ -55,7 +58,7 @@ typedef struct
 static void init_mmp_state(MoveMPartState *mmps, const char *part_name,
 						   int32 dst_node);
 static void move_mparts(MoveMPartState *mmpss, int nparts);
-static int calc_timeout(slist_head *timeout_states);
+static int calc_timeout(struct timespec waketm, bool waketm_set);
 static ExecMoveMPartRes exec_move_mpart(MoveMPartState *mmps);
 
 /*
@@ -260,18 +263,28 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	/* list of sleeping mmp states we need to wake after specified timeout */
 	slist_head timeout_states = SLIST_STATIC_INIT(timeout_states);
 	slist_iter iter;
-
-	int timeout; /* at least one task will be ready after timeout millis */
+	/* at least one task will require our attention at waketm */
+	struct timespec waketm;
+	/* Yes, we could use field of waketm for that. */
+	bool waketm_set;
+	int timeout;
 	int unfinished_moves = 0; /* number of not yet failed or succeeded tasks */
 	int i;
 	int e;
 	int epfd;
+	struct epoll_event evlist[MAX_EVENTS];
 
+	/* In the beginning, all tasks are ready for execution, so wake tm is right
+	 * is actually current time. We also need to put all tasks to the
+	 * timeout_states list to invoke them.
+	 */
+	if ((e = clock_gettime(CLOCK_MONOTONIC, &waketm)) == -1)
+		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
+	waketm_set = true;
 	for (i = 0; i < nparts; i++)
 	{
 		if (mmpss[i].result != MOVEMPART_FAILED)
 		{
-			/* In the beginning, all tasks are ready immediately */
 			MoveMPartStateNode *mmps_node = palloc(sizeof(MoveMPartStateNode));
 			elog(DEBUG4, "Adding task %s to timeout list", mmpss[i].part_name);
 			mmps_node->mmps = &mmpss[i];
@@ -285,50 +298,46 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 		shmn_elog(FATAL, "epoll_create1 failed");
 	}
 
+	/* TODO: check for signals */
 	while (unfinished_moves > 0)
 	{
-		timeout = calc_timeout(&timeout_states);
+		timeout = calc_timeout(waketm, waketm_set);
+		e = epoll_wait(epfd, evlist, MAX_EVENTS, timeout);
+		if (e == -1)
+		{
+			if (errno == EINTR)
+				continue;
+			else
+				shmn_elog(FATAL, "epoll_wait failed, %s", strerror(e));
+		}
 		unfinished_moves--;
 	}
 }
 
-/* Calculate when we need to wake if no epoll events are happening */
+/*
+ * Calculate when we need to wake if no epoll events are happening.
+ * Returned value is ready for epoll_wait.
+ */
 int
-calc_timeout(slist_head *timeout_states)
+calc_timeout(struct timespec waketm, bool waketm_set)
 {
-	slist_iter iter;
-	struct timespec curtm;
 	int e;
-	int timeout = -1; /* If no tasks wait for us, don't wake */
+	struct timespec curtm;
+	int timeout;
 
-	slist_foreach(iter, timeout_states)
-	{
-		MoveMPartStateNode *mmps_node =
-			slist_container(MoveMPartStateNode, list_node, iter.cur);
-		MoveMPartState *mmps = mmps_node->mmps;
-		shmn_elog(DEBUG1, "Peeking into %s task wake time", mmps->part_name);
-		if ((e = clock_gettime(CLOCK_MONOTONIC, &curtm)) == -1)
-		{
+	if (!waketm_set)
+		return -1;
+
+	if ((e = clock_gettime(CLOCK_MONOTONIC, &curtm)) == -1)
 			shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
-		}
-		if (timespeccmp(curtm, mmps->waketm) >= 0)
-		{
-			shmn_elog(DEBUG1, "Task %s is already ready", mmps->part_name);
-			timeout = 0;
-			return timeout;
-		}
-		else
-		{
-			int diff = Max(0, timespec_diff_millis(mmps->waketm, curtm));
-			if (timeout == -1)
-				timeout = diff;
-			else
-				timeout = Min(timeout, diff);
-			shmn_elog(DEBUG1, "Timeout set to %d due to task %s ",
-					  timeout, mmps->part_name);
-		}
+	if (timespeccmp(waketm, curtm) <= 0)
+	{
+		shmn_elog(DEBUG1, "Non-negative timeout, waking immediately");
+		return 0;
 	}
 
+	timeout = Max(0, timespec_diff_millis(waketm, curtm));
+	shmn_elog(DEBUG1, "Timeout is %d", timeout);
 	return timeout;
 }
 
