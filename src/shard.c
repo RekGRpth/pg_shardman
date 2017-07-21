@@ -9,6 +9,7 @@
 #include "libpq-fe.h"
 #include "lib/ilist.h"
 
+#include <unistd.h>
 #include <time.h>
 #include <limits.h>
 #include <sys/epoll.h>
@@ -59,6 +60,9 @@ static void init_mmp_state(MoveMPartState *mmps, const char *part_name,
 						   int32 dst_node);
 static void move_mparts(MoveMPartState *mmpss, int nparts);
 static int calc_timeout(struct timespec waketm, bool waketm_set);
+static void update_waketm(struct timespec *waketm, bool *waketm_set,
+						  MoveMPartState *mmps);
+static void epoll_subscribe(int epfd, MoveMPartState *mmps);
 static ExecMoveMPartRes exec_move_mpart(MoveMPartState *mmps);
 
 /*
@@ -249,6 +253,7 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 	{
 		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
 	}
+	mmps->fd_to_epoll = -1;
 	mmps->fd_in_epoll_set = -1;
 
 	mmps->result = MOVEMPART_IN_PROGRESS;
@@ -262,11 +267,12 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 {
 	/* list of sleeping mmp states we need to wake after specified timeout */
 	slist_head timeout_states = SLIST_STATIC_INIT(timeout_states);
-	slist_iter iter;
+	slist_mutable_iter iter;
 	/* at least one task will require our attention at waketm */
 	struct timespec waketm;
 	/* Yes, we could use field of waketm for that. */
 	bool waketm_set;
+	struct timespec curtm;
 	int timeout;
 	int unfinished_moves = 0; /* number of not yet failed or succeeded tasks */
 	int i;
@@ -294,9 +300,7 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	}
 
 	if ((epfd = epoll_create1(0)) == -1)
-	{
 		shmn_elog(FATAL, "epoll_create1 failed");
-	}
 
 	/* TODO: check for signals */
 	while (unfinished_moves > 0)
@@ -310,8 +314,47 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 			else
 				shmn_elog(FATAL, "epoll_wait failed, %s", strerror(e));
 		}
-		unfinished_moves--;
+
+		/* Run all tasks for which it is time to wake */
+		waketm_set = false; /* reset waketm */
+		slist_foreach_modify(iter, &timeout_states)
+		{
+			MoveMPartStateNode *mmps_node =
+				slist_container(MoveMPartStateNode, list_node, iter.cur);
+			MoveMPartState *mmps = mmps_node->mmps;
+			if ((e = clock_gettime(CLOCK_MONOTONIC, &curtm)) == -1)
+				shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
+
+			if (timespeccmp(mmps->waketm, curtm) <= 0)
+			{
+				shmn_elog(DEBUG1, "%s is ready for exec", mmps->part_name);
+				switch (exec_move_mpart(mmps))
+				{
+					case EXECMOVEMPART_WAKEMEUP:
+						/* We need to wake this task again, update waketm and
+						 * keep it in the list */
+						update_waketm(&waketm, &waketm_set, mmps);
+						continue;
+
+					case EXECMOVEMPART_EPOLL:
+						/* Task wants to be wakened by epoll */
+						epoll_subscribe(epfd, mmps);
+						break;
+
+					case EXECMOVEMPART_DONE:
+						/* Task is done, decrement the counter */
+						unfinished_moves--;
+						break;
+				}
+				/* If we are still here, remove node from timeouts_list */
+				slist_delete_current(&iter);
+				/* And free memory */
+				pfree(mmps_node);
+			}
+		}
 	}
+
+	close(epfd);
 }
 
 /*
@@ -342,11 +385,55 @@ calc_timeout(struct timespec waketm, bool waketm_set)
 }
 
 /*
+ * Update min waketm
+ */
+void
+update_waketm(struct timespec *waketm, bool *waketm_set, MoveMPartState *mmps)
+{
+	if (!(*waketm_set) || timespeccmp(mmps->waketm, *waketm) < 0)
+	{
+		shmn_elog(DEBUG1, "Waketm updated, old s %d, new s %d",
+				  (int) waketm->tv_sec, (int) mmps->waketm.tv_sec);
+		*waketm_set = true;
+		*waketm = mmps->waketm;
+	}
+}
+
+/*
+ * Ensure that mmps is registered in epoll and set proper mode.
+ * We never remove fds from epoll, they should be removed automatically when
+ * closed.
+ */
+void
+epoll_subscribe(int epfd, MoveMPartState *mmps)
+{
+	struct epoll_event ev;
+	int e;
+
+	ev.data.ptr = mmps;
+	ev.events = EPOLLIN | EPOLLONESHOT;
+	Assert(mmps->fd_to_epoll != -1);
+	if (mmps->fd_to_epoll == mmps->fd_in_epoll_set)
+	{
+		if ((e = epoll_ctl(epfd, EPOLL_CTL_MOD, mmps->fd_to_epoll, &ev)) == -1)
+			shmn_elog(FATAL, "epoll_ctl failed, %s", strerror(e));
+	}
+	else
+	{
+		if ((e = epoll_ctl(epfd, EPOLL_CTL_ADD, mmps->fd_to_epoll, &ev)) == -1)
+			shmn_elog(FATAL, "epoll_ctl failed, %s", strerror(e));
+		mmps->fd_in_epoll_set = mmps->fd_to_epoll;
+	}
+	shmn_elog(DEBUG1, "socket for task %s added to epoll", mmps->part_name);
+}
+
+/*
  * Actually run MoveMPart state machine. Return value says when (if ever)
  * we want to be executed again.
  */
 ExecMoveMPartRes
 exec_move_mpart(MoveMPartState *mmps)
 {
-
+	shmn_elog(DEBUG1, "Partition %s is moved", mmps->part_name);
+	return	EXECMOVEMPART_DONE;
 }
