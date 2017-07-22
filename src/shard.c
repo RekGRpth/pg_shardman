@@ -51,15 +51,27 @@ typedef struct
 	const char *part_name; /* partition name */
 	int32 src_node; /* node we are moving partition from */
 	int32 dst_node; /* node we are moving partition to */
-	char *src_connstr;
-	char *dst_connstr;
-	struct timespec waketm; /* wake me up at waketm to do the job */
+	const char *src_connstr;
+	const char *dst_connstr;
+	/* wake me up at waketm to do the job. Try to keep it zero when invalid	*/
+	struct timespec waketm;
 	/* We need to epoll only on socket with dst to wait for copy */
 	 /* exec_move_mpart sets fd here when it wants to be wakened by epoll */
 	int fd_to_epoll;
 	int fd_in_epoll_set; /* socket *currently* in epoll set. -1 of none */
 	PGconn *src_conn; /* connection to src */
 	PGconn *dst_conn; /* connection to dst */
+
+	/*
+	 * The following strs are constant during execution; we allocate them
+	 * once in init func and they disappear with cmd mem ctxt
+	 */
+	char *logname; /* name of publication, repslot and subscription */
+	char *dst_drop_sub_sql; /* sql to drop sub on dst node */
+	char *src_create_pub_and_rs_sql; /* create publ and repslot on src */
+	char *relation; /* name of sharded relation */
+	char *dst_create_tab_and_sub_sql; /* create table and sub on dst */
+
 	MoveMPartStep curstep; /* current step */
 	ExecMoveMPartRes exec_res; /* result of the last iteration */
 	MoveMPartRes res; /* result of the whole move */
@@ -75,15 +87,15 @@ static void init_mmp_state(MoveMPartState *mmps, const char *part_name,
 						   int32 dst_node);
 static void finalize_mmp_state(MoveMPartState *mmps);
 static void move_mparts(MoveMPartState *mmpss, int nparts);
-static int calc_timeout(struct timespec waketm, bool waketm_set);
-static void update_waketm(struct timespec *waketm, bool *waketm_set,
-						  MoveMPartState *mmps);
+static int calc_timeout(slist_head *timeout_states);
 static void epoll_subscribe(int epfd, MoveMPartState *mmps);
 static void exec_move_mpart(MoveMPartState *mmps);
 static int start_tablesync(MoveMPartState *mmpts);
 static int ensure_pqconn(MoveMPartState *mmpts, int nodes);
 static int ensure_pqconn_intern(PGconn **conn, const char *connstr,
 								MoveMPartState *mmps);
+static void reset_pqconn(PGconn **conn);
+static void reset_pqconn_and_res(PGconn **conn, PGresult *res);
 static void configure_retry(MoveMPartState *mmpts, int millis);
 static struct timespec timespec_now_plus_millis(int millis);
 
@@ -131,7 +143,9 @@ create_hash_partitions(Cmd *cmd)
 	}
 
 	/* Note that we have to run statements in separate transactions, otherwise
-	 * we have a deadlock between pathman and pg_dump */
+	 * we have a deadlock between pathman and pg_dump.
+	 * pfree'd with ctxt
+	 */
 	sql = psprintf(
 		"begin; select create_hash_partitions('%s', '%s', %d); end;"
 		"select shardman.gen_create_table_sql('%s', '%s');",
@@ -295,6 +309,24 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 	mmps->src_conn = NULL;
 	mmps->dst_conn = NULL;
 
+	/* constant strings */
+	mmps->logname = psprintf("shardman_copy_%s_%d_%d",
+							 mmps->part_name, mmps->src_node, mmps->dst_node);
+	mmps->dst_drop_sub_sql = psprintf(
+		"drop subscription if exists %s cascade;", mmps->logname);
+	mmps->src_create_pub_and_rs_sql = psprintf(
+		"drop publication if exists %s cascade;"
+		" create publication %s for table %s;"
+		" select shardman.create_repslot('%s');",
+		mmps->logname, mmps->logname, mmps->part_name, mmps->logname
+		);
+	mmps->relation = get_partition_relation(part_name);
+	mmps->dst_create_tab_and_sub_sql = psprintf(
+		"drop table if exists %s cascade;"
+		" create table %s (like %s including defaults including indexes"
+		" including storage);",
+		mmps->part_name, mmps->part_name, mmps->relation);
+
 	mmps->curstep = MOVEMPARTSTEP_START_TABLESYNC;
 	mmps->res = MOVEMPART_IN_PROGRESS;
 }
@@ -305,15 +337,9 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 static void finalize_mmp_state(MoveMPartState *mmps)
 {
 	if (mmps->src_conn != NULL)
-	{
-		PQfinish(mmps->src_conn);
-		mmps->src_conn = NULL;
-	}
+		reset_pqconn(&mmps->src_conn);
 	if (mmps->dst_conn != NULL)
-	{
-		PQfinish(mmps->dst_conn);
-		mmps->dst_conn = NULL;
-	}
+		reset_pqconn(&mmps->dst_conn);
 }
 
 /*
@@ -330,8 +356,6 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	slist_mutable_iter iter;
 	/* at least one task will require our attention at waketm */
 	struct timespec waketm;
-	/* Yes, we could use field of waketm for that. */
-	bool waketm_set;
 	struct timespec curtm;
 	int timeout;
 	int unfinished_moves = 0; /* number of not yet failed or succeeded tasks */
@@ -346,13 +370,12 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	 */
 	if ((e = clock_gettime(CLOCK_MONOTONIC, &waketm)) == -1)
 		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
-	waketm_set = true;
 	for (i = 0; i < nparts; i++)
 	{
 		if (mmpss[i].res != MOVEMPART_FAILED)
 		{
 			MoveMPartStateNode *mmps_node = palloc(sizeof(MoveMPartStateNode));
-			elog(DEBUG4, "Adding task %s to timeout list", mmpss[i].part_name);
+			elog(DEBUG2, "Adding task %s to timeout list", mmpss[i].part_name);
 			mmps_node->mmps = &mmpss[i];
 			slist_push_head(&timeout_states, &mmps_node->list_node);
 			unfinished_moves++;
@@ -365,7 +388,7 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	/* TODO: check for signals */
 	while (unfinished_moves > 0 && !got_sigusr1 && !got_sigterm)
 	{
-		timeout = calc_timeout(waketm, waketm_set);
+		timeout = calc_timeout(&timeout_states);
 		e = epoll_wait(epfd, evlist, MAX_EVENTS, timeout);
 		if (e == -1)
 		{
@@ -376,7 +399,6 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 		}
 
 		/* Run all tasks for which it is time to wake */
-		waketm_set = false; /* reset waketm */
 		slist_foreach_modify(iter, &timeout_states)
 		{
 			MoveMPartStateNode *mmps_node =
@@ -392,9 +414,8 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 				switch (mmps->exec_res)
 				{
 					case EXECMOVEMPART_WAKEMEUP:
-						/* We need to wake this task again, update waketm and
-						 * keep it in the list */
-						update_waketm(&waketm, &waketm_set, mmps);
+						/* We need to wake this task again, to keep it in
+						 * in the list and just continue */
 						continue;
 
 					case EXECMOVEMPART_EPOLL:
@@ -409,7 +430,7 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 				}
 				/* If we are still here, remove node from timeouts_list */
 				slist_delete_current(&iter);
-				/* And free memory */
+				/* And free node */
 				pfree(mmps_node);
 			}
 		}
@@ -437,12 +458,37 @@ move_mparts(MoveMPartState *mmpss, int nparts)
  * Returned value is ready for epoll_wait.
  */
 int
-calc_timeout(struct timespec waketm, bool waketm_set)
+calc_timeout(slist_head *timeout_states)
 {
+	slist_iter iter;
 	int e;
 	struct timespec curtm;
 	int timeout;
+	/* could use timespec field for this, but that's more readable */
+	bool waketm_set = false;
+	struct timespec waketm; /* min of all waketms */
 
+	/* calc min waketm */
+	slist_foreach(iter, timeout_states)
+	{
+		MoveMPartStateNode *mmps_node =
+			slist_container(MoveMPartStateNode, list_node, iter.cur);
+		MoveMPartState *mmps = mmps_node->mmps;
+
+		/* If waketm is not set, what this node does in this list? */
+		Assert(mmps->waketm.tv_nsec != 0);
+		if (!waketm_set || timespeccmp(mmps->waketm, waketm) < 0)
+		{
+			shmn_elog(DEBUG1, "Waketm updated, old %d s, new %d s",
+					  waketm_set ? (int) waketm.tv_sec : 0,
+					  (int) mmps->waketm.tv_sec);
+			waketm = mmps->waketm;
+			waketm_set = true;
+		}
+
+	}
+
+	/* now calc timeout */
 	if (!waketm_set)
 		return -1;
 
@@ -455,23 +501,8 @@ calc_timeout(struct timespec waketm, bool waketm_set)
 	}
 
 	timeout = Max(0, timespec_diff_millis(waketm, curtm));
-	shmn_elog(DEBUG1, "Timeout is %d", timeout);
+	shmn_elog(DEBUG1, "New timeout is %d ms", timeout);
 	return timeout;
-}
-
-/*
- * Update min waketm
- */
-void
-update_waketm(struct timespec *waketm, bool *waketm_set, MoveMPartState *mmps)
-{
-	if (!(*waketm_set) || timespeccmp(mmps->waketm, *waketm) < 0)
-	{
-		shmn_elog(DEBUG1, "Waketm updated, old s %d, new s %d",
-				  (int) waketm->tv_sec, (int) mmps->waketm.tv_sec);
-		*waketm_set = true;
-		*waketm = mmps->waketm;
-	}
 }
 
 /*
@@ -509,18 +540,19 @@ epoll_subscribe(int epfd, MoveMPartState *mmps)
 void
 exec_move_mpart(MoveMPartState *mmps)
 {
+	/* Mark waketm as invalid for safety */
+	mmps->waketm = (struct timespec) {0};
+
 	switch (mmps->curstep)
 	{
 		case MOVEMPARTSTEP_START_TABLESYNC:
 			if (start_tablesync(mmps) == -1)
 				return;
-			break;
 	}
 	shmn_elog(DEBUG1, "Partition %s is moved", mmps->part_name);
 	mmps->res =	MOVEMPART_SUCCESS;
 	mmps->exec_res = EXECMOVEMPART_DONE;
 }
-
 
 /*
  * Set up logical replication between src and dst. If anything goes wrong,
@@ -529,9 +561,35 @@ exec_move_mpart(MoveMPartState *mmps)
 int
 start_tablesync(MoveMPartState *mmps)
 {
+	PGresult *res;
+
 	if (ensure_pqconn(mmps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
+
+	res = PQexec(mmps->dst_conn, mmps->dst_drop_sub_sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		shmn_elog(NOTICE, "Failed to drop sub on dst: %s",
+				  PQerrorMessage(mmps->dst_conn));
+		reset_pqconn_and_res(&mmps->dst_conn, res);
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	PQclear(res);
+	shmn_elog(DEBUG1, "mmp %s: sub on dst dropped, if any", mmps->part_name);
+
+	res = PQexec(mmps->src_conn, mmps->src_create_pub_and_rs_sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		shmn_elog(NOTICE, "Failed to create pub and repslot on src: %s",
+				  PQerrorMessage(mmps->src_conn));
+		reset_pqconn_and_res(&mmps->src_conn, res);
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
 	return 0;
+	PQclear(res);
+	shmn_elog(DEBUG1, "mmp %s: pub and rs recreated on src", mmps->part_name);
 }
 
 /*
@@ -562,8 +620,7 @@ ensure_pqconn_intern(PGconn **conn, const char *connstr,
 	if (*conn != NULL &&
 		PQstatus(*conn) != CONNECTION_OK)
 	{
-		PQfinish(*conn);
-		*conn = NULL;
+		reset_pqconn(conn);
 	}
 	if (*conn == NULL)
 	{
@@ -572,9 +629,7 @@ ensure_pqconn_intern(PGconn **conn, const char *connstr,
 		{
 			shmn_elog(NOTICE, "Connection to node failed: %s",
 					  PQerrorMessage(*conn));
-			/* not checking for not enough memory error :( */
-			PQfinish(*conn);
-			*conn = NULL;
+			reset_pqconn(conn);
 			configure_retry(mmps, shardman_cmd_retry_naptime);
 			return -1;
 		}
@@ -583,12 +638,27 @@ ensure_pqconn_intern(PGconn **conn, const char *connstr,
 	return 0;
 }
 
+/*
+ * Finish pq connection and set ptr to NULL. You must be sure that the
+ * connection exists!
+ */
+void
+reset_pqconn(PGconn **conn) { PQfinish(*conn); *conn = NULL; }
+/* Same, but also clear res. You must be sure it exists */
+void
+reset_pqconn_and_res(PGconn **conn, PGresult *res)
+{
+	PQclear(res); reset_pqconn(conn);
+}
+
 
 /*
  * Configure mmps so that main loop wakes us again after given retry millis.
  */
-static void configure_retry(MoveMPartState *mmps, int millis)
+void configure_retry(MoveMPartState *mmps, int millis)
 {
+	shmn_elog(DEBUG1, "Moving mpart %s: sleeping %d ms and retrying",
+			  mmps->part_name, millis);
 	mmps->waketm = timespec_now_plus_millis(millis);
 	mmps->exec_res = EXECMOVEMPART_WAKEMEUP;
 }

@@ -525,13 +525,13 @@ add_node(Cmd *cmd)
 		}
 		PQclear(res);
 
-		/* Create replication slot, if not yet */
+		/* Create replication slot */
 		sql = psprintf("select shardman.create_repslot('shardman_meta_sub_%d');",
 					   node_id);
 		void_spi(sql);
 		pfree(sql);
 
-		/* Create subscription and set node it on itself */
+		/* Create subscription and set node id on itself */
 		sql = psprintf(
 			"create subscription shardman_meta_sub connection '%s'"
 			"publication shardman_meta_pub with (create_slot = false,"
@@ -751,4 +751,42 @@ get_partition_owner(const char *part_name)
 
 	SPI_EPILOG;
 	return owner;
+}
+
+/*
+ * Get relation name of partition part_name. Memory is palloc'ed.
+ * NULL is returned, if there is no such partition.
+ */
+char*
+get_partition_relation(const char *part_name)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	char *sql = psprintf("select relation from shardman.partitions"
+						 " where part_name = '%s';", part_name);
+	char *res;
+
+	SPI_PROLOG;
+
+	if (SPI_execute(sql, true, 0) < 0)
+	{
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+	}
+	pfree(sql);
+
+	if (SPI_processed == 0)
+	{
+		res = NULL;
+	}
+	else
+	{
+		HeapTuple tuple = SPI_tuptable->vals[0];
+		TupleDesc rowdesc = SPI_tuptable->tupdesc;
+		/* We need to allocate connstring in our ctxt, not spi's */
+		MemoryContext spicxt = MemoryContextSwitchTo(oldcxt);
+		res = SPI_getvalue(tuple, rowdesc, 1);
+		MemoryContextSwitchTo(spicxt);
+	}
+
+	SPI_EPILOG;
+	return res;
 }

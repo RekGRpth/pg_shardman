@@ -301,17 +301,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Create logical pgoutput replication slot, if not exists
+-- Recreate logical pgoutput replication slot. Drops existing slot.
 CREATE FUNCTION create_repslot(slot_name text) RETURNS void AS $$
-DECLARE
-	slot_exists bool;
 BEGIN
-	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
-				   WHERE slot_name=%L)', slot_name) INTO slot_exists;
-	IF NOT slot_exists THEN
-		EXECUTE format('SELECT pg_create_logical_replication_slot(%L, %L)',
-					   slot_name, 'pgoutput');
-	END IF;
+	PERFORM shardman.drop_repslot(slot_name);
+	EXECUTE format('SELECT pg_create_logical_replication_slot(%L, %L)',
+				   slot_name, 'pgoutput');
 END
 $$ LANGUAGE plpgsql;
 
@@ -321,7 +316,7 @@ DECLARE
 	slot_exists bool;
 BEGIN
 	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
-				   WHERE slot_name=%L)', slot_name) INTO slot_exists;
+				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
 		EXECUTE format('SELECT pg_drop_replication_slot(%L)', slot_name);
 	END IF;

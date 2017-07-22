@@ -49,5 +49,5 @@ timespec_diff_millis(struct timespec t1, struct timespec t2)
 {
 	int sec_diff = t1.tv_sec - t2.tv_sec;
 	long nsec_diff = t1.tv_nsec - t2.tv_nsec;
-	return sec_diff * 1000 + nsec_diff / 1000;
+	return sec_diff * 1000 + nsec_diff / MILLION;
 }
