@@ -340,10 +340,14 @@ BEGIN
 			EXECUTE format('DROP SUBSCRIPTION %I', sub.subname);
 		END IF;
 	END LOOP;
-	FOR rs IN SELECT slot_name FROM pg_replication_slots
-		WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
-		EXECUTE format('SELECT pg_drop_replication_slot(%L)', rs.slot_name);
-	END LOOP;
+	-- TODO: we can't just drop replication slots because
+	-- pg_drop_replication_slot will bail out with ERROR if connection is active.
+	-- We should therefore iterate over all active subscribers and turn off
+	-- subscriptions first.
+	-- FOR rs IN SELECT slot_name FROM pg_replication_slots
+		-- WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
+		-- EXECUTE format('SELECT pg_drop_replication_slot(%L)', rs.slot_name);
+	-- END LOOP;
 
 	PERFORM shardman.reset_node_id();
 END;

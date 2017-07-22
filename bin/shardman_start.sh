@@ -6,7 +6,7 @@ source "${script_dir}/common.sh"
 cd "${script_dir}/.."
 make clean
 
-restart_nodes
+restart_nodes # make sure nodes run
 for port in $master_port "${worker_ports[@]}"; do
     psql -p $port -c "drop extension if exists pg_shardman;"
 done
