@@ -288,19 +288,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- These tables will be replicated to worker nodes, notifying them about changes.
--- Called on worker nodes.
-CREATE FUNCTION create_meta_sub() RETURNS void AS $$
-DECLARE
-	master_connstring text;
-BEGIN
-	SELECT pg_settings.setting into master_connstring from pg_settings
-		WHERE NAME = 'shardman.master_connstring';
-	-- Note that 'CONNECTION $1...' USING master_connstring won't work here
-	EXECUTE format('CREATE SUBSCRIPTION shardman_meta_sub CONNECTION %L PUBLICATION shardman_meta_pub', master_connstring);
-END;
-$$ LANGUAGE plpgsql;
-
 -- Recreate logical pgoutput replication slot. Drops existing slot.
 CREATE FUNCTION create_repslot(slot_name text) RETURNS void AS $$
 BEGIN

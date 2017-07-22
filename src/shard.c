@@ -43,7 +43,8 @@ typedef enum
 /* Current step of 1 master partition move */
 typedef enum
 {
-	MOVEMPARTSTEP_START_TABLESYNC
+	MOVEMPARTSTEP_START_TABLESYNC,
+	MOVEMPARTSTEP_WAIT_TABLESYNC
 } MoveMPartStep;
 
 typedef struct
@@ -314,18 +315,37 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 							 mmps->part_name, mmps->src_node, mmps->dst_node);
 	mmps->dst_drop_sub_sql = psprintf(
 		"drop subscription if exists %s cascade;", mmps->logname);
+	/*
+	 * Note that we run stmts in separate txns: repslot can't be created in in
+	 * transaction that performed writes
+	 */
 	mmps->src_create_pub_and_rs_sql = psprintf(
-		"drop publication if exists %s cascade;"
-		" create publication %s for table %s;"
+		"begin; drop publication if exists %s cascade;"
+		" create publication %s for table %s; end;"
 		" select shardman.create_repslot('%s');",
 		mmps->logname, mmps->logname, mmps->part_name, mmps->logname
 		);
 	mmps->relation = get_partition_relation(part_name);
 	mmps->dst_create_tab_and_sub_sql = psprintf(
 		"drop table if exists %s cascade;"
+		/*
+		 * TODO: we are mimicking pathman's partition creation here. At least
+		 * one difference is that we don't copy foreign keys, so this should
+		 * be fixed. For example, we could directly call pathman's
+		 * create_single_partition_internal func here, though currently it is
+		 * static. We could also just use old empty partition and not remove
+		 * it, but considering (in very far perspective) ALTER TABLE this is
+		 * wrong approach.
+		 */
 		" create table %s (like %s including defaults including indexes"
-		" including storage);",
-		mmps->part_name, mmps->part_name, mmps->relation);
+		" including storage);"
+		" drop subscription if exists %s cascade;"
+		" create subscription %s connection '%s' publication %s with"
+		"   (create_slot = false, slot_name = '%s');",
+		mmps->part_name,
+		mmps->part_name, mmps->relation,
+		mmps->logname,
+		mmps->logname, mmps->src_connstr, mmps->logname, mmps->logname);
 
 	mmps->curstep = MOVEMPARTSTEP_START_TABLESYNC;
 	mmps->res = MOVEMPART_IN_PROGRESS;
@@ -543,12 +563,14 @@ exec_move_mpart(MoveMPartState *mmps)
 	/* Mark waketm as invalid for safety */
 	mmps->waketm = (struct timespec) {0};
 
-	switch (mmps->curstep)
+	if (mmps->curstep == MOVEMPARTSTEP_START_TABLESYNC)
 	{
-		case MOVEMPARTSTEP_START_TABLESYNC:
-			if (start_tablesync(mmps) == -1)
-				return;
+		if (start_tablesync(mmps) == -1)
+			return;
+		else
+			mmps->curstep =	MOVEMPARTSTEP_WAIT_TABLESYNC;
 	}
+
 	shmn_elog(DEBUG1, "Partition %s is moved", mmps->part_name);
 	mmps->res =	MOVEMPART_SUCCESS;
 	mmps->exec_res = EXECMOVEMPART_DONE;
@@ -579,7 +601,7 @@ start_tablesync(MoveMPartState *mmps)
 	shmn_elog(DEBUG1, "mmp %s: sub on dst dropped, if any", mmps->part_name);
 
 	res = PQexec(mmps->src_conn, mmps->src_create_pub_and_rs_sql);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		shmn_elog(NOTICE, "Failed to create pub and repslot on src: %s",
 				  PQerrorMessage(mmps->src_conn));
@@ -587,9 +609,23 @@ start_tablesync(MoveMPartState *mmps)
 		configure_retry(mmps, shardman_cmd_retry_naptime);
 		return -1;
 	}
-	return 0;
 	PQclear(res);
 	shmn_elog(DEBUG1, "mmp %s: pub and rs recreated on src", mmps->part_name);
+
+	res = PQexec(mmps->dst_conn, mmps->dst_create_tab_and_sub_sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		shmn_elog(NOTICE, "Failed to recreate table & sub on dst: %s",
+				  PQerrorMessage(mmps->dst_conn));
+		reset_pqconn_and_res(&mmps->dst_conn, res);
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	PQclear(res);
+	shmn_elog(DEBUG1, "mmp %s: table & sub created on dst, tablesync started",
+			  mmps->part_name);
+
+	return 0;
 }
 
 /*
