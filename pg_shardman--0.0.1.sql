@@ -407,8 +407,6 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION readonly_table_on(relation regclass)
 	RETURNS void AS $$
 BEGIN
-	-- Grab exclusive lock on table to finish existing transactions
-	PERFORM shardman.ae_lock_table(relation);
 	-- Create go away trigger to prevent any new ones
 	PERFORM shardman.readonly_table_off(relation);
 	EXECUTE format(

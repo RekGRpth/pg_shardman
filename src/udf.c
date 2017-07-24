@@ -269,15 +269,3 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 	PQconninfoFree(opts);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
-
-/*
- * Obtain AccessExclusiveLock on table
- */
-PG_FUNCTION_INFO_V1(ae_lock_table);
-Datum
-ae_lock_table(PG_FUNCTION_ARGS)
-{
-	Oid relid = PG_GETARG_OID(0);
-	LockRelationOid(relid, AccessExclusiveLock);
-	PG_RETURN_VOID();
-}
