@@ -403,6 +403,38 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Make table read-only
+CREATE FUNCTION readonly_table_on(relation regclass)
+	RETURNS void AS $$
+BEGIN
+	-- Grab exclusive lock on table to finish existing transactions
+	PERFORM shardman.ae_lock_table(relation);
+	-- Create go away trigger to prevent any new ones
+	PERFORM shardman.readonly_table_off(relation);
+	EXECUTE format(
+		'CREATE TRIGGER shardman_readonly BEFORE INSERT OR UPDATE OR DELETE OR
+		TRUNCATE ON %I FOR EACH STATEMENT EXECUTE PROCEDURE shardman.go_away();',
+		relation);
+	EXECUTE format(
+		'ALTER TABLE %I ENABLE ALWAYS TRIGGER shardman_readonly;', relation);
+END
+$$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION go_away() RETURNS TRIGGER AS $$
+BEGIN
+	RAISE EXCEPTION 'The "%" table is read only.', TG_TABLE_NAME
+		USING HINT = 'Probably table copy is in progress';
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION ae_lock_table(relation regclass) RETURNS void
+	AS 'pg_shardman' LANGUAGE C;
+-- And make it writable again
+CREATE FUNCTION readonly_table_off(relation regclass)
+	RETURNS void AS $$
+BEGIN
+	EXECUTE format('DROP TRIGGER IF EXISTS shardman_readonly ON %s', relation);
+END $$ LANGUAGE plpgsql STRICT;
+
 CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS text
     AS 'pg_shardman' LANGUAGE C;
 

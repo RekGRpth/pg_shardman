@@ -554,8 +554,8 @@ epoll_subscribe(int epfd, MoveMPartState *mmps)
 }
 
 /*
- * Actually run MoveMPart state machine. Return value says when (if ever)
- * we want to be executed again.
+ * Actually run MoveMPart state machine. On return, mmps values say when (if
+ * ever) we want to be executed again.
  */
 void
 exec_move_mpart(MoveMPartState *mmps)
