@@ -112,6 +112,59 @@ BEGIN
 	RETURN format('%s_fdw', part_name);
 END $$ LANGUAGE plpgsql STRICT;
 
+-- Drop all foreign server's option. Yes, I don't know simpler ways.
+CREATE FUNCTION reset_foreign_server_opts(srvname name) RETURNS void AS $$
+DECLARE
+	opts text[];
+	opt text;
+	opt_key text;
+BEGIN
+	EXECUTE format($q$select coalesce(srvoptions, '{}'::text[] from
+									  pg_foreign_server where srvname = %L$q$,
+									  srvname) INTO opts;
+	FOREACH opt IN ARRAY opts LOOP
+		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
+		EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', srvname, opt_key);
+	END LOOP;
+END $$ LANGUAGE plpgsql STRICT;
+-- Same for resetting user mapping opts
+CREATE or replace FUNCTION reset_um_opts(srvname name, umuser regrole)
+	RETURNS void AS $$
+DECLARE
+	opts text[];
+	opt text;
+	opt_key text;
+BEGIN
+	EXECUTE format($q$select coalesce(umoptions, '{}'::text[]) from
+				   pg_user_mapping ums join pg_foreign_server fs
+				   on fs.oid = ums.umserver where fs.srvname = %L and
+				   ums.umuser = umuser$q$, srvname)
+		INTO opts;
+
+	FOREACH opt IN ARRAY opts LOOP
+		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
+		EXECUTE format('ALTER USER MAPPING FOR %I SERVER %I OPTIONS (DROP %s);',
+					   umuser::name, srvname, opt_key);
+	END LOOP;
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Update foreign server and user mapping params according to partition part, so
+-- this is expected to be called on server/um params change. We use dedicated
+-- server for each partition because we plan to use multiple hosts/ports in
+-- connstrings for transient fallback to replica if server with main partition
+-- fails. FDW server, user mapping, foreign table and (obviously) parent partition must
+-- exist when called.
+CREATE FUNCTION update_fdw_server(part partitions) RETURNS void AS $$
+DECLARE
+	connstring text;
+BEGIN
+	-- ALTER FOREIGN TABLE doesn't support changing server, ALTER SERVER doesn't
+	-- support dropping all params, and I don't want to recreate foreign table
+	-- each time server params change, so resorting to these hacks.
+	PERFORM shardman.reset_foreign_server_opts(part.part_name);
+	PERFORM shardman.reset_um_opts(part.part_name, current_user::regrole);
+END $$ LANGUAGE plpgsql STRICT;
+
 -- Replace existing hash partition with foreign, assuming 'partition' shows
 -- where it is stored. Existing partition is dropped.
 CREATE FUNCTION replace_usual_part_with_foreign(part partitions)
@@ -122,10 +175,10 @@ DECLARE
 	server_opts text;
 	um_opts text;
 BEGIN
-	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
-	  INTO connstring;
 	EXECUTE format('DROP SERVER IF EXISTS %I CASCADE;', part.part_name);
 
+	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
+		INTO connstring;
 	SELECT * INTO server_opts, um_opts FROM
 		(SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)) opts;
 
@@ -157,7 +210,7 @@ BEGIN
 							format('%I', part.relation))),
 							part.part_name,
 							part.part_name);
-	-- Finally, replace local partition with foreign table
+	-- replace local partition with foreign table
 	EXECUTE format('SELECT replace_hash_partition(%L, %L)',
 				   part.part_name, fdw_part_name);
 	-- And drop old table
@@ -216,6 +269,8 @@ BEGIN
 		PERFORM shardman.eliminate_sub(movepart_logname);
 		PERFORM shardman.replace_foreign_part_with_usual(NEW);
 	ELSE -- other nodes
+		-- just update foreign server
+		PERFORM shardman.update_fdw_server(part);
 	END IF;
 	RETURN NULL;
 END
