@@ -105,6 +105,13 @@ CREATE TABLE partitions (
 	owner int REFERENCES nodes(id) -- node on which partition lies
 );
 
+-- We use _fdw suffix for foreign tables to avoid interleaving with real
+-- ones.
+CREATE FUNCTION get_fdw_part_name(part_name name) RETURNS name AS $$
+BEGIN
+	RETURN format('%s_fdw', part_name);
+END $$ LANGUAGE plpgsql STRICT;
+
 -- Replace existing hash partition with foreign, assuming 'partition' shows
 -- where it is stored. Existing partition is dropped.
 CREATE FUNCTION replace_usual_part_with_foreign(part partitions)
@@ -128,9 +135,7 @@ BEGIN
 				   part.part_name);
 	EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I
 				   %s;', part.part_name, um_opts);
-	-- We use _fdw suffix for foreign tables to avoid interleaving with real
-	-- ones.
-	SELECT format('%s_fdw', part.part_name) INTO fdw_part_name;
+	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
 	EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', fdw_part_name);
 
 	-- Generate and execute CREATE FOREIGN TABLE sql statement which will
@@ -179,7 +184,13 @@ ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_partition;
 CREATE FUNCTION replace_foreign_part_with_usual(part partitions)
 	RETURNS void AS $$
 DECLARE
+	fdw_part_name name;
 BEGIN
+	ASSERT to_regclass(part.part_name) IS NOT NULL;
+	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
+	EXECUTE format('SELECT replace_hash_partition(%L, %L);',
+				   fdw_part_name, part.part_name);
+	EXECUTE format('DROP FOREIGN TABLE %I;', fdw_part_name);
 END $$ LANGUAGE plpgsql;
 
 -- Update metadata according to partition move
@@ -188,14 +199,23 @@ END $$ LANGUAGE plpgsql;
 CREATE FUNCTION partition_moved() RETURNS TRIGGER AS $$
 DECLARE
 	movepart_logname text; -- name of logical pub, sub, repslot for copying, etc
+	my_id int;
 BEGIN
 	ASSERT NEW.owner != OLD.owner, 'partition_moved handles only moved parts';
 	movepart_logname := format('shardman_copy_%s_%s_%s',
 							   OLD.part_name, OLD.owner, NEW.owner);
-	IF OLD.owner == (SELECT shardman.get_node_id()) THEN -- src node
-		-- Drop
+	my_id := (SELECT shardman.get_node_id());
+	IF my_id = OLD.owner THEN -- src node
+		-- Drop publication & repslot used for copy
+		EXECUTE format('DROP PUBLICATION IF EXISTS %I', movepart_logname);
+		PERFORM shardman.drop_repslot(movepart_logname, true);
 		-- On src node, replace its partition with foreign one
-		PERFORM replace_usual_part_with_foreign(NEW);
+		PERFORM shardman.replace_usual_part_with_foreign(NEW);
+	ELSEIF my_id = NEW.owner THEN -- dst node
+		-- Drop subscription used for copy
+		PERFORM shardman.eliminate_sub(movepart_logname);
+		PERFORM shardman.replace_foreign_part_with_usual(NEW);
+	ELSE -- other nodes
 	END IF;
 	RETURN NULL;
 END
@@ -321,6 +341,7 @@ CREATE FUNCTION drop_repslot(slot_name text, with_fire bool DEFAULT false)
 DECLARE
 	slot_exists bool;
 BEGIN
+	RAISE DEBUG 'Dropping repslot %', slot_name;
 	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
 				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
@@ -338,6 +359,25 @@ CREATE FUNCTION terminate_repslot_walsender(slot_name text) RETURNS void AS $$
 BEGIN
 	EXECUTE format('SELECT pg_terminate_backend(active_pid) FROM
 				   pg_replication_slots WHERE slot_name = %L', slot_name);
+END $$ LANGUAGE plpgsql STRICT;
+
+-- If sub exists, disable it, detach repslot from it and possibly drop. We
+-- manage repslots ourselves, so it is essential to detach rs before dropping
+-- sub, and repslots can't be detached while subscription is active.
+CREATE FUNCTION eliminate_sub(subname name, drop_sub bool DEFAULT true)
+	RETURNS void AS $$
+DECLARE
+	sub_exists bool;
+BEGIN
+	EXECUTE format('SELECT count(*) > 0 FROM pg_subscription WHERE subname
+				   = %L', subname) INTO sub_exists;
+	IF sub_exists THEN
+		EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', subname);
+		EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', subname);
+		IF drop_sub THEN
+			EXECUTE format('DROP SUBSCRIPTION %I', subname);
+		END IF;
+	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Remove all our logical replication stuff in case of drop extension.
@@ -363,12 +403,7 @@ BEGIN
 		EXECUTE format('DROP PUBLICATION %I', pub.pubname);
 	END LOOP;
 	FOR sub IN SELECT subname FROM pg_subscription WHERE subname LIKE 'shardman_%' LOOP
-		-- we are managing rep slots manually, so we need to detach it beforehand
-		EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', sub.subname);
-		EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', sub.subname);
-		IF drop_subs THEN
-			EXECUTE format('DROP SUBSCRIPTION %I', sub.subname);
-		END IF;
+		PERFORM shardman.eliminate_sub(sub.subname, drop_subs);
 	END LOOP;
 	-- TODO: drop repslots gracefully? For that we should iterate over all active
 	-- subscribers and turn off subscriptions first.
