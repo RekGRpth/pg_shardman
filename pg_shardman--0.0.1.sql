@@ -105,98 +105,66 @@ CREATE TABLE partitions (
 	owner int REFERENCES nodes(id) -- node on which partition lies
 );
 
+-- Replace existing hash partition with foreign, assuming 'partition' shows
+-- where it is stored. Existing partition is dropped.
+CREATE FUNCTION replace_usual_part_with_foreign(part partitions)
+	RETURNS void AS $$
+DECLARE
+	connstring text;
+	fdw_part_name text;
+	server_opts text;
+	um_opts text;
+BEGIN
+	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
+	  INTO connstring;
+	EXECUTE format('DROP SERVER IF EXISTS %I CASCADE;', part.part_name);
+
+	SELECT * INTO server_opts, um_opts FROM
+		(SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)) opts;
+
+	EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER
+				   postgres_fdw %s;', part.part_name, server_opts);
+	EXECUTE format('DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER %I;',
+				   part.part_name);
+	EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I
+				   %s;', part.part_name, um_opts);
+	-- We use _fdw suffix for foreign tables to avoid interleaving with real
+	-- ones.
+	SELECT format('%s_fdw', part.part_name) INTO fdw_part_name;
+	EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', fdw_part_name);
+
+	-- Generate and execute CREATE FOREIGN TABLE sql statement which will
+	-- clone the existing local table schema. In constrast to
+	-- gen_create_table_sql, here we need only the header of the table,
+	-- i.e. its attributes. CHECK constraint for partition will be added
+	-- during the attachment, and other stuff doesn't seem to have much
+	-- sense on foreign table.
+	-- In fact, we should have CREATE FOREIGN TABLE (LIKE ...) to make this
+	-- sane. We could also used here IMPORT FOREIGN SCHEMA, but it
+	-- unneccessary involves network (we already have this schema locally)
+	-- and dangerous: what if table was created and dropped before this
+	-- change reached us? We might also use it with local table (create
+	-- foreign server pointing to it, etc), but that's just ugly.
+	EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I OPTIONS (table_name %L)',
+				   fdw_part_name,
+				   (SELECT
+						shardman.reconstruct_table_attrs(
+							format('%I', part.relation))),
+							part.part_name,
+							part.part_name);
+	-- Finally, replace local partition with foreign table
+	EXECUTE format('SELECT replace_hash_partition(%L, %L)',
+				   part.part_name, fdw_part_name);
+	-- And drop old table
+	EXECUTE format('DROP TABLE %I', part.part_name);
+END $$ LANGUAGE plpgsql;
+
 -- On adding new partition, create proper foreign server & foreign table and
 -- replace tmp (empty) partition with it.
 CREATE FUNCTION new_partition() RETURNS TRIGGER AS $$
-DECLARE
-	connstring text;
-	connstring_keywords text[];
-	connstring_vals text[];
-	server_opts text default '';
-	um_opts text default '';
-	server_opts_first_time_through bool DEFAULT true;
-	um_opts_first_time_through bool DEFAULT true;
-	fdw_part_name text;
 BEGIN
 	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
-		SELECT nodes.connstring FROM shardman.nodes WHERE id = NEW.owner
-		  INTO connstring;
-		EXECUTE format('DROP SERVER IF EXISTS %I CASCADE;', NEW.part_name);
-		-- Options to postgres_fdw are specified in two places: user & password
-		-- in user mapping and everything else in create server. The problem is
-		-- that we use single connstring, however user mapping and server
-		-- doesn't understand this format, i.e. we can't say create server
-		-- ... options (dbname 'port=4848 host=blabla.org'). So we have to parse
-		-- the opts and pass them manually. libpq knows how to do it, but
-		-- doesn't expose that. On the other hand, quote_literal (which is
-		-- neccessary here) doesn't have handy C API. I resorted to have C
-		-- function which parses the opts and returns them in two parallel
-		-- arrays, and here we join them with quoting.
-		SELECT * FROM shardman.pq_conninfo_parse(connstring)
-		  INTO connstring_keywords, connstring_vals;
-		FOR i IN 1..(SELECT array_upper(connstring_keywords, 1)) LOOP
-			IF connstring_keywords[i] = 'client_encoding' OR
-				connstring_keywords[i] = 'fallback_application_name' THEN
-				CONTINUE; /* not allowed in postgres_fdw */
-			ELSIF connstring_keywords[i] = 'user' OR
-				connstring_keywords[i] = 'password' THEN -- user mapping option
-				IF NOT um_opts_first_time_through THEN
-					um_opts := um_opts || ', ';
-				END IF;
-				um_opts_first_time_through := false;
-				um_opts := um_opts ||
-					format('%s %L', connstring_keywords[i], connstring_vals[i]);
-			ELSE -- server option
-				IF NOT server_opts_first_time_through THEN
-					server_opts := server_opts || ', ';
-				END IF;
-				server_opts_first_time_through := false;
-				server_opts := server_opts ||
-					format('%s %L', connstring_keywords[i], connstring_vals[i]);
-			END IF;
-		END LOOP;
-		-- OPTIONS () is syntax error, so add OPTIONS only if we really have opts
-		IF server_opts != '' THEN
-			server_opts := format(' OPTIONS (%s)', server_opts);
-		END IF;
-		IF um_opts != '' THEN
-			um_opts := format(' OPTIONS (%s)', um_opts);
-		END IF;
-		EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER
-					   postgres_fdw %s;', NEW.part_name, server_opts);
-		EXECUTE format('DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER %I;',
-					   NEW.part_name);
-		EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I
-					   %s;', NEW.part_name, um_opts);
-		-- We use _fdw suffix for foreign tables to avoid interleaving with real
-		-- ones.
-		SELECT format('%s_fdw', NEW.part_name) INTO fdw_part_name;
-		EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', fdw_part_name);
-
-		-- Generate and execute CREATE FOREIGN TABLE sql statement which will
-		-- clone the existing local table schema. In constrast to
-		-- gen_create_table_sql, here we need only the header of the table,
-		-- i.e. its attributes. CHECK constraint for partition will be added
-		-- during the attachment, and other stuff doesn't seem to have much
-		-- sense on foreign table.
-		-- In fact, we should have CREATE FOREIGN TABLE (LIKE ...) to make this
-		-- sane.  We could also used here IMPORT FOREIGN SCHEMA, but it
-		-- unneccessary involves network (we already have this schema locally)
-		-- and dangerous: what if table was created and dropped before this
-		-- change reached us?
-
-		EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I OPTIONS (table_name %L)',
-					   fdw_part_name,
-					   (SELECT
-							shardman.reconstruct_table_attrs(
-								format('%I', NEW.part_name))),
-						NEW.part_name,
-						NEW.part_name);
-		-- Finally, replace empty local tmp partition with foreign table
-		EXECUTE format('SELECT replace_hash_partition(%L, %L)',
-					   NEW.part_name, fdw_part_name);
-		-- And drop old empty table
-		EXECUTE format('DROP TABLE %I', NEW.part_name);
+		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
 	RETURN NULL;
 END
@@ -205,6 +173,37 @@ CREATE TRIGGER new_partition AFTER INSERT ON shardman.partitions
 	FOR EACH ROW EXECUTE PROCEDURE new_partition();
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_partition;
+
+-- Replace foreign table-partition with local. The latter must exist!
+-- Foreign table will be dropped.
+CREATE FUNCTION replace_foreign_part_with_usual(part partitions)
+	RETURNS void AS $$
+DECLARE
+BEGIN
+END $$ LANGUAGE plpgsql;
+
+-- Update metadata according to partition move
+-- On adding new partition, create proper foreign server & foreign table and
+-- replace tmp (empty) partition with it.
+CREATE FUNCTION partition_moved() RETURNS TRIGGER AS $$
+DECLARE
+	movepart_logname text; -- name of logical pub, sub, repslot for copying, etc
+BEGIN
+	ASSERT NEW.owner != OLD.owner, 'partition_moved handles only moved parts';
+	movepart_logname := format('shardman_copy_%s_%s_%s',
+							   OLD.part_name, OLD.owner, NEW.owner);
+	IF OLD.owner == (SELECT shardman.get_node_id()) THEN -- src node
+		-- Drop
+		-- On src node, replace its partition with foreign one
+		PERFORM replace_usual_part_with_foreign(NEW);
+	END IF;
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER partition_moved AFTER UPDATE ON shardman.partitions
+	FOR EACH ROW EXECUTE PROCEDURE partition_moved();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER partition_moved;
 
 -- Currently it is used just to store node id, in general we can keep any local
 -- node metadata here. If is ever used extensively, probably hstore suits better.
@@ -218,7 +217,8 @@ INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
 CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
 						 'move_mpart');
 -- command status
-CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress', 'success');
+CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
+								'success');
 
 CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
@@ -305,18 +305,40 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Drop replication slot, if it exists
-CREATE FUNCTION drop_repslot(slot_name text) RETURNS void AS $$
+-- Drop replication slot, if it exists.
+-- About 'hard' option: we can't just drop replication slots because
+-- pg_drop_replication_slot will bail out with ERROR if connection is active.
+-- Therefore the caller must either ensure that the connection is dead (e.g.
+-- drop subscription on far end) or pass 'true' to 'with_fire' option, which does
+-- the following dirty hack. It kills twice active walsender with 1 second
+-- interval. After the first kill, replica will immediately try to reconnect,
+-- so the connection resurrects instantly. However, if we kill it second time,
+-- replica won't try to reconnect until wal_retrieve_retry_interval after its
+-- first reaction passes, which is 5 secs by default. Of course, this is not
+-- reliable and should be redesigned.
+CREATE FUNCTION drop_repslot(slot_name text, with_fire bool DEFAULT false)
+	RETURNS void AS $$
 DECLARE
 	slot_exists bool;
 BEGIN
 	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
 				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
+		IF with_fire THEN -- kill walsender twice
+			RAISE DEBUG 'Killing repslot % with fire', slot_name;
+			PERFORM shardman.terminate_repslot_walsender(slot_name);
+			PERFORM pg_sleep(1);
+			PERFORM shardman.terminate_repslot_walsender(slot_name);
+		END IF;
 		EXECUTE format('SELECT pg_drop_replication_slot(%L)', slot_name);
 	END IF;
 END
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION terminate_repslot_walsender(slot_name text) RETURNS void AS $$
+BEGIN
+	EXECUTE format('SELECT pg_terminate_backend(active_pid) FROM
+				   pg_replication_slots WHERE slot_name = %L', slot_name);
+END $$ LANGUAGE plpgsql STRICT;
 
 -- Remove all our logical replication stuff in case of drop extension.
 -- Dropping extension cleanup is not that easy:
@@ -348,14 +370,12 @@ BEGIN
 			EXECUTE format('DROP SUBSCRIPTION %I', sub.subname);
 		END IF;
 	END LOOP;
-	-- TODO: we can't just drop replication slots because
-	-- pg_drop_replication_slot will bail out with ERROR if connection is active.
-	-- We should therefore iterate over all active subscribers and turn off
-	-- subscriptions first.
-	-- FOR rs IN SELECT slot_name FROM pg_replication_slots
-		-- WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
-		-- EXECUTE format('SELECT pg_drop_replication_slot(%L)', rs.slot_name);
-	-- END LOOP;
+	-- TODO: drop repslots gracefully? For that we should iterate over all active
+	-- subscribers and turn off subscriptions first.
+	FOR rs IN SELECT slot_name FROM pg_replication_slots
+		WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
+		PERFORM shardman.drop_repslot(rs.slot_name, true);
+	END LOOP;
 
 	PERFORM shardman.reset_node_id();
 END;
@@ -445,6 +465,60 @@ CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS tex
 CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 	RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
+-- Options to postgres_fdw are specified in two places: user & password in user
+-- mapping and everything else in create server. The problem is that we use
+-- single connstring, however user mapping and server doesn't understand this
+-- format, i.e. we can't say create server ... options (dbname 'port=4848
+-- host=blabla.org'). So we have to parse the opts and pass them manually. libpq
+-- knows how to do it, but doesn't expose that. On the other hand, quote_literal
+-- (which is neccessary here) doesn't seem to have handy C API. I resorted to
+-- have C function which parses the opts and returns them in two parallel
+-- arrays, and this sql function joins them with quoting.
+-- Returns two strings: one with opts ready to pass to CREATE FOREIGN SERVER
+-- stmt, and one wih opts ready to pass to CREATE USER MAPPING.
+CREATE FUNCTION conninfo_to_postgres_fdw_opts(
+	IN connstring text, OUT server_opts text, OUT um_opts text)
+	RETURNS record AS $$
+DECLARE
+	connstring_keywords text[];
+	connstring_vals text[];
+	server_opts_first_time_through bool DEFAULT true;
+	um_opts_first_time_through bool DEFAULT true;
+BEGIN
+	server_opts := '';
+	um_opts := '';
+	SELECT * FROM shardman.pq_conninfo_parse(connstring)
+	  INTO connstring_keywords, connstring_vals;
+	FOR i IN 1..(SELECT array_upper(connstring_keywords, 1)) LOOP
+		IF connstring_keywords[i] = 'client_encoding' OR
+			connstring_keywords[i] = 'fallback_application_name' THEN
+			CONTINUE; /* not allowed in postgres_fdw */
+		ELSIF connstring_keywords[i] = 'user' OR
+			connstring_keywords[i] = 'password' THEN -- user mapping option
+			IF NOT um_opts_first_time_through THEN
+				um_opts := um_opts || ', ';
+			END IF;
+			um_opts_first_time_through := false;
+			um_opts := um_opts ||
+				format('%s %L', connstring_keywords[i], connstring_vals[i]);
+		ELSE -- server option
+			IF NOT server_opts_first_time_through THEN
+				server_opts := server_opts || ', ';
+			END IF;
+			server_opts_first_time_through := false;
+			server_opts := server_opts ||
+				format('%s %L', connstring_keywords[i], connstring_vals[i]);
+		END IF;
+	END LOOP;
+
+	-- OPTIONS () is syntax error, so add OPTIONS only if we really have opts
+	IF server_opts != '' THEN
+		server_opts := format(' OPTIONS (%s)', server_opts);
+	END IF;
+	IF um_opts != '' THEN
+		um_opts := format(' OPTIONS (%s)', um_opts);
+	END IF;
+END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals text[])
 	RETURNS record AS 'pg_shardman' LANGUAGE C STRICT;
 
