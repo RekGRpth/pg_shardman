@@ -56,6 +56,7 @@ bool shardman_master;
 char *shardman_master_dbname;
 char *shardman_master_connstring;
 int shardman_cmd_retry_naptime;
+int shardman_poll_interval;
 
 /* Just global vars. */
 /* Connection to local server for LISTEN notifications. Is is global for easy
@@ -70,6 +71,7 @@ void
 _PG_init()
 {
 	BackgroundWorker shardmaster_worker;
+	char *desc;
 
 	if (!process_shared_preload_libraries_in_progress)
 	{
@@ -114,6 +116,20 @@ _PG_init()
 							"Sleep time in millisec between retrying to execute failing command",
 							NULL,
 							&shardman_cmd_retry_naptime,
+							10000,
+							0,
+							INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+	desc = "Unfortunately, some actions are not yet implemented using proper"
+		"notifications and we need to poll the target node to learn progress."
+		"This variable specifies how often (in milliseconds) we do that.";
+	DefineCustomIntVariable("shardman.poll_interval",
+							desc,
+							NULL,
+							&shardman_poll_interval,
 							10000,
 							0,
 							INT_MAX,

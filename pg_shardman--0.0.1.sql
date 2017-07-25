@@ -59,16 +59,24 @@ CREATE TABLE tables (
 );
 
 -- On adding new table, create this table on non-owner nodes using provided sql
--- and partition it.
+-- and partition it. We destroy all existing tables with needed names.
 CREATE FUNCTION new_table_worker_side() RETURNS TRIGGER AS $$
+DECLARE
+	partition_names text[];
+	pname text;
 BEGIN
 	IF NEW.initial_node != (SELECT shardman.get_node_id()) THEN
-		EXECUTE format ('DROP TABLE IF EXISTS %I CASCADE;', NEW.relation);
+		EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', NEW.relation);
+		partition_names :=
+			(SELECT ARRAY(SELECT part_name FROM shardman.gen_part_names(
+				NEW.relation, NEW.partitions_count)));
+		FOREACH pname IN ARRAY partition_names LOOP
+			EXECUTE format('DROP TABLE IF EXISTS %I', pname);
+		END LOOP;
 		EXECUTE format('%s', NEW.create_sql);
 		EXECUTE format('select create_hash_partitions(%L, %L, %L, true, %L);',
 					   NEW.relation, NEW.expr, NEW.partitions_count,
-					   (SELECT ARRAY(SELECT part_name FROM shardman.gen_part_names(
-						   NEW.relation, NEW.partitions_count))));
+					   partition_names);
 	END IF;
 	RETURN NULL;
 END
@@ -424,8 +432,6 @@ BEGIN
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
-CREATE FUNCTION ae_lock_table(relation regclass) RETURNS void
-	AS 'pg_shardman' LANGUAGE C;
 -- And make it writable again
 CREATE FUNCTION readonly_table_off(relation regclass)
 	RETURNS void AS $$

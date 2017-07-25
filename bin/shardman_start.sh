@@ -9,7 +9,7 @@ make clean
 restart_nodes # make sure nodes run
 # first workers, then master
 for port in "${worker_ports[@]}" $master_port; do
-    psql -p $port -c "drop extension if exists pg_shardman;"
+    psql -p $port -c "drop extension if exists pg_shardman cascade;"
 done
 
 restart_nodes

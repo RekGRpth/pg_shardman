@@ -7,6 +7,9 @@
  */
 #include "postgres.h"
 #include "libpq-fe.h"
+#include "access/xlogdefs.h"
+#include "utils/pg_lsn.h"
+#include "utils/builtins.h"
 #include "lib/ilist.h"
 
 #include <unistd.h>
@@ -40,11 +43,15 @@ typedef enum
 	EXECMOVEMPART_DONE /* the work is done, never invoke me again */
 } ExecMoveMPartRes;
 
-/* Current step of 1 master partition move */
+/*
+ *  Current step of 1 master partition move. See comments to corresponding
+ *  funcs, e.g. start_tablesync.
+ */
 typedef enum
 {
 	MOVEMPARTSTEP_START_TABLESYNC,
-	MOVEMPARTSTEP_WAIT_TABLESYNC
+	MOVEMPARTSTEP_START_FINALSYNC,
+	MOVEMPARTSTEP_FINALIZE
 } MoveMPartStep;
 
 typedef struct
@@ -72,7 +79,12 @@ typedef struct
 	char *src_create_pub_and_rs_sql; /* create publ and repslot on src */
 	char *relation; /* name of sharded relation */
 	char *dst_create_tab_and_sub_sql; /* create table and sub on dst */
+	char *substate_sql; /* get current state of subscription */
+	char *readonly_sql; /* make src table read-only */
+	char *received_lsn_sql; /* get last received lsn on dst */
+	char *update_metadata_sql;
 
+	XLogRecPtr sync_point; /* when dst reached this point, it is synced */
 	MoveMPartStep curstep; /* current step */
 	ExecMoveMPartRes exec_res; /* result of the last iteration */
 	MoveMPartRes res; /* result of the whole move */
@@ -92,6 +104,8 @@ static int calc_timeout(slist_head *timeout_states);
 static void epoll_subscribe(int epfd, MoveMPartState *mmps);
 static void exec_move_mpart(MoveMPartState *mmps);
 static int start_tablesync(MoveMPartState *mmpts);
+static int start_finalsync(MoveMPartState *mmpts);
+static int finalize(MoveMPartState *mmpts);
 static int ensure_pqconn(MoveMPartState *mmpts, int nodes);
 static int ensure_pqconn_intern(PGconn **conn, const char *connstr,
 								MoveMPartState *mmps);
@@ -229,7 +243,7 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
  * - Sleep & check in connection to the dest waiting for completion of the
  *   initial sync. Later this should be substituted with listen/notify.
  * - When done, lock writes (better lock reads too) on source and remember
- *   current wal lsn on it.
+ *   pg_current_wal_lsn() on it.
  * - Now final sync has started, remember that at least in ram.
  * - Sleep & check in connection to dest waiting for completion of final sync,
  *   i.e. when received_lsn is equal to remembered lsn on src.
@@ -346,6 +360,21 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 		mmps->part_name, mmps->relation,
 		mmps->logname,
 		mmps->logname, mmps->src_connstr, mmps->logname, mmps->logname);
+	mmps->substate_sql = psprintf(
+		"select srsubstate from pg_subscription_rel srel join pg_subscription"
+		" s on srel.srsubid = s.oid where subname = '%s';",
+		mmps->logname
+		);
+	mmps->readonly_sql = psprintf(
+		"select shardman.readonly_table_on('%s')", mmps->part_name
+		);
+	mmps->received_lsn_sql = psprintf(
+		"select received_lsn from pg_stat_subscription where subname = '%s'",
+		mmps->logname
+		);
+	mmps->update_metadata_sql = psprintf(
+		"update shardman.partitions set owner = %d where part_name = '%s';",
+		mmps->dst_node, mmps->part_name);
 
 	mmps->curstep = MOVEMPARTSTEP_START_TABLESYNC;
 	mmps->res = MOVEMPART_IN_PROGRESS;
@@ -405,7 +434,6 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	if ((epfd = epoll_create1(0)) == -1)
 		shmn_elog(FATAL, "epoll_create1 failed");
 
-	/* TODO: check for signals */
 	while (unfinished_moves > 0 && !got_sigusr1 && !got_sigterm)
 	{
 		timeout = calc_timeout(&timeout_states);
@@ -567,13 +595,13 @@ exec_move_mpart(MoveMPartState *mmps)
 	{
 		if (start_tablesync(mmps) == -1)
 			return;
-		else
-			mmps->curstep =	MOVEMPARTSTEP_WAIT_TABLESYNC;
 	}
-
-	shmn_elog(DEBUG1, "Partition %s is moved", mmps->part_name);
-	mmps->res =	MOVEMPART_SUCCESS;
-	mmps->exec_res = EXECMOVEMPART_DONE;
+	if (mmps->curstep == MOVEMPARTSTEP_START_FINALSYNC)
+	{
+		if (start_finalsync(mmps) == -1)
+			return;
+	}
+	finalize(mmps);
 }
 
 /*
@@ -625,6 +653,136 @@ start_tablesync(MoveMPartState *mmps)
 	shmn_elog(DEBUG1, "mmp %s: table & sub created on dst, tablesync started",
 			  mmps->part_name);
 
+	mmps->curstep =	MOVEMPARTSTEP_START_FINALSYNC;
+	return 0;
+}
+
+/*
+ * - wait until initial sync is done;
+ * - make src read only and save its pg_current_wal() in mmps;
+ * - now we are ready to wait for final sync
+ * Returns -1 if anything goes wrong and 0 otherwise. current wal is saved
+ * in mmps.
+ */
+int
+start_finalsync(MoveMPartState *mmps)
+{
+	PGresult *res;
+	int ntups;
+	char substate;
+	char *sync_point;
+
+	if (ensure_pqconn(mmps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
+		return -1;
+
+	res = PQexec(mmps->dst_conn, mmps->substate_sql);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(NOTICE, "Failed to learn sub status on dst: %s",
+				  PQerrorMessage(mmps->dst_conn));
+		reset_pqconn_and_res(&mmps->dst_conn, res);
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	ntups = PQntuples(res);
+	if (ntups != 1)
+	{
+		shmn_elog(WARNING, "mmp %s: num of subrels != 1", mmps->part_name);
+		/*
+		 * Since several or 0 subrels is absolutely wrong situtation, we start
+		 * from the beginning.
+		 */
+		mmps->curstep =	MOVEMPARTSTEP_START_TABLESYNC;
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	substate = PQgetvalue(res, 0, 0)[0];
+	if (substate != 'r')
+	{
+		shmn_elog(DEBUG1, "mmp %s: init sync is not yet finished, its state"
+				  " is %c", mmps->part_name, substate);
+		configure_retry(mmps, shardman_poll_interval);
+		return -1;
+	}
+	shmn_elog(DEBUG1, "mmp %s: init sync finished", mmps->part_name);
+	PQclear(res);
+
+	res = PQexec(mmps->src_conn, mmps->readonly_sql);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(NOTICE, "Failed to make src table read only: %s",
+				  PQerrorMessage(mmps->src_conn));
+		reset_pqconn_and_res(&mmps->src_conn, res);
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	shmn_elog(DEBUG1, "mmp %s: src made read only", mmps->part_name);
+	PQclear(res);
+
+	res = PQexec(mmps->src_conn, "select pg_current_wal_lsn();");
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(NOTICE, "Failed to get current lsn on src: %s",
+				  PQerrorMessage(mmps->src_conn));
+		reset_pqconn_and_res(&mmps->src_conn, res);
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	sync_point = PQgetvalue(res, 0, 0);
+    mmps->sync_point = DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid,
+											   CStringGetDatum(sync_point)));
+	shmn_elog(DEBUG1, "mmp %s: sync lsn is %s", mmps->part_name, sync_point);
+	PQclear(res);
+
+	mmps->curstep = MOVEMPARTSTEP_FINALIZE;
+	return 0;
+}
+
+/*
+ * Wait until final sync is done and update metadata. Returns -1 if anything
+ * goes wrong and 0 otherwise.
+ */
+int
+finalize(MoveMPartState *mmps)
+{
+
+	PGresult *res;
+	XLogRecPtr received_lsn;
+	char *received_lsn_str;
+
+	if (ensure_pqconn(mmps, ENSURE_PQCONN_DST) == -1)
+		return -1;
+
+	res = PQexec(mmps->dst_conn, mmps->received_lsn_sql);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(NOTICE, "Failed to learn received_lsn on dst: %s",
+				  PQerrorMessage(mmps->dst_conn));
+		reset_pqconn_and_res(&mmps->dst_conn, res);
+		configure_retry(mmps, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	received_lsn_str = PQgetvalue(res, 0, 0);
+	shmn_elog(DEBUG1, "mmp %s: received_lsn is %s", mmps->part_name,
+			  received_lsn_str);
+	received_lsn = DatumGetLSN(DirectFunctionCall1Coll(
+								   pg_lsn_in, InvalidOid,
+								   CStringGetDatum(received_lsn_str)));
+	PQclear(res);
+	if (received_lsn < mmps->sync_point)
+	{
+		shmn_elog(DEBUG1, "mmp %s: final sync is not yet finished,"
+				  "received_lsn is %lu, but we wait for %lu",
+				  mmps->part_name, received_lsn, mmps->sync_point);
+		configure_retry(mmps, shardman_poll_interval);
+		return -1;
+	}
+
+	void_spi(mmps->update_metadata_sql);
+
+	shmn_elog(DEBUG1, "Partition %s successfully moved", mmps->part_name);
+	mmps->res =	MOVEMPART_SUCCESS;
+	mmps->exec_res = EXECMOVEMPART_DONE;
 	return 0;
 }
 

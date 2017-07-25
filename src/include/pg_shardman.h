@@ -26,6 +26,7 @@ extern bool shardman_master;
 extern char *shardman_master_dbname;
 extern char *shardman_master_connstring;
 extern int shardman_cmd_retry_naptime;
+extern int shardman_poll_interval;
 
 typedef struct Cmd
 {
