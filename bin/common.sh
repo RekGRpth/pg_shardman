@@ -13,10 +13,15 @@ master_port=5432
 
 # declare -a worker_datadirs=()
 # declare -a worker_ports=()
+
 # declare -a worker_datadirs=("${HOME}/postgres/data2")
 # declare -a worker_ports=("5433")
+
 declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3")
 declare -a worker_ports=("5433" "5434")
+
+# declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3" "${HOME}/postgres/data4")
+# declare -a worker_ports=("5433" "5434" "5435")
 
 #------------------------------------------------------------
 PATH="$PATH:${pgpath}bin/"
@@ -57,6 +62,5 @@ function run_demo()
     psql -p 5433 -c "INSERT INTO partitioned_table SELECT generate_series(1, 1000), random();"
     psql -c "select shardman.add_node('port=5433');"
     psql -c "select shardman.add_node('port=5434');"
-    sleep 5
     psql -c "select shardman.create_hash_partitions(2, 'partitioned_table', 'id', 2);"
 }

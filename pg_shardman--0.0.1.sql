@@ -112,15 +112,15 @@ BEGIN
 	RETURN format('%s_fdw', part_name);
 END $$ LANGUAGE plpgsql STRICT;
 
--- Drop all foreign server's option. Yes, I don't know simpler ways.
+-- Drop all foreign server's options. Yes, I don't know simpler ways.
 CREATE FUNCTION reset_foreign_server_opts(srvname name) RETURNS void AS $$
 DECLARE
 	opts text[];
 	opt text;
 	opt_key text;
 BEGIN
-	EXECUTE format($q$select coalesce(srvoptions, '{}'::text[] from
-									  pg_foreign_server where srvname = %L$q$,
+	EXECUTE format($q$select coalesce(srvoptions, '{}'::text[]) FROM
+									  pg_foreign_server WHERE srvname = %L$q$,
 									  srvname) INTO opts;
 	FOREACH opt IN ARRAY opts LOOP
 		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
@@ -135,9 +135,9 @@ DECLARE
 	opt text;
 	opt_key text;
 BEGIN
-	EXECUTE format($q$select coalesce(umoptions, '{}'::text[]) from
-				   pg_user_mapping ums join pg_foreign_server fs
-				   on fs.oid = ums.umserver where fs.srvname = %L and
+	EXECUTE format($q$select coalesce(umoptions, '{}'::text[]) FROM
+				   pg_user_mapping ums JOIN pg_foreign_server fs
+				   ON fs.oid = ums.umserver WHERE fs.srvname = %L AND
 				   ums.umuser = umuser$q$, srvname)
 		INTO opts;
 
@@ -157,12 +157,27 @@ END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION update_fdw_server(part partitions) RETURNS void AS $$
 DECLARE
 	connstring text;
+	server_opts text;
+	um_opts text;
 BEGIN
 	-- ALTER FOREIGN TABLE doesn't support changing server, ALTER SERVER doesn't
 	-- support dropping all params, and I don't want to recreate foreign table
 	-- each time server params change, so resorting to these hacks.
 	PERFORM shardman.reset_foreign_server_opts(part.part_name);
 	PERFORM shardman.reset_um_opts(part.part_name, current_user::regrole);
+
+	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
+		INTO connstring;
+	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring, 'ADD ')
+	INTO server_opts, um_opts;
+
+	IF server_opts != '' THEN
+		EXECUTE format('ALTER SERVER %I %s', part.part_name, server_opts);
+	END IF;
+	IF um_opts != '' THEN
+		EXECUTE format('ALTER USER MAPPING FOR CURRENT_USER SERVER %I %s',
+					   part.part_name, um_opts);
+	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Replace existing hash partition with foreign, assuming 'partition' shows
@@ -179,13 +194,14 @@ BEGIN
 
 	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
 		INTO connstring;
-	SELECT * INTO server_opts, um_opts FROM
-		(SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)) opts;
+	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)
+		INTO server_opts, um_opts;
 
 	EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER
 				   postgres_fdw %s;', part.part_name, server_opts);
 	EXECUTE format('DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER %I;',
 				   part.part_name);
+	-- TODO: support not only CURRENT_USER
 	EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I
 				   %s;', part.part_name, um_opts);
 	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
@@ -270,7 +286,7 @@ BEGIN
 		PERFORM shardman.replace_foreign_part_with_usual(NEW);
 	ELSE -- other nodes
 		-- just update foreign server
-		PERFORM shardman.update_fdw_server(part);
+		PERFORM shardman.update_fdw_server(NEW);
 	END IF;
 	RETURN NULL;
 END
@@ -564,11 +580,12 @@ CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 -- (which is neccessary here) doesn't seem to have handy C API. I resorted to
 -- have C function which parses the opts and returns them in two parallel
 -- arrays, and this sql function joins them with quoting.
+-- prfx is prefix added before opt name, e.g. 'ADD ' for use in ALTER SERVER.
 -- Returns two strings: one with opts ready to pass to CREATE FOREIGN SERVER
 -- stmt, and one wih opts ready to pass to CREATE USER MAPPING.
 CREATE FUNCTION conninfo_to_postgres_fdw_opts(
-	IN connstring text, OUT server_opts text, OUT um_opts text)
-	RETURNS record AS $$
+	IN connstring text, IN prfx text DEFAULT '',
+	OUT server_opts text, OUT um_opts text) RETURNS record AS $$
 DECLARE
 	connstring_keywords text[];
 	connstring_vals text[];
@@ -589,14 +606,14 @@ BEGIN
 				um_opts := um_opts || ', ';
 			END IF;
 			um_opts_first_time_through := false;
-			um_opts := um_opts ||
+			um_opts := prfx || um_opts ||
 				format('%s %L', connstring_keywords[i], connstring_vals[i]);
 		ELSE -- server option
 			IF NOT server_opts_first_time_through THEN
 				server_opts := server_opts || ', ';
 			END IF;
 			server_opts_first_time_through := false;
-			server_opts := server_opts ||
+			server_opts := prfx || server_opts ||
 				format('%s %L', connstring_keywords[i], connstring_vals[i]);
 		END IF;
 	END LOOP;
