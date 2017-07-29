@@ -3,6 +3,68 @@
  * shard.c
  *		Sharding commands implementation.
  *
+ * Partitions moving/copying is implemented via LR: we start initial tablesync,
+ * wait it for finish, then make src read-only and wait until dst will get
+ * current src's lsn.
+ *
+ * Since we want to execute several actions in parallel, e.g. move partitions,
+ * but shardlord works only on one user command at time, we divide commands
+ * into 'tasks', e.g. move one partition. Every task it atomic in a sense that
+ * it either completes fully or not completes at all (though in latter case we
+ * currently leave some garbage here and there which should be cleaned).
+ * Parallel execution of tasks is accomplished via event loop: we work on task
+ * until it says 'I am done, don't wake me again', 'Wake me again after n
+ * sec', or 'Wake me again when data on socket x arrives'. Currently I plan to
+ * support the following types of tasks: moving primary, moving replica and
+ * creating replicas. Because of parallel execution we may face dependency
+ * issues: for example, if we move primary and at the same time add replica
+ * by copying this primary to some node, replica might lost some data which
+ * as written at new primary location when LR channel between new primary and
+ * and replica was not yet established. To simplify things, we will not allow
+ * parallel execution of tasks involving the same src node.
+ *
+ * We have other issues as well. Imagine the following nodes with primary part
+ * on A and replica on B:
+ * A --> B
+ * |     |
+ * C --- D
+ * We move in parallel primary (Pr) from A to C and replica (Rp) from B to
+ * D. Rr has moved first, Pr second, A quickly learns about this and drops
+ * partition & repslot since it has moved to C. Now slow D learns what
+ * happened; since Rr move was first, it creates subscription pointing to the
+ * table on A, but the repslot doesn't exist anymore, so we will receive a
+ * bunch of errors in the log. Happily, this doesn't mean that CREATE
+ * SUBSCRIPTION fails, so things will get fixed eventually.
+ *
+ * As with most actions, we can create/alter/drop pubs, subs and repslots in
+ * two ways: via triggers on tables with metadata and manually via libpq.
+ * The first is more handy, but dangerous: if pub node crashed, create
+ * subscription will fail. We need either patch LR to overcome this or add
+ * wrapper which will continiously try to create subscription if it fails.
+ *
+ * General copy partition implementation:
+ * - Disable subscription on destination, otherwise we can't drop rep slot on
+     source.
+ * - Idempotently create publication and repl slot on source.
+ * - Idempotently create table and async subscription on destination.
+ *   We use async subscription, because sync would block table while copy is
+ *   in progress. But with async, we have to lock the table after initial sync.
+ * - Now inital copy has started.
+ * - Sleep & check in connection to the dest waiting for completion of the
+ *   initial sync. Later this should be substituted with listen/notify.
+ * - When done, lock writes (better lock reads too to avoid stale reads)
+ *	 on source and remember pg_current_wal_lsn() on it.
+ * - Now final sync has started.
+ * - Sleep & check in connection to dest waiting for completion of final sync,
+ *   i.e. when received_lsn is equal to remembered lsn on src. This is harder
+ *   to replace with notify, but we can try that too.
+ * - Done. src table drop and foreign settings rebuilding is done via metadata
+ *   update.
+ *
+ *  If we don't save progress (whether initial sync started or done, lsn,
+ *  etc), we have to start everything from the ground if master reboots. This
+ *  is arguably fine.
+ *
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -27,21 +89,29 @@
 #define ENSURE_PQCONN_SRC (1 << 0)
 #define ENSURE_PQCONN_DST (1 << 1)
 
-/* final result of 1 master partition move */
+/* Type of task involving partition copy */
 typedef enum
 {
-	MOVEMPART_IN_PROGRESS,
-	MOVEMPART_FAILED,
-	MOVEMPART_SUCCESS
-} MoveMPartRes;
+	COPYPARTTASK_MOVE_PRIMARY,
+	COPYPARTTASK_MOVE_REPLICA,
+	COPYPARTTASK_ADD_REPLICA
+} CopyPartTaskType;
+
+/* final result of 1 one task */
+typedef enum
+{
+	TASK_IN_PROGRESS,
+	TASK_FAILED,
+	TASK_SUCCESS
+} TaskRes;
 
 /* result of one iteration of master partition moving */
 typedef enum
 {
-	EXECMOVEMPART_EPOLL, /* add me to epoll on epolled_fd on EPOLLIN */
-	EXECMOVEMPART_WAKEMEUP, /* wake me up again on waketm */
-	EXECMOVEMPART_DONE /* the work is done, never invoke me again */
-} ExecMoveMPartRes;
+	TASK_EPOLL, /* add me to epoll on epolled_fd on EPOLLIN */
+	TASK_WAKEMEUP, /* wake me up again on waketm */
+	TASK_DONE /* the work is done, never invoke me again */
+} ExecTaskRes;
 
 /*
  *  Current step of 1 master partition move. See comments to corresponding
@@ -49,22 +119,24 @@ typedef enum
  */
 typedef enum
 {
-	MOVEMPARTSTEP_START_TABLESYNC,
-	MOVEMPARTSTEP_START_FINALSYNC,
-	MOVEMPARTSTEP_FINALIZE
-} MoveMPartStep;
+	COPYPART_START_TABLESYNC,
+	COPYPART_START_FINALSYNC,
+	COPYPART_FINALIZE
+} CopyPartStep;
 
+/* State of copy part task */
 typedef struct
 {
+	CopyPartTaskType type;
 	const char *part_name; /* partition name */
-	int32 src_node; /* node we are moving partition from */
-	int32 dst_node; /* node we are moving partition to */
+	int32 src_node; /* node we are copying partition from */
+	int32 dst_node; /* node we are copying partition to */
 	const char *src_connstr;
 	const char *dst_connstr;
 	/* wake me up at waketm to do the job. Try to keep it zero when invalid	*/
 	struct timespec waketm;
 	/* We need to epoll only on socket with dst to wait for copy */
-	 /* exec_move_mpart sets fd here when it wants to be wakened by epoll */
+	 /* exec_copypart sets fd here when it wants to be wakened by epoll */
 	int fd_to_epoll;
 	int fd_in_epoll_set; /* socket *currently* in epoll set. -1 of none */
 	PGconn *src_conn; /* connection to src */
@@ -85,33 +157,33 @@ typedef struct
 	char *update_metadata_sql;
 
 	XLogRecPtr sync_point; /* when dst reached this point, it is synced */
-	MoveMPartStep curstep; /* current step */
-	ExecMoveMPartRes exec_res; /* result of the last iteration */
-	MoveMPartRes res; /* result of the whole move */
-} MoveMPartState;
+	CopyPartStep curstep; /* current step */
+	ExecTaskRes exec_res; /* result of the last iteration */
+	TaskRes res; /* result of the whole move */
+} CopyPartState;
 
 typedef struct
 {
 	slist_node list_node;
-	MoveMPartState *mmps;
-} MoveMPartStateNode;
+	CopyPartState *cps;
+} CopyPartStateNode;
 
-static void init_mmp_state(MoveMPartState *mmps, const char *part_name,
+static void init_cp_state(CopyPartState *cps, const char *part_name,
 						   int32 dst_node);
-static void finalize_mmp_state(MoveMPartState *mmps);
-static void move_mparts(MoveMPartState *mmpss, int nparts);
+static void finalize_cp_state(CopyPartState *cps);
+static void exec_tasks(CopyPartState **tasks, int ntasks);
 static int calc_timeout(slist_head *timeout_states);
-static void epoll_subscribe(int epfd, MoveMPartState *mmps);
-static void exec_move_mpart(MoveMPartState *mmps);
-static int start_tablesync(MoveMPartState *mmpts);
-static int start_finalsync(MoveMPartState *mmpts);
-static int finalize(MoveMPartState *mmpts);
-static int ensure_pqconn(MoveMPartState *mmpts, int nodes);
+static void epoll_subscribe(int epfd, CopyPartState *cps);
+static void exec_move_primary(CopyPartState *cps);
+static int cp_start_tablesync(CopyPartState *cpts);
+static int cp_start_finalsync(CopyPartState *cpts);
+static int cp_finalize(CopyPartState *cpts);
+static int ensure_pqconn(CopyPartState *cpts, int nodes);
 static int ensure_pqconn_intern(PGconn **conn, const char *connstr,
-								MoveMPartState *mmps);
+								CopyPartState *cps);
 static void reset_pqconn(PGconn **conn);
 static void reset_pqconn_and_res(PGconn **conn, PGresult *res);
-static void configure_retry(MoveMPartState *mmpts, int millis);
+static void configure_retry(CopyPartState *cpts, int millis);
 static struct timespec timespec_now_plus_millis(int millis);
 
 /*
@@ -231,42 +303,20 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 }
 
 /*
- * Move master partition to specified node. We
- * - Disable subscription on destination, otherwise we can't drop rep slot on
-     source.
- * - Idempotently create publication and repl slot on source.
- * - Idempotently create table and async subscription on destination.
- *   We use async subscription, because sync would block table while copy is
- *   in progress. But with async, we have to lock the table after initial sync.
- * - Now inital copy has started, remember that at least in ram to retry
- *   from this point if network fails.
- * - Sleep & check in connection to the dest waiting for completion of the
- *   initial sync. Later this should be substituted with listen/notify.
- * - When done, lock writes (better lock reads too) on source and remember
- *   pg_current_wal_lsn() on it.
- * - Now final sync has started, remember that at least in ram.
- * - Sleep & check in connection to dest waiting for completion of final sync,
- *   i.e. when received_lsn is equal to remembered lsn on src.
- * - Now update metadata on master, mark cmd as complete and we are done.
- *   src table will be dropped via metadata update
- *
- *  If we don't save progress (whether initial sync started or done, lsn,
- *  etc), we have to start everything from the ground if master reboots. This
- *  is arguably fine. There is also a very small chance that the command will
- *  complete but fail before status is set to 'success', and after reboot will
- *  fail because the partition was already moved.
- *
+ * Move primary partition.
  */
 void
-move_mpart(Cmd *cmd)
+move_primary(Cmd *cmd)
 {
 	char *part_name = cmd->opts[0];
 	int32 dst_node = atoi(cmd->opts[1]);
 
-	MoveMPartState *mmps = palloc(sizeof(MoveMPartState));
-	init_mmp_state(mmps, part_name, dst_node);
+	CopyPartState **tasks = palloc(sizeof(CopyPartState*));
+	CopyPartState *cps = palloc(sizeof(CopyPartState));
+	tasks[0] = cps;
+	init_cp_state(cps, part_name, dst_node);
 
-	move_mparts(mmps, 1);
+	exec_tasks(tasks, 1);
 	check_for_sigterm();
 	if (got_sigusr1)
 	{
@@ -274,73 +324,73 @@ move_mpart(Cmd *cmd)
 		return;
 	}
 
-	Assert(mmps->res != MOVEMPART_IN_PROGRESS);
-	if (mmps->res == MOVEMPART_FAILED)
+	Assert(cps->res != TASK_IN_PROGRESS);
+	if (cps->res == TASK_FAILED)
 		update_cmd_status(cmd->id, "failed");
-	else if (mmps->res == MOVEMPART_SUCCESS)
+	else if (cps->res == TASK_SUCCESS)
 		update_cmd_status(cmd->id, "success");
 }
 
 
 /*
- * Fill MoveMPartState, retrieving needed data. If something goes wrong, we
+ * Fill CopyPartState, retrieving needed data. If something goes wrong, we
  * don't bother to fill the rest of fields.
  */
 void
-init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
+init_cp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 {
 	int e;
 
-	mmps->part_name = part_name;
-	if ((mmps->src_node = get_partition_owner(part_name)) == -1)
+	cps->part_name = part_name;
+	if ((cps->src_node = get_partition_owner(part_name)) == -1)
 	{
 		shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
 				  part_name);
-		mmps->res = MOVEMPART_FAILED;
+		cps->res = TASK_FAILED;
 		return;
 	}
-	mmps->dst_node = dst_node;
+	cps->dst_node = dst_node;
 
 	/* src_connstr is surely not NULL since src_node is referenced by
 	   part_name */
-	mmps->src_connstr = get_worker_node_connstr(mmps->src_node);
-	mmps->dst_connstr = get_worker_node_connstr(mmps->dst_node);
-	if (mmps->dst_connstr == NULL)
+	cps->src_connstr = get_worker_node_connstr(cps->src_node);
+	cps->dst_connstr = get_worker_node_connstr(cps->dst_node);
+	if (cps->dst_connstr == NULL)
 	{
 		shmn_elog(WARNING, "Node %d doesn't exist, not moving %s to it",
-				  mmps->dst_node, part_name);
-		mmps->res = MOVEMPART_FAILED;
+				  cps->dst_node, part_name);
+		cps->res = TASK_FAILED;
 		return;
 	}
 
 	/* Task is ready to be processed right now */
-	if ((e = clock_gettime(CLOCK_MONOTONIC, &mmps->waketm)) == -1)
+	if ((e = clock_gettime(CLOCK_MONOTONIC, &cps->waketm)) == -1)
 	{
 		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
 	}
-	mmps->fd_to_epoll = -1;
-	mmps->fd_in_epoll_set = -1;
+	cps->fd_to_epoll = -1;
+	cps->fd_in_epoll_set = -1;
 
-	mmps->src_conn = NULL;
-	mmps->dst_conn = NULL;
+	cps->src_conn = NULL;
+	cps->dst_conn = NULL;
 
 	/* constant strings */
-	mmps->logname = psprintf("shardman_copy_%s_%d_%d",
-							 mmps->part_name, mmps->src_node, mmps->dst_node);
-	mmps->dst_drop_sub_sql = psprintf(
-		"drop subscription if exists %s cascade;", mmps->logname);
+	cps->logname = psprintf("shardman_copy_%s_%d_%d",
+							 cps->part_name, cps->src_node, cps->dst_node);
+	cps->dst_drop_sub_sql = psprintf(
+		"drop subscription if exists %s cascade;", cps->logname);
 	/*
 	 * Note that we run stmts in separate txns: repslot can't be created in in
 	 * transaction that performed writes
 	 */
-	mmps->src_create_pub_and_rs_sql = psprintf(
+	cps->src_create_pub_and_rs_sql = psprintf(
 		"begin; drop publication if exists %s cascade;"
 		" create publication %s for table %s; end;"
 		" select shardman.create_repslot('%s');",
-		mmps->logname, mmps->logname, mmps->part_name, mmps->logname
+		cps->logname, cps->logname, cps->part_name, cps->logname
 		);
-	mmps->relation = get_partition_relation(part_name);
-	mmps->dst_create_tab_and_sub_sql = psprintf(
+	cps->relation = get_partition_relation(part_name);
+	cps->dst_create_tab_and_sub_sql = psprintf(
 		"drop table if exists %s cascade;"
 		/*
 		 * TODO: we are mimicking pathman's partition creation here. At least
@@ -356,51 +406,54 @@ init_mmp_state(MoveMPartState *mmps, const char *part_name, int32 dst_node)
 		" drop subscription if exists %s cascade;"
 		" create subscription %s connection '%s' publication %s with"
 		"   (create_slot = false, slot_name = '%s');",
-		mmps->part_name,
-		mmps->part_name, mmps->relation,
-		mmps->logname,
-		mmps->logname, mmps->src_connstr, mmps->logname, mmps->logname);
-	mmps->substate_sql = psprintf(
+		cps->part_name,
+		cps->part_name, cps->relation,
+		cps->logname,
+		cps->logname, cps->src_connstr, cps->logname, cps->logname);
+	cps->substate_sql = psprintf(
 		"select srsubstate from pg_subscription_rel srel join pg_subscription"
 		" s on srel.srsubid = s.oid where subname = '%s';",
-		mmps->logname
+		cps->logname
 		);
-	mmps->readonly_sql = psprintf(
-		"select shardman.readonly_table_on('%s')", mmps->part_name
+	cps->readonly_sql = psprintf(
+		"select shardman.readonly_table_on('%s')", cps->part_name
 		);
-	mmps->received_lsn_sql = psprintf(
+	cps->received_lsn_sql = psprintf(
 		"select received_lsn from pg_stat_subscription where subname = '%s'",
-		mmps->logname
+		cps->logname
 		);
-	mmps->update_metadata_sql = psprintf(
+	cps->update_metadata_sql = psprintf(
 		"update shardman.partitions set owner = %d where part_name = '%s';",
-		mmps->dst_node, mmps->part_name);
+		cps->dst_node, cps->part_name);
 
-	mmps->curstep = MOVEMPARTSTEP_START_TABLESYNC;
-	mmps->res = MOVEMPART_IN_PROGRESS;
+	cps->curstep = COPYPART_START_TABLESYNC;
+	cps->res = TASK_IN_PROGRESS;
 }
 
 /*
  * Close pq connections, if any.
  */
-static void finalize_mmp_state(MoveMPartState *mmps)
+static void finalize_cp_state(CopyPartState *cps)
 {
-	if (mmps->src_conn != NULL)
-		reset_pqconn(&mmps->src_conn);
-	if (mmps->dst_conn != NULL)
-		reset_pqconn(&mmps->dst_conn);
+	if (cps->src_conn != NULL)
+		reset_pqconn(&cps->src_conn);
+	if (cps->dst_conn != NULL)
+		reset_pqconn(&cps->dst_conn);
 }
 
 /*
- * Move partitions as specified in move_mpart_states array. Results (and
- * general state is saved in this array too. Tries to move all parts until
- * all have failed/succeeded or sigusr1/sigterm is caugth.
+ * Execute tasks specified in 'tasks' array of ptrs to CopyPartState
+ * structs. Currently the only tasks we support involve copying parts; later,
+ * if needed, we can easily generalize this by excluding common task state
+ * from CopyPartState to separate struct and inheriting from it.  Results (and
+ * general state) is saved in this array too. Executes tasks until all have
+ * have failed/succeeded or sigusr1/sigterm is caugth.
  *
  */
 void
-move_mparts(MoveMPartState *mmpss, int nparts)
+exec_tasks(CopyPartState **tasks, int ntasks)
 {
-	/* list of sleeping mmp states we need to wake after specified timeout */
+	/* list of sleeping cp states we need to wake after specified timeout */
 	slist_head timeout_states = SLIST_STATIC_INIT(timeout_states);
 	slist_mutable_iter iter;
 	/* at least one task will require our attention at waketm */
@@ -419,14 +472,14 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	 */
 	if ((e = clock_gettime(CLOCK_MONOTONIC, &waketm)) == -1)
 		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
-	for (i = 0; i < nparts; i++)
+	for (i = 0; i < ntasks; i++)
 	{
-		if (mmpss[i].res != MOVEMPART_FAILED)
+		if (tasks[i]->res != TASK_FAILED)
 		{
-			MoveMPartStateNode *mmps_node = palloc(sizeof(MoveMPartStateNode));
-			elog(DEBUG2, "Adding task %s to timeout list", mmpss[i].part_name);
-			mmps_node->mmps = &mmpss[i];
-			slist_push_head(&timeout_states, &mmps_node->list_node);
+			CopyPartStateNode *cps_node = palloc(sizeof(CopyPartStateNode));
+			elog(DEBUG2, "Adding task %s to timeout lst", tasks[i]->part_name);
+			cps_node->cps = tasks[i];
+			slist_push_head(&timeout_states, &cps_node->list_node);
 			unfinished_moves++;
 		}
 	}
@@ -449,29 +502,29 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 		/* Run all tasks for which it is time to wake */
 		slist_foreach_modify(iter, &timeout_states)
 		{
-			MoveMPartStateNode *mmps_node =
-				slist_container(MoveMPartStateNode, list_node, iter.cur);
-			MoveMPartState *mmps = mmps_node->mmps;
+			CopyPartStateNode *cps_node =
+				slist_container(CopyPartStateNode, list_node, iter.cur);
+			CopyPartState *cps = cps_node->cps;
 			if ((e = clock_gettime(CLOCK_MONOTONIC, &curtm)) == -1)
 				shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
 
-			if (timespeccmp(mmps->waketm, curtm) <= 0)
+			if (timespeccmp(cps->waketm, curtm) <= 0)
 			{
-				shmn_elog(DEBUG1, "%s is ready for exec", mmps->part_name);
-				exec_move_mpart(mmps);
-				switch (mmps->exec_res)
+				shmn_elog(DEBUG1, "%s is ready for exec", cps->part_name);
+				exec_move_primary(cps);
+				switch (cps->exec_res)
 				{
-					case EXECMOVEMPART_WAKEMEUP:
+					case TASK_WAKEMEUP:
 						/* We need to wake this task again, to keep it in
 						 * in the list and just continue */
 						continue;
 
-					case EXECMOVEMPART_EPOLL:
+					case TASK_EPOLL:
 						/* Task wants to be wakened by epoll */
-						epoll_subscribe(epfd, mmps);
+						epoll_subscribe(epfd, cps);
 						break;
 
-					case EXECMOVEMPART_DONE:
+					case TASK_DONE:
 						/* Task is done, decrement the counter */
 						unfinished_moves--;
 						break;
@@ -479,7 +532,7 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 				/* If we are still here, remove node from timeouts_list */
 				slist_delete_current(&iter);
 				/* And free node */
-				pfree(mmps_node);
+				pfree(cps_node);
 			}
 		}
 	}
@@ -490,14 +543,14 @@ move_mparts(MoveMPartState *mmpss, int nparts)
 	 */
 	slist_foreach_modify(iter, &timeout_states)
 	{
-		MoveMPartStateNode *mmps_node =
-				slist_container(MoveMPartStateNode, list_node, iter.cur);
+		CopyPartStateNode *cps_node =
+				slist_container(CopyPartStateNode, list_node, iter.cur);
 		slist_delete_current(&iter);
-		pfree(mmps_node);
+		pfree(cps_node);
 	}
 	/* But this is important, as libpq manages memory on its own */
-	for (i = 0; i < nparts; i++)
-		finalize_mmp_state(&mmpss[i]);
+	for (i = 0; i < ntasks; i++)
+		finalize_cp_state(tasks[i]);
 	close(epfd);
 }
 
@@ -519,18 +572,18 @@ calc_timeout(slist_head *timeout_states)
 	/* calc min waketm */
 	slist_foreach(iter, timeout_states)
 	{
-		MoveMPartStateNode *mmps_node =
-			slist_container(MoveMPartStateNode, list_node, iter.cur);
-		MoveMPartState *mmps = mmps_node->mmps;
+		CopyPartStateNode *cps_node =
+			slist_container(CopyPartStateNode, list_node, iter.cur);
+		CopyPartState *cps = cps_node->cps;
 
 		/* If waketm is not set, what this node does in this list? */
-		Assert(mmps->waketm.tv_nsec != 0);
-		if (!waketm_set || timespeccmp(mmps->waketm, waketm) < 0)
+		Assert(cps->waketm.tv_nsec != 0);
+		if (!waketm_set || timespeccmp(cps->waketm, waketm) < 0)
 		{
 			shmn_elog(DEBUG1, "Waketm updated, old %d s, new %d s",
 					  waketm_set ? (int) waketm.tv_sec : 0,
-					  (int) mmps->waketm.tv_sec);
-			waketm = mmps->waketm;
+					  (int) cps->waketm.tv_sec);
+			waketm = cps->waketm;
 			waketm_set = true;
 		}
 
@@ -554,187 +607,187 @@ calc_timeout(slist_head *timeout_states)
 }
 
 /*
- * Ensure that mmps is registered in epoll and set proper mode.
+ * Ensure that cps is registered in epoll and set proper mode.
  * We never remove fds from epoll, they should be removed automatically when
  * closed.
  */
 void
-epoll_subscribe(int epfd, MoveMPartState *mmps)
+epoll_subscribe(int epfd, CopyPartState *cps)
 {
 	struct epoll_event ev;
 	int e;
 
-	ev.data.ptr = mmps;
+	ev.data.ptr = cps;
 	ev.events = EPOLLIN | EPOLLONESHOT;
-	Assert(mmps->fd_to_epoll != -1);
-	if (mmps->fd_to_epoll == mmps->fd_in_epoll_set)
+	Assert(cps->fd_to_epoll != -1);
+	if (cps->fd_to_epoll == cps->fd_in_epoll_set)
 	{
-		if ((e = epoll_ctl(epfd, EPOLL_CTL_MOD, mmps->fd_to_epoll, &ev)) == -1)
+		if ((e = epoll_ctl(epfd, EPOLL_CTL_MOD, cps->fd_to_epoll, &ev)) == -1)
 			shmn_elog(FATAL, "epoll_ctl failed, %s", strerror(e));
 	}
 	else
 	{
-		if ((e = epoll_ctl(epfd, EPOLL_CTL_ADD, mmps->fd_to_epoll, &ev)) == -1)
+		if ((e = epoll_ctl(epfd, EPOLL_CTL_ADD, cps->fd_to_epoll, &ev)) == -1)
 			shmn_elog(FATAL, "epoll_ctl failed, %s", strerror(e));
-		mmps->fd_in_epoll_set = mmps->fd_to_epoll;
+		cps->fd_in_epoll_set = cps->fd_to_epoll;
 	}
-	shmn_elog(DEBUG1, "socket for task %s added to epoll", mmps->part_name);
+	shmn_elog(DEBUG1, "socket for task %s added to epoll", cps->part_name);
 }
 
 /*
- * Actually run MoveMPart state machine. On return, mmps values say when (if
+ * Actually run MoveMPart state machine. On return, cps values say when (if
  * ever) we want to be executed again.
  */
 void
-exec_move_mpart(MoveMPartState *mmps)
+exec_move_primary(CopyPartState *cps)
 {
 	/* Mark waketm as invalid for safety */
-	mmps->waketm = (struct timespec) {0};
+	cps->waketm = (struct timespec) {0};
 
-	if (mmps->curstep == MOVEMPARTSTEP_START_TABLESYNC)
+	if (cps->curstep == COPYPART_START_TABLESYNC)
 	{
-		if (start_tablesync(mmps) == -1)
+		if (cp_start_tablesync(cps) == -1)
 			return;
 	}
-	if (mmps->curstep == MOVEMPARTSTEP_START_FINALSYNC)
+	if (cps->curstep == COPYPART_START_FINALSYNC)
 	{
-		if (start_finalsync(mmps) == -1)
+		if (cp_start_finalsync(cps) == -1)
 			return;
 	}
-	finalize(mmps);
+	cp_finalize(cps);
 }
 
 /*
  * Set up logical replication between src and dst. If anything goes wrong,
- * it configures mmps properly and returns -1, otherwise 0.
+ * it configures cps properly and returns -1, otherwise 0.
  */
 int
-start_tablesync(MoveMPartState *mmps)
+cp_start_tablesync(CopyPartState *cps)
 {
 	PGresult *res;
 
-	if (ensure_pqconn(mmps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
-	res = PQexec(mmps->dst_conn, mmps->dst_drop_sub_sql);
+	res = PQexec(cps->dst_conn, cps->dst_drop_sub_sql);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		shmn_elog(NOTICE, "Failed to drop sub on dst: %s",
-				  PQerrorMessage(mmps->dst_conn));
-		reset_pqconn_and_res(&mmps->dst_conn, res);
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+				  PQerrorMessage(cps->dst_conn));
+		reset_pqconn_and_res(&cps->dst_conn, res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	PQclear(res);
-	shmn_elog(DEBUG1, "mmp %s: sub on dst dropped, if any", mmps->part_name);
+	shmn_elog(DEBUG1, "cp %s: sub on dst dropped, if any", cps->part_name);
 
-	res = PQexec(mmps->src_conn, mmps->src_create_pub_and_rs_sql);
+	res = PQexec(cps->src_conn, cps->src_create_pub_and_rs_sql);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		shmn_elog(NOTICE, "Failed to create pub and repslot on src: %s",
-				  PQerrorMessage(mmps->src_conn));
-		reset_pqconn_and_res(&mmps->src_conn, res);
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+				  PQerrorMessage(cps->src_conn));
+		reset_pqconn_and_res(&cps->src_conn, res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	PQclear(res);
-	shmn_elog(DEBUG1, "mmp %s: pub and rs recreated on src", mmps->part_name);
+	shmn_elog(DEBUG1, "cp %s: pub and rs recreated on src", cps->part_name);
 
-	res = PQexec(mmps->dst_conn, mmps->dst_create_tab_and_sub_sql);
+	res = PQexec(cps->dst_conn, cps->dst_create_tab_and_sub_sql);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		shmn_elog(NOTICE, "Failed to recreate table & sub on dst: %s",
-				  PQerrorMessage(mmps->dst_conn));
-		reset_pqconn_and_res(&mmps->dst_conn, res);
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+				  PQerrorMessage(cps->dst_conn));
+		reset_pqconn_and_res(&cps->dst_conn, res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	PQclear(res);
-	shmn_elog(DEBUG1, "mmp %s: table & sub created on dst, tablesync started",
-			  mmps->part_name);
+	shmn_elog(DEBUG1, "cp %s: table & sub created on dst, tablesync started",
+			  cps->part_name);
 
-	mmps->curstep =	MOVEMPARTSTEP_START_FINALSYNC;
+	cps->curstep =	COPYPART_START_FINALSYNC;
 	return 0;
 }
 
 /*
  * - wait until initial sync is done;
- * - make src read only and save its pg_current_wal() in mmps;
+ * - make src read only and save its pg_current_wal() in cps;
  * - now we are ready to wait for final sync
  * Returns -1 if anything goes wrong and 0 otherwise. current wal is saved
- * in mmps.
+ * in cps.
  */
 int
-start_finalsync(MoveMPartState *mmps)
+cp_start_finalsync(CopyPartState *cps)
 {
 	PGresult *res;
 	int ntups;
 	char substate;
 	char *sync_point;
 
-	if (ensure_pqconn(mmps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
-	res = PQexec(mmps->dst_conn, mmps->substate_sql);
+	res = PQexec(cps->dst_conn, cps->substate_sql);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		shmn_elog(NOTICE, "Failed to learn sub status on dst: %s",
-				  PQerrorMessage(mmps->dst_conn));
-		reset_pqconn_and_res(&mmps->dst_conn, res);
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+				  PQerrorMessage(cps->dst_conn));
+		reset_pqconn_and_res(&cps->dst_conn, res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	ntups = PQntuples(res);
 	if (ntups != 1)
 	{
-		shmn_elog(WARNING, "mmp %s: num of subrels != 1", mmps->part_name);
+		shmn_elog(WARNING, "cp %s: num of subrels != 1", cps->part_name);
 		/*
 		 * Since several or 0 subrels is absolutely wrong situtation, we start
 		 * from the beginning.
 		 */
-		mmps->curstep =	MOVEMPARTSTEP_START_TABLESYNC;
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+		cps->curstep =	COPYPART_START_TABLESYNC;
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	substate = PQgetvalue(res, 0, 0)[0];
 	if (substate != 'r')
 	{
-		shmn_elog(DEBUG1, "mmp %s: init sync is not yet finished, its state"
-				  " is %c", mmps->part_name, substate);
-		configure_retry(mmps, shardman_poll_interval);
+		shmn_elog(DEBUG1, "cp %s: init sync is not yet finished, its state"
+				  " is %c", cps->part_name, substate);
+		configure_retry(cps, shardman_poll_interval);
 		return -1;
 	}
-	shmn_elog(DEBUG1, "mmp %s: init sync finished", mmps->part_name);
+	shmn_elog(DEBUG1, "cp %s: init sync finished", cps->part_name);
 	PQclear(res);
 
-	res = PQexec(mmps->src_conn, mmps->readonly_sql);
+	res = PQexec(cps->src_conn, cps->readonly_sql);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		shmn_elog(NOTICE, "Failed to make src table read only: %s",
-				  PQerrorMessage(mmps->src_conn));
-		reset_pqconn_and_res(&mmps->src_conn, res);
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+				  PQerrorMessage(cps->src_conn));
+		reset_pqconn_and_res(&cps->src_conn, res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
-	shmn_elog(DEBUG1, "mmp %s: src made read only", mmps->part_name);
+	shmn_elog(DEBUG1, "cp %s: src made read only", cps->part_name);
 	PQclear(res);
 
-	res = PQexec(mmps->src_conn, "select pg_current_wal_lsn();");
+	res = PQexec(cps->src_conn, "select pg_current_wal_lsn();");
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		shmn_elog(NOTICE, "Failed to get current lsn on src: %s",
-				  PQerrorMessage(mmps->src_conn));
-		reset_pqconn_and_res(&mmps->src_conn, res);
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+				  PQerrorMessage(cps->src_conn));
+		reset_pqconn_and_res(&cps->src_conn, res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	sync_point = PQgetvalue(res, 0, 0);
-    mmps->sync_point = DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid,
+    cps->sync_point = DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid,
 											   CStringGetDatum(sync_point)));
-	shmn_elog(DEBUG1, "mmp %s: sync lsn is %s", mmps->part_name, sync_point);
+	shmn_elog(DEBUG1, "cp %s: sync lsn is %s", cps->part_name, sync_point);
 	PQclear(res);
 
-	mmps->curstep = MOVEMPARTSTEP_FINALIZE;
+	cps->curstep = COPYPART_FINALIZE;
 	return 0;
 }
 
@@ -743,46 +796,46 @@ start_finalsync(MoveMPartState *mmps)
  * goes wrong and 0 otherwise.
  */
 int
-finalize(MoveMPartState *mmps)
+cp_finalize(CopyPartState *cps)
 {
 
 	PGresult *res;
 	XLogRecPtr received_lsn;
 	char *received_lsn_str;
 
-	if (ensure_pqconn(mmps, ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn(cps, ENSURE_PQCONN_DST) == -1)
 		return -1;
 
-	res = PQexec(mmps->dst_conn, mmps->received_lsn_sql);
+	res = PQexec(cps->dst_conn, cps->received_lsn_sql);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		shmn_elog(NOTICE, "Failed to learn received_lsn on dst: %s",
-				  PQerrorMessage(mmps->dst_conn));
-		reset_pqconn_and_res(&mmps->dst_conn, res);
-		configure_retry(mmps, shardman_cmd_retry_naptime);
+				  PQerrorMessage(cps->dst_conn));
+		reset_pqconn_and_res(&cps->dst_conn, res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	received_lsn_str = PQgetvalue(res, 0, 0);
-	shmn_elog(DEBUG1, "mmp %s: received_lsn is %s", mmps->part_name,
+	shmn_elog(DEBUG1, "cp %s: received_lsn is %s", cps->part_name,
 			  received_lsn_str);
 	received_lsn = DatumGetLSN(DirectFunctionCall1Coll(
 								   pg_lsn_in, InvalidOid,
 								   CStringGetDatum(received_lsn_str)));
 	PQclear(res);
-	if (received_lsn < mmps->sync_point)
+	if (received_lsn < cps->sync_point)
 	{
-		shmn_elog(DEBUG1, "mmp %s: final sync is not yet finished,"
+		shmn_elog(DEBUG1, "cp %s: final sync is not yet finished,"
 				  "received_lsn is %lu, but we wait for %lu",
-				  mmps->part_name, received_lsn, mmps->sync_point);
-		configure_retry(mmps, shardman_poll_interval);
+				  cps->part_name, received_lsn, cps->sync_point);
+		configure_retry(cps, shardman_poll_interval);
 		return -1;
 	}
 
-	void_spi(mmps->update_metadata_sql);
+	void_spi(cps->update_metadata_sql);
 
-	shmn_elog(DEBUG1, "Partition %s successfully moved", mmps->part_name);
-	mmps->res =	MOVEMPART_SUCCESS;
-	mmps->exec_res = EXECMOVEMPART_DONE;
+	shmn_elog(DEBUG1, "Partition %s successfully moved", cps->part_name);
+	cps->res =	TASK_SUCCESS;
+	cps->exec_res = TASK_DONE;
 	return 0;
 }
 
@@ -790,16 +843,16 @@ finalize(MoveMPartState *mmps)
  * Ensure that pq connection to src and dst node is CONNECTION_OK. nodes
  * is a bitmask specifying with which nodes -- src, dst or both -- connection
  * must be ensured. -1 is returned if we have failed to establish connection;
- * mmps is then configured to sleep retry time. 0 is returned if ok.
+ * cps is then configured to sleep retry time. 0 is returned if ok.
  */
 int
-ensure_pqconn(MoveMPartState *mmps, int nodes)
+ensure_pqconn(CopyPartState *cps, int nodes)
 {
 	if ((nodes & ENSURE_PQCONN_SRC) &&
-		(ensure_pqconn_intern(&mmps->src_conn, mmps->src_connstr, mmps) == -1))
+		(ensure_pqconn_intern(&cps->src_conn, cps->src_connstr, cps) == -1))
 		return -1;
 	if ((nodes & ENSURE_PQCONN_DST) &&
-		(ensure_pqconn_intern(&mmps->dst_conn, mmps->dst_connstr, mmps) == -1))
+		(ensure_pqconn_intern(&cps->dst_conn, cps->dst_connstr, cps) == -1))
 		return -1;
 	return 0;
 }
@@ -809,7 +862,7 @@ ensure_pqconn(MoveMPartState *mmps, int nodes)
  */
 int
 ensure_pqconn_intern(PGconn **conn, const char *connstr,
-					   MoveMPartState *mmps)
+					   CopyPartState *cps)
 {
 	if (*conn != NULL &&
 		PQstatus(*conn) != CONNECTION_OK)
@@ -824,7 +877,7 @@ ensure_pqconn_intern(PGconn **conn, const char *connstr,
 			shmn_elog(NOTICE, "Connection to node failed: %s",
 					  PQerrorMessage(*conn));
 			reset_pqconn(conn);
-			configure_retry(mmps, shardman_cmd_retry_naptime);
+			configure_retry(cps, shardman_cmd_retry_naptime);
 			return -1;
 		}
 		shmn_elog(DEBUG1, "Connection to %s established", connstr);
@@ -847,14 +900,14 @@ reset_pqconn_and_res(PGconn **conn, PGresult *res)
 
 
 /*
- * Configure mmps so that main loop wakes us again after given retry millis.
+ * Configure cps so that main loop wakes us again after given retry millis.
  */
-void configure_retry(MoveMPartState *mmps, int millis)
+void configure_retry(CopyPartState *cps, int millis)
 {
 	shmn_elog(DEBUG1, "Moving mpart %s: sleeping %d ms and retrying",
-			  mmps->part_name, millis);
-	mmps->waketm = timespec_now_plus_millis(millis);
-	mmps->exec_res = EXECMOVEMPART_WAKEMEUP;
+			  cps->part_name, millis);
+	cps->waketm = timespec_now_plus_millis(millis);
+	cps->exec_res = TASK_WAKEMEUP;
 }
 
 /*

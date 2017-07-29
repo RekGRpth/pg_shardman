@@ -306,7 +306,7 @@ INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
 
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_mpart');
+						 'move_primary');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
 								'success');
@@ -673,11 +673,11 @@ $$ LANGUAGE plpgsql;
 -- Move master partition to another node. Params:
 -- 'part_name' is name of the partition to move
 -- 'dest' is id of the destination node
-CREATE FUNCTION move_mpart(part_name text, dest int) RETURNS int AS $$
+CREATE FUNCTION move_primary(part_name text, dest int) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_mpart')
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_primary')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);

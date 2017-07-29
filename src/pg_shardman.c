@@ -194,8 +194,8 @@ shardmaster_main(Datum main_arg)
 				rm_node(cmd);
 			else if (strcmp(cmd->cmd_type, "create_hash_partitions") == 0)
 				create_hash_partitions(cmd);
-			else if (strcmp(cmd->cmd_type, "move_mpart") == 0)
-				move_mpart(cmd);
+			else if (strcmp(cmd->cmd_type, "move_primary") == 0)
+				move_primary(cmd);
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
