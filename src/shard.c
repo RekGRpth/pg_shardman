@@ -44,7 +44,7 @@
  *
  * General copy partition implementation:
  * - Disable subscription on destination, otherwise we can't drop rep slot on
-     source.
+ *   source.
  * - Idempotently create publication and repl slot on source.
  * - Idempotently create table and async subscription on destination.
  *   We use async subscription, because sync would block table while copy is
@@ -64,6 +64,44 @@
  *  If we don't save progress (whether initial sync started or done, lsn,
  *  etc), we have to start everything from the ground if master reboots. This
  *  is arguably fine.
+ *
+ *  Short description of all tasks:
+ *  move_primary:
+ *    copy part, update metadata
+ *    On metadata update:
+ *    on src node, drop lr copy stuff, create foreign table and replace
+ *      table with it, drop table. Drop primary lr stuff.
+ *    on dst node, replace foreign table with fresh copy (lock it until
+ *      sync_standby_names updated?), drop the former. drop lr copy stuff.
+ *      Create primary lr stuff (including sync_standby_names)
+ *    On node with replica (if exists) alter sub and alter fdw server.
+ *    on others, alter fdw server.
+ *
+ *  About fdws on replicas: we have to keep partition of parent table as fdw,
+ *  because otherwise we would not be able to write anything to it. On the
+ *  other hand, keeping the whole list of replicas is a bit excessive and
+ *  slower in case of primary failure: we need actually only primary and
+ *  ourself.
+ *
+ *  add_replica:
+ *    copy part from the last replica (because only the last replica knows
+ *      when it has created sync lr channel and can make table writable again).
+ *      Make dst table read-only for non-replica role, update metadata.
+ *    On metadata update:
+ *    on (old) last replica, alter cp lr channel to make it sync (and rename),
+ *      make table writable.
+ *    on node with fresh replica, rename lr channel, alter fdw server.
+ *    on others, alter fdw server.
+ *
+ *  move_replica:
+ *    copy part. Make dst table read-only for non-replica role, update
+ *    metadata.
+ *    On metadata update:
+ *    On src, drop lr copy stuff, alter fdw server. Drop lr pub (if any) and
+ *      sub stuff. Drop table.
+ *    On dst, drop lr copy stuff, create lr pub & sync sub, alter fdw server.
+ *    On previous part node, alter lr channel
+ *    On following part node (if any), recreate sub.
  *
  * -------------------------------------------------------------------------
  */
@@ -334,7 +372,7 @@ move_primary(Cmd *cmd)
 
 /*
  * Fill CopyPartState, retrieving needed data. If something goes wrong, we
- * don't bother to fill the rest of fields.
+ * don't bother to fill the rest of fields and mark task as failed.
  */
 void
 init_cp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
@@ -390,6 +428,7 @@ init_cp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 		cps->logname, cps->logname, cps->part_name, cps->logname
 		);
 	cps->relation = get_partition_relation(part_name);
+	Assert(cps->relation != NULL);
 	cps->dst_create_tab_and_sub_sql = psprintf(
 		"drop table if exists %s cascade;"
 		/*
@@ -474,6 +513,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
 	for (i = 0; i < ntasks; i++)
 	{
+		/* TODO: make sure one part is touched only by one task */
 		if (tasks[i]->res != TASK_FAILED)
 		{
 			CopyPartStateNode *cps_node = palloc(sizeof(CopyPartStateNode));

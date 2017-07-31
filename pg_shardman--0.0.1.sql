@@ -152,8 +152,8 @@ END $$ LANGUAGE plpgsql STRICT;
 -- this is expected to be called on server/um params change. We use dedicated
 -- server for each partition because we plan to use multiple hosts/ports in
 -- connstrings for transient fallback to replica if server with main partition
--- fails. FDW server, user mapping, foreign table and (obviously) parent partition must
--- exist when called.
+-- fails. FDW server, user mapping, foreign table and (obviously) parent partition
+-- must exist when called.
 CREATE FUNCTION update_fdw_server(part partitions) RETURNS void AS $$
 DECLARE
 	connstring text;
