@@ -734,11 +734,11 @@ get_worker_node_connstr(int node_id)
 }
 
 /*
- * Get node id on which given partition is stored. -1 is returned if there is
- * no such partition.
+ * Get node id on which given primary is stored. -1 is returned if there is
+ * no such primary.
  */
 int32
-get_partition_owner(const char *part_name)
+get_primary_owner(const char *part_name)
 {
 	char *sql;
 	bool isnull;
@@ -746,7 +746,7 @@ get_partition_owner(const char *part_name)
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
-		"select owner from shardman.partitions where part_name = '%s';",
+		"select owner from shardman.partitions where part_name = '%s' and num = 0;",
 		part_name);
 
 	if (SPI_execute(sql, true, 0) < 0)

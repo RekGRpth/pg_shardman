@@ -223,6 +223,7 @@ static void reset_pqconn(PGconn **conn);
 static void reset_pqconn_and_res(PGconn **conn, PGresult *res);
 static void configure_retry(CopyPartState *cpts, int millis);
 static struct timespec timespec_now_plus_millis(int millis);
+struct timespec timespec_now(void);
 
 /*
  * Steps are:
@@ -377,10 +378,8 @@ move_primary(Cmd *cmd)
 void
 init_cp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 {
-	int e;
-
 	cps->part_name = part_name;
-	if ((cps->src_node = get_partition_owner(part_name)) == -1)
+	if ((cps->src_node = get_primary_owner(part_name)) == -1)
 	{
 		shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
 				  part_name);
@@ -402,10 +401,7 @@ init_cp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 	}
 
 	/* Task is ready to be processed right now */
-	if ((e = clock_gettime(CLOCK_MONOTONIC, &cps->waketm)) == -1)
-	{
-		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
-	}
+	cps->waketm = timespec_now();
 	cps->fd_to_epoll = -1;
 	cps->fd_in_epoll_set = -1;
 
@@ -496,7 +492,6 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 	slist_head timeout_states = SLIST_STATIC_INIT(timeout_states);
 	slist_mutable_iter iter;
 	/* at least one task will require our attention at waketm */
-	struct timespec waketm;
 	struct timespec curtm;
 	int timeout;
 	int unfinished_moves = 0; /* number of not yet failed or succeeded tasks */
@@ -505,12 +500,10 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 	int epfd;
 	struct epoll_event evlist[MAX_EVENTS];
 
-	/* In the beginning, all tasks are ready for execution, so wake tm is right
-	 * is actually current time. We also need to put all tasks to the
-	 * timeout_states list to invoke them.
+	/*
+	 * In the beginning, all tasks are ready for execution, so we need to put
+	 * all tasks to the timeout_states list to invoke them.
 	 */
-	if ((e = clock_gettime(CLOCK_MONOTONIC, &waketm)) == -1)
-		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
 	for (i = 0; i < ntasks; i++)
 	{
 		/* TODO: make sure one part is touched only by one task */
@@ -545,8 +538,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 			CopyPartStateNode *cps_node =
 				slist_container(CopyPartStateNode, list_node, iter.cur);
 			CopyPartState *cps = cps_node->cps;
-			if ((e = clock_gettime(CLOCK_MONOTONIC, &curtm)) == -1)
-				shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
+			curtm = timespec_now();
 
 			if (timespeccmp(cps->waketm, curtm) <= 0)
 			{
@@ -602,7 +594,6 @@ int
 calc_timeout(slist_head *timeout_states)
 {
 	slist_iter iter;
-	int e;
 	struct timespec curtm;
 	int timeout;
 	/* could use timespec field for this, but that's more readable */
@@ -633,8 +624,7 @@ calc_timeout(slist_head *timeout_states)
 	if (!waketm_set)
 		return -1;
 
-	if ((e = clock_gettime(CLOCK_MONOTONIC, &curtm)) == -1)
-			shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
+	curtm = timespec_now();
 	if (timespeccmp(waketm, curtm) <= 0)
 	{
 		shmn_elog(DEBUG1, "Non-negative timeout, waking immediately");
@@ -951,16 +941,26 @@ void configure_retry(CopyPartState *cps, int millis)
 }
 
 /*
- * Get current time + given milliseconds. Fails with PG elog(FATAL) if gettime
- * failed. Not very generic, yes, but exactly what we need.
+ * Get current CLOCK_MONOTONIC time. Fails with PG elog(FATAL) if gettime
+ * failed.
  */
-struct timespec timespec_now_plus_millis(int millis)
+struct timespec timespec_now(void)
 {
-	struct timespec t;
 	int e;
+	struct timespec t;
 
 	if ((e = clock_gettime(CLOCK_MONOTONIC, &t)) == -1)
 		shmn_elog(FATAL, "clock_gettime failed, %s", strerror(e));
 
+	return t;
+}
+
+/*
+ * Get current time + given milliseconds. Fails with PG elog(FATAL) if gettime
+ * failed.
+ */
+struct timespec timespec_now_plus_millis(int millis)
+{
+	struct timespec t = timespec_now();
 	return timespec_add_millis(t, millis);
 }

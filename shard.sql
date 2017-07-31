@@ -45,11 +45,12 @@ CREATE TRIGGER new_table_worker_side AFTER INSERT ON shardman.tables
 	FOR EACH ROW EXECUTE PROCEDURE new_table_worker_side();
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.tables ENABLE REPLICA TRIGGER new_table_worker_side;
--- On master side, insert partitions
+-- On master side, insert partitions.
+-- All of them are primary and have no prev or nxt.
 CREATE FUNCTION new_table_master_side() RETURNS TRIGGER AS $$
 BEGIN
 	INSERT INTO shardman.partitions
-	SELECT part_name, NEW.relation AS relation, NEW.initial_node AS owner
+	SELECT part_name, 0, NULL, NULL, NEW.relation AS relation, NEW.initial_node AS owner
 	  FROM (SELECT part_name FROM shardman.gen_part_names(
 		  NEW.relation, NEW.partitions_count))
 			   AS partnames;
@@ -59,10 +60,21 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER new_table_master_side AFTER INSERT ON shardman.tables
 	FOR EACH ROW EXECUTE PROCEDURE new_table_master_side();
 
+-- Primary shard and its replicas compose a doubly-linked list with 0 shard in
+-- the beginning.
 CREATE TABLE partitions (
-	part_name text PRIMARY KEY,
+	part_name text,
+	-- Shard number. 0 means primary shard.
+	num int NOT NULL,
+	nxt int,
+	prev int,
 	relation text NOT NULL REFERENCES tables(relation),
-	owner int REFERENCES nodes(id) -- node on which partition lies
+	owner int REFERENCES nodes(id), -- node on which partition lies
+	PRIMARY KEY (part_name, num),
+	FOREIGN KEY (part_name, nxt) REFERENCES shardman.partitions(part_name, num),
+	FOREIGN KEY (part_name, prev) REFERENCES shardman.partitions(part_name, num),
+	-- primary has no prev, replica must have prev
+	CONSTRAINT prev_existence CHECK (num = 0 OR prev IS NOT NULL)
 );
 
 -- We use _fdw suffix for foreign tables to avoid interleaving with real
