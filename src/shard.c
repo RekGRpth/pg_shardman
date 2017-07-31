@@ -21,7 +21,7 @@
  * by copying this primary to some node, replica might lost some data which
  * as written at new primary location when LR channel between new primary and
  * and replica was not yet established. To simplify things, we will not allow
- * parallel execution of tasks involving the same src node.
+ * parallel execution of copy part tasks involving the same src partition.
  *
  * We have other issues as well. Imagine the following nodes with primary part
  * on A and replica on B:
@@ -86,7 +86,7 @@
  *  add_replica:
  *    copy part from the last replica (because only the last replica knows
  *      when it has created sync lr channel and can make table writable again).
- *      Make dst table read-only for non-replica role, update metadata.
+ *      Make dst table read-only for all but lr workers, update metadata.
  *    On metadata update:
  *    on (old) last replica, alter cp lr channel to make it sync (and rename),
  *      make table writable.
@@ -94,7 +94,7 @@
  *    on others, alter fdw server.
  *
  *  move_replica:
- *    copy part. Make dst table read-only for non-replica role, update
+ *    copy part. Make dst table read-only for all but lr worker, update
  *    metadata.
  *    On metadata update:
  *    On src, drop lr copy stuff, alter fdw server. Drop lr pub (if any) and

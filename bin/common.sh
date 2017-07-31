@@ -57,6 +57,7 @@ function restart_nodes()
 
 function run_demo()
 {
+    :
     psql -p 5433 -c "drop table if exists pt cascade;"
     psql -p 5433 -c "CREATE TABLE pt(id INT NOT NULL, payload REAL);"
     psql -p 5433 -c "INSERT INTO pt SELECT generate_series(1, 1000), random();"
