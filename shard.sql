@@ -192,6 +192,8 @@ BEGIN
 	-- and dangerous: what if table was created and dropped before this
 	-- change reached us? We might also use it with local table (create
 	-- foreign server pointing to it, etc), but that's just ugly.
+	RAISE DEBUG '[SHARDMAN] my id: %, creating ft %',
+		shardman.get_node_id(), part.part_name;
 	EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I OPTIONS (table_name %L)',
 				   fdw_part_name,
 				   (SELECT
@@ -199,7 +201,6 @@ BEGIN
 							format('%I', part.relation))),
 							part.part_name,
 							part.part_name);
-	RAISE DEBUG '[SHARDMAN] my id: %, new part: %', shardman.get_node_id(), part.part_name;
 	-- replace local partition with foreign table
 	EXECUTE format('SELECT replace_hash_partition(%L, %L)',
 				   part.part_name, fdw_part_name);

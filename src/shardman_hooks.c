@@ -36,8 +36,6 @@ shardman_log_hook(ErrorData *edata)
 
 		edata->message = psprintf("[SHNODE %d] %s",
 								  shardman_my_node_id, edata->message);
-		printf("Log hook called, line pref is %s, message is %s", Log_line_prefix,
-		edata->message);
 
 		MemoryContextSwitchTo(oldcontext);
 	}

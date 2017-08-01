@@ -626,11 +626,10 @@ calc_timeout(slist_head *timeout_states)
 		CopyPartState *cps = cps_node->cps;
 
 		/* If waketm is not set, what this node does in this list? */
-		elog(INFO, "waketm is %ld:%ld", cps->waketm.tv_sec, cps->waketm.tv_nsec);
 		Assert(cps->waketm.tv_nsec != 0);
 		if (!waketm_set || timespeccmp(cps->waketm, waketm) < 0)
 		{
-			shmn_elog(DEBUG1, "Waketm updated, old %d s, new %d s",
+			shmn_elog(DEBUG5, "Waketm updated, old %d s, new %d s",
 					  waketm_set ? (int) waketm.tv_sec : 0,
 					  (int) cps->waketm.tv_sec);
 			waketm = cps->waketm;
@@ -1011,7 +1010,7 @@ reset_pqconn_and_res(PGconn **conn, PGresult *res)
  */
 void configure_retry(CopyPartState *cps, int millis)
 {
-	shmn_elog(DEBUG1, "Moving mpart %s: sleeping %d ms and retrying",
+	shmn_elog(DEBUG1, "Copying mpart %s: sleeping %d ms and retrying",
 			  cps->part_name, millis);
 	cps->waketm = timespec_now_plus_millis(millis);
 	cps->exec_res = TASK_WAKEMEUP;
