@@ -13,6 +13,8 @@ cd "${script_dir}/.."
 make clean
 make install
 
+> $logfile
+
 stop_nodes
 for datadir in $master_datadir "${worker_datadirs[@]}"; do
     rm -rf "$datadir"
@@ -37,4 +39,4 @@ restart_nodes
 
 run_demo
 
-psql
+# psql

@@ -1,3 +1,10 @@
+/* -------------------------------------------------------------------------
+ *
+ * udf.c
+ *		SQL functions.
+ *
+ * -------------------------------------------------------------------------
+ */
 #include "postgres.h"
 #include "commands/event_trigger.h"
 #include "executor/spi.h"
@@ -11,6 +18,8 @@
 #include "catalog/pg_type.h"
 #include "storage/lmgr.h"
 #include "libpq-fe.h"
+
+#include "pg_shardman.h"
 
 /*
  * Must be called iff we are dropping extension. Checks that we are dropping
@@ -80,7 +89,6 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	FILE *fp;
 	size_t bytes_read;
 	SET_VARSIZE(sql, VARHDRSZ);
-	elog(INFO, "RUNNING GEN CREATE TABLE");
 
 	/* find pg_dump location */
 	if (find_my_exec("pg_dump", pg_dump_path) != 0)
@@ -268,4 +276,22 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 
 	PQconninfoFree(opts);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * Set and reset node id stored in C variable
+ */
+PG_FUNCTION_INFO_V1(set_node_id_c);
+Datum
+set_node_id_c(PG_FUNCTION_ARGS)
+{
+	shardman_my_node_id = PG_GETARG_INT32(0);
+	PG_RETURN_VOID();
+}
+PG_FUNCTION_INFO_V1(reset_node_id_c);
+Datum
+reset_node_id_c(PG_FUNCTION_ARGS)
+{
+	shardman_my_node_id = SHMN_INVALID_NODE_ID;
+	PG_RETURN_VOID();
 }

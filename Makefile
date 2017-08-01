@@ -6,7 +6,8 @@ DATA_built = $(EXTENSION)--$(EXTVERSION).sql
 
 
 MODULE_big = pg_shardman
-OBJS = src/pg_shardman.o src/udf.o src/shard.o src/timeutils.o
+OBJS = src/pg_shardman.o src/udf.o src/shard.o src/timeutils.o \
+       src/shardman_hooks.o
 
 PG_CPPFLAGS += -Isrc/include
 
@@ -21,7 +22,6 @@ PG_CPPFLAGS += -I$(INCLUDEDIR) # add server's include directory for libpq-fe.h
 SHLIB_LINK += -lpq # add libpq
 
 EXTRA_CLEAN = $(EXTENSION)--$(EXTVERSION).sql
-$(info $$var is [${EXTRA_CLEAN}])
 
 include $(PGXS)
 

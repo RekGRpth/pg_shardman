@@ -28,6 +28,9 @@ extern char *shardman_master_connstring;
 extern int shardman_cmd_retry_naptime;
 extern int shardman_poll_interval;
 
+extern int32 shardman_my_node_id;
+#define SHMN_INVALID_NODE_ID -1
+
 typedef struct Cmd
 {
 	int64 id;

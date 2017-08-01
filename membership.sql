@@ -46,22 +46,30 @@ CREATE TABLE local_meta (
 	k text NOT NULL, -- key
 	v text -- value
 );
-INSERT INTO @extschema@.local_meta VALUES ('node_id', NULL);
+INSERT INTO shardman.local_meta VALUES ('node_id', NULL);
 
 -- Get local node id. NULL means node is not in the cluster yet.
 CREATE FUNCTION get_node_id() RETURNS int AS $$
-	SELECT v::int FROM @extschema@.local_meta WHERE k = 'node_id';
+	SELECT v::int FROM shardman.local_meta WHERE k = 'node_id';
 $$ LANGUAGE sql;
 
 -- Exclude node from the cluster
 CREATE FUNCTION reset_node_id() RETURNS void AS $$
-	UPDATE @extschema@.local_meta SET v = NULL WHERE k = 'node_id';
-$$ LANGUAGE sql;
+BEGIN
+	UPDATE shardman.local_meta SET v = NULL WHERE k = 'node_id';
+	PERFORM shardman.reset_node_id_c();
+END $$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION reset_node_id_c() RETURNS void
+	AS 'pg_shardman' LANGUAGE C;
 
 -- Set local node id.
 CREATE FUNCTION set_node_id(node_id int) RETURNS void AS $$
-	UPDATE @extschema@.local_meta SET v = node_id WHERE k = 'node_id';
-$$ LANGUAGE sql;
+BEGIN
+	UPDATE shardman.local_meta SET v = node_id WHERE k = 'node_id';
+	PERFORM shardman.set_node_id_c(node_id);
+END $$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION set_node_id_c(node_id int) RETURNS void
+	AS 'pg_shardman' LANGUAGE C;
 
 -- If for cmd cmd_id we haven't yet inserted new node, do that; mark it as
 -- passive for now, we still need to setup lr and set its id on the node itself.

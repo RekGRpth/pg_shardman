@@ -7,6 +7,7 @@ set -e
 pgpath=~/postgres/install/vanilla/
 pathmanpath=~/postgres/pg_pathman
 install_pathman=false
+logfile=$HOME/tmp/tmp/tmp.log
 
 master_datadir=~/postgres/data1
 master_port=5432
@@ -31,9 +32,9 @@ function start_nodes()
     for ((i=0; i<${#worker_datadirs[@]}; ++i)); do
 	datadir="${worker_datadirs[i]}"
 	port="${worker_ports[i]}"
-	pg_ctl -o "-p $port" -D $datadir start
+	pg_ctl -o "-p $port" -D $datadir  -l $logfile start
     done
-    pg_ctl -o "-p $master_port" -D $master_datadir start
+    pg_ctl -o "-p $master_port" -D $master_datadir -l $logfile start
 }
 
 function stop_nodes()
@@ -50,9 +51,9 @@ function restart_nodes()
     for ((i=0; i<${#worker_datadirs[@]}; ++i)); do
 	datadir="${worker_datadirs[i]}"
 	port="${worker_ports[i]}"
-	pg_ctl -o "-p $port" -D $datadir restart
+	pg_ctl -o "-p $port" -D $datadir -l $logfile restart
     done
-    pg_ctl -o "-p $master_port" -D $master_datadir restart
+    pg_ctl -o "-p $master_port" -D $master_datadir -l $logfile restart
 }
 
 function run_demo()

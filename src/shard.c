@@ -159,24 +159,26 @@ typedef enum
 {
 	COPYPART_START_TABLESYNC,
 	COPYPART_START_FINALSYNC,
-	COPYPART_FINALIZE
+	COPYPART_FINALIZE,
+	COPYPART_DONE
 } CopyPartStep;
 
 /* State of copy part task */
 typedef struct
 {
 	CopyPartTaskType type;
-	const char *part_name; /* partition name */
-	int32 src_node; /* node we are copying partition from */
-	int32 dst_node; /* node we are copying partition to */
-	const char *src_connstr;
-	const char *dst_connstr;
 	/* wake me up at waketm to do the job. Try to keep it zero when invalid	*/
 	struct timespec waketm;
 	/* We need to epoll only on socket with dst to wait for copy */
 	 /* exec_copypart sets fd here when it wants to be wakened by epoll */
 	int fd_to_epoll;
 	int fd_in_epoll_set; /* socket *currently* in epoll set. -1 of none */
+
+	const char *part_name; /* partition name */
+	int32 src_node; /* node we are copying partition from */
+	int32 dst_node; /* node we are copying partition to */
+	const char *src_connstr;
+	const char *dst_connstr;
 	PGconn *src_conn; /* connection to src */
 	PGconn *dst_conn; /* connection to dst */
 
@@ -208,11 +210,17 @@ typedef struct
 
 static void init_cp_state(CopyPartState *cps, const char *part_name,
 						   int32 dst_node);
+static void init_mpp_state(CopyPartState *cps, const char *part_name,
+						   int32 dst_node);
 static void finalize_cp_state(CopyPartState *cps);
 static void exec_tasks(CopyPartState **tasks, int ntasks);
 static int calc_timeout(slist_head *timeout_states);
 static void epoll_subscribe(int epfd, CopyPartState *cps);
+static void exec_task(CopyPartState *cps);
+static void exec_cp(CopyPartState *cps);
 static void exec_move_primary(CopyPartState *cps);
+static void exec_add_replica(CopyPartState *cps);
+static void exec_move_replica(CopyPartState *cps);
 static int cp_start_tablesync(CopyPartState *cpts);
 static int cp_start_finalsync(CopyPartState *cpts);
 static int cp_finalize(CopyPartState *cpts);
@@ -353,7 +361,7 @@ move_primary(Cmd *cmd)
 	CopyPartState **tasks = palloc(sizeof(CopyPartState*));
 	CopyPartState *cps = palloc(sizeof(CopyPartState));
 	tasks[0] = cps;
-	init_cp_state(cps, part_name, dst_node);
+	init_mpp_state(cps, part_name, dst_node);
 
 	exec_tasks(tasks, 1);
 	check_for_sigterm();
@@ -370,6 +378,27 @@ move_primary(Cmd *cmd)
 		update_cmd_status(cmd->id, "success");
 }
 
+/*
+ * Fill CopyPartState for moving primary partition
+ */
+void
+init_mpp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
+{
+	if ((cps->src_node = get_primary_owner(part_name)) == -1)
+	{
+		shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
+				  part_name);
+		cps->res = TASK_FAILED;
+		return;
+	}
+	cps->update_metadata_sql = psprintf(
+		"update shardman.partitions set owner = %d where part_name = '%s'"
+		" and num = 0;",
+		dst_node, part_name);
+	cps->type = COPYPARTTASK_MOVE_PRIMARY;
+	/* The rest fields are common among copy part tasks */
+	init_cp_state(cps, part_name, dst_node);
+}
 
 /*
  * Fill CopyPartState, retrieving needed data. If something goes wrong, we
@@ -378,32 +407,24 @@ move_primary(Cmd *cmd)
 void
 init_cp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 {
-	cps->part_name = part_name;
-	if ((cps->src_node = get_primary_owner(part_name)) == -1)
-	{
-		shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
-				  part_name);
-		cps->res = TASK_FAILED;
-		return;
-	}
-	cps->dst_node = dst_node;
+	/* Task is ready to be processed right now */
+	cps->waketm = timespec_now();
+	cps->fd_to_epoll = -1;
+	cps->fd_in_epoll_set = -1;
 
+	cps->part_name = part_name;
+	cps->dst_node = dst_node;
 	/* src_connstr is surely not NULL since src_node is referenced by
 	   part_name */
 	cps->src_connstr = get_worker_node_connstr(cps->src_node);
 	cps->dst_connstr = get_worker_node_connstr(cps->dst_node);
 	if (cps->dst_connstr == NULL)
 	{
-		shmn_elog(WARNING, "Node %d doesn't exist, not moving %s to it",
+		shmn_elog(WARNING, "Node %d doesn't exist, not copying %s to it",
 				  cps->dst_node, part_name);
 		cps->res = TASK_FAILED;
 		return;
 	}
-
-	/* Task is ready to be processed right now */
-	cps->waketm = timespec_now();
-	cps->fd_to_epoll = -1;
-	cps->fd_in_epoll_set = -1;
 
 	cps->src_conn = NULL;
 	cps->dst_conn = NULL;
@@ -457,9 +478,6 @@ init_cp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 		"select received_lsn from pg_stat_subscription where subname = '%s'",
 		cps->logname
 		);
-	cps->update_metadata_sql = psprintf(
-		"update shardman.partitions set owner = %d where part_name = '%s';",
-		cps->dst_node, cps->part_name);
 
 	cps->curstep = COPYPART_START_TABLESYNC;
 	cps->res = TASK_IN_PROGRESS;
@@ -494,7 +512,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 	/* at least one task will require our attention at waketm */
 	struct timespec curtm;
 	int timeout;
-	int unfinished_moves = 0; /* number of not yet failed or succeeded tasks */
+	int unfinished_tasks = 0; /* number of not yet failed or succeeded tasks */
 	int i;
 	int e;
 	int epfd;
@@ -513,14 +531,14 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 			elog(DEBUG2, "Adding task %s to timeout lst", tasks[i]->part_name);
 			cps_node->cps = tasks[i];
 			slist_push_head(&timeout_states, &cps_node->list_node);
-			unfinished_moves++;
+			unfinished_tasks++;
 		}
 	}
 
 	if ((epfd = epoll_create1(0)) == -1)
 		shmn_elog(FATAL, "epoll_create1 failed");
 
-	while (unfinished_moves > 0 && !got_sigusr1 && !got_sigterm)
+	while (unfinished_tasks > 0 && !got_sigusr1 && !got_sigterm)
 	{
 		timeout = calc_timeout(&timeout_states);
 		e = epoll_wait(epfd, evlist, MAX_EVENTS, timeout);
@@ -543,7 +561,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 			if (timespeccmp(cps->waketm, curtm) <= 0)
 			{
 				shmn_elog(DEBUG1, "%s is ready for exec", cps->part_name);
-				exec_move_primary(cps);
+				exec_task(cps);
 				switch (cps->exec_res)
 				{
 					case TASK_WAKEMEUP:
@@ -558,7 +576,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 
 					case TASK_DONE:
 						/* Task is done, decrement the counter */
-						unfinished_moves--;
+						unfinished_tasks--;
 						break;
 				}
 				/* If we are still here, remove node from timeouts_list */
@@ -608,6 +626,7 @@ calc_timeout(slist_head *timeout_states)
 		CopyPartState *cps = cps_node->cps;
 
 		/* If waketm is not set, what this node does in this list? */
+		elog(INFO, "waketm is %ld:%ld", cps->waketm.tv_sec, cps->waketm.tv_nsec);
 		Assert(cps->waketm.tv_nsec != 0);
 		if (!waketm_set || timespeccmp(cps->waketm, waketm) < 0)
 		{
@@ -665,11 +684,69 @@ epoll_subscribe(int epfd, CopyPartState *cps)
 }
 
 /*
- * Actually run MoveMPart state machine. On return, cps values say when (if
- * ever) we want to be executed again.
+ * One iteration of task execution
+ */
+void
+exec_task(CopyPartState *cps)
+{
+	switch (cps->type)
+	{
+		case COPYPARTTASK_MOVE_PRIMARY:
+			exec_move_primary(cps);
+			break;
+
+		case COPYPARTTASK_ADD_REPLICA:
+			exec_add_replica(cps);
+			break;
+
+		case COPYPARTTASK_MOVE_REPLICA:
+			exec_move_replica(cps);
+			break;
+	}
+}
+
+/*
+ * One iteration of move primary task execution
  */
 void
 exec_move_primary(CopyPartState *cps)
+{
+	if (cps->curstep != COPYPART_DONE)
+	{
+		exec_cp(cps);
+		if (cps->curstep != COPYPART_DONE)
+			return;
+	}
+
+	void_spi(cps->update_metadata_sql);
+	cps->res = TASK_SUCCESS;
+	cps->exec_res = TASK_DONE;
+}
+
+/*
+ * One iteration of add replica task execution
+ */
+void
+exec_add_replica(CopyPartState *cps)
+{
+
+}
+
+/*
+ * One iteration of move replica task execution
+ */
+void
+exec_move_replica(CopyPartState *cps)
+{
+
+}
+
+/*
+ * Actually run CopyPartState state machine. On return, cps values say when (if
+ * ever) we want to be executed again.
+ */
+void
+exec_cp(CopyPartState *cps)
 {
 	/* Mark waketm as invalid for safety */
 	cps->waketm = (struct timespec) {0};
@@ -684,7 +761,9 @@ exec_move_primary(CopyPartState *cps)
 		if (cp_start_finalsync(cps) == -1)
 			return;
 	}
-	cp_finalize(cps);
+	if (cps->curstep == COPYPART_FINALIZE)
+		cp_finalize(cps);
+	return;
 }
 
 /*
@@ -736,7 +815,7 @@ cp_start_tablesync(CopyPartState *cps)
 	shmn_elog(DEBUG1, "cp %s: table & sub created on dst, tablesync started",
 			  cps->part_name);
 
-	cps->curstep =	COPYPART_START_FINALSYNC;
+	cps->curstep = COPYPART_START_FINALSYNC;
 	return 0;
 }
 
@@ -861,11 +940,9 @@ cp_finalize(CopyPartState *cps)
 		return -1;
 	}
 
-	void_spi(cps->update_metadata_sql);
-
-	shmn_elog(DEBUG1, "Partition %s successfully moved", cps->part_name);
-	cps->res =	TASK_SUCCESS;
-	cps->exec_res = TASK_DONE;
+	cps->curstep = COPYPART_DONE;
+	shmn_elog(DEBUG1, "Partition %s %d->%d successfully copied",
+			  cps->part_name, cps->src_node, cps->dst_node);
 	return 0;
 }
 

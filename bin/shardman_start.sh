@@ -6,6 +6,8 @@ source "${script_dir}/common.sh"
 cd "${script_dir}/.."
 make clean
 
+> $logfile
+
 restart_nodes # make sure nodes run
 # first workers, then master
 for port in "${worker_ports[@]}" $master_port; do
@@ -23,4 +25,4 @@ restart_nodes
 
 run_demo
 
-psql
+# psql

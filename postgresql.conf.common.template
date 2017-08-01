@@ -1,5 +1,8 @@
 shared_preload_libraries = 'pg_pathman, pg_shardman'
 
+# print node ids in log messages
+log_line_prefix = '%m %z'
+
 # just to suppress logging
 autovacuum = off
 

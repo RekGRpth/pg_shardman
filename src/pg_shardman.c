@@ -29,6 +29,7 @@
 
 #include "pg_shardman.h"
 #include "shard.h"
+#include "shardman_hooks.h"
 
 
 /* ensure that extension won't load against incompatible version of Postgres */
@@ -63,6 +64,8 @@ int shardman_poll_interval;
  * cleanup after receiving SIGTERM.
  */
 static PGconn *conn = NULL;
+/* This node id. */
+int32 shardman_my_node_id = -1;
 
 /*
  * Entrypoint of the module. Define variables and register background worker.
@@ -78,6 +81,10 @@ _PG_init()
 		ereport(ERROR, (errmsg("pg_shardman can only be loaded via shared_preload_libraries"),
 						errhint("Add pg_shardman to shared_preload_libraries.")));
 	}
+
+	/* remember & set hooks */
+	log_hook_next = emit_log_hook;
+	emit_log_hook = shardman_log_hook;
 
 	DefineCustomBoolVariable("shardman.master",
 							 "This node is the master?",
@@ -184,10 +191,10 @@ shardmaster_main(Datum main_arg)
 		while ((cmd = next_cmd()) != NULL)
 		{
 			update_cmd_status(cmd->id, "in progress");
-			shmn_elog(LOG, "Working on command %ld, %s, opts are",
+			shmn_elog(DEBUG1, "Working on command %ld, %s, opts are",
 				 cmd->id, cmd->cmd_type);
 			for (char **opts = cmd->opts; *opts; opts++)
-				shmn_elog(LOG, "%s", *opts);
+				shmn_elog(DEBUG1, "%s", *opts);
 			if (strcmp(cmd->cmd_type, "add_node") == 0)
 				add_node(cmd);
 			else if (strcmp(cmd->cmd_type, "rm_node") == 0)
@@ -577,7 +584,7 @@ add_node(Cmd *cmd)
 		pfree(sql);
 
 		/* done */
-		elog(INFO, "Node %s successfully added, it is assigned id %d",
+		shmn_elog(INFO, "Node %s successfully added, it is assigned id %d",
 			 connstr, node_id);
 		return;
 

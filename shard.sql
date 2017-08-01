@@ -65,7 +65,7 @@ CREATE TRIGGER new_table_master_side AFTER INSERT ON shardman.tables
 CREATE TABLE partitions (
 	part_name text,
 	-- Shard number. 0 means primary shard.
-	num int NOT NULL,
+	num serial,
 	nxt int,
 	prev int,
 	relation text NOT NULL REFERENCES tables(relation),
