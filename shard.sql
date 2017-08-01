@@ -26,6 +26,7 @@ DECLARE
 	pname text;
 BEGIN
 	IF NEW.initial_node != (SELECT shardman.get_node_id()) THEN
+		RAISE DEBUG '[SHARDMAN] new table trig, pid %', (select pg_backend_pid());
 		EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', NEW.relation);
 		partition_names :=
 			(SELECT ARRAY(SELECT part_name FROM shardman.gen_part_names(
@@ -198,6 +199,7 @@ BEGIN
 							format('%I', part.relation))),
 							part.part_name,
 							part.part_name);
+	RAISE DEBUG '[SHARDMAN] my id: %, new part: %', shardman.get_node_id(), part.part_name;
 	-- replace local partition with foreign table
 	EXECUTE format('SELECT replace_hash_partition(%L, %L)',
 				   part.part_name, fdw_part_name);
@@ -207,18 +209,21 @@ END $$ LANGUAGE plpgsql;
 
 -- On adding new partition, create proper foreign server & foreign table and
 -- replace tmp (empty) partition with it.
-CREATE FUNCTION new_partition() RETURNS TRIGGER AS $$
+-- TODO: race condition between this trigger and new_table_worker_side
+-- definitely deserves attention.
+CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
 BEGIN
 	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
+		RAISE DEBUG 'SHARDMAN new prim trigger, pid %', (select pg_backend_pid());
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
-CREATE TRIGGER new_partition AFTER INSERT ON shardman.partitions
-	FOR EACH ROW EXECUTE PROCEDURE new_partition();
+CREATE TRIGGER new_primary AFTER INSERT ON shardman.partitions
+	FOR EACH ROW WHEN (NEW.num = 0) EXECUTE PROCEDURE new_primary();
 -- fire trigger only on worker nodes
-ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_partition;
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_primary;
 
 -- Replace foreign table-partition with local. The latter must exist!
 -- Foreign table will be dropped.

@@ -18,6 +18,7 @@ emit_log_hook_type log_hook_next;
  * Add [SHNODE x] where x is node id to each log message, if '%z' is in
  * log_line_prefix. Seems like there is no way to hook something into
  * prefix iself without touching core code.
+ * TODO: In some, probably most interesting cases this hook is not called :(
  */
 void
 shardman_log_hook(ErrorData *edata)
