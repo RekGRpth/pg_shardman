@@ -8,7 +8,6 @@ autovacuum = off
 
 log_min_messages = DEBUG1
 # client_min_messages = NOTICE
-# client_min_messages = INFO
-client_min_messages = PANIC
+client_min_messages = WARNING
 
 wal_level = logical

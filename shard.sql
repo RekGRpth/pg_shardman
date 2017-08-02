@@ -26,7 +26,6 @@ DECLARE
 	pname text;
 BEGIN
 	IF NEW.initial_node != (SELECT shardman.get_node_id()) THEN
-		RAISE DEBUG '[SHARDMAN] new table trig, pid %', (select pg_backend_pid());
 		EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', NEW.relation);
 		partition_names :=
 			(SELECT ARRAY(SELECT part_name FROM shardman.gen_part_names(
@@ -210,12 +209,12 @@ END $$ LANGUAGE plpgsql;
 
 -- On adding new partition, create proper foreign server & foreign table and
 -- replace tmp (empty) partition with it.
--- TODO: race condition between this trigger and new_table_worker_side
--- definitely deserves attention.
+-- TODO: There is a race condition between this trigger and
+-- new_table_worker_side trigger during initial tablesync, we should deal with
+-- it.
 CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
 BEGIN
 	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
-		RAISE DEBUG 'SHARDMAN new prim trigger, pid %', (select pg_backend_pid());
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
 	RETURN NULL;
@@ -297,21 +296,16 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION readonly_table_on(relation regclass)
 	RETURNS void AS $$
 BEGIN
-	-- Create go away trigger to prevent any new ones
+	-- Create go away trigger to prevent any modifications
 	PERFORM shardman.readonly_table_off(relation);
-	EXECUTE format(
-		'CREATE TRIGGER shardman_readonly BEFORE INSERT OR UPDATE OR DELETE OR
-		TRUNCATE ON %I FOR EACH STATEMENT EXECUTE PROCEDURE shardman.go_away();',
-		relation);
-	EXECUTE format(
-		'ALTER TABLE %I ENABLE ALWAYS TRIGGER shardman_readonly;', relation);
+	PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly',
+												 'shardman.go_away()');
 END
 $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION go_away() RETURNS TRIGGER AS $$
 BEGIN
 	RAISE EXCEPTION 'The "%" table is read only.', TG_TABLE_NAME
 		USING HINT = 'Probably table copy is in progress';
-  RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 -- And make it writable again
@@ -319,6 +313,69 @@ CREATE FUNCTION readonly_table_off(relation regclass)
 	RETURNS void AS $$
 BEGIN
 	EXECUTE format('DROP TRIGGER IF EXISTS shardman_readonly ON %s', relation);
+	EXECUTE format('DROP TRIGGER IF EXISTS shardman_readonly_stmt ON %s', relation);
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Make replica read-only, i.e. readonly for all but LR apply workers
+CREATE FUNCTION readonly_replica_on(relation regclass)
+	RETURNS void AS $$
+BEGIN
+	RAISE DEBUG '[SHARDMAN] table % made read-only for all but apply workers', relation;
+	PERFORM shardman.readonly_replica_off(relation);
+	PERFORM shardman.create_modification_triggers(
+		relation, 'shardman_readonly_replica', 'shardman.ror_go_away()');
+END $$ LANGUAGE plpgsql STRICT;
+-- This function is impudent because it is used as both stmt and row trigger.
+-- The idea is that we must never reach RETURN NEW after stmt row trigger,
+-- because stmt trigger fires only on TRUNCATE which is impossible in LR.
+-- Besides, I checked that nothing bad happens if we return NEW from stmt
+-- trigger function anyway.
+CREATE FUNCTION ror_go_away() RETURNS TRIGGER AS $$
+BEGIN
+	IF NOT shardman.inside_apply_worker() THEN
+		RAISE EXCEPTION 'The "%" table is read only for non-apply workers', TG_TABLE_NAME
+		USING HINT =
+		'If you see this, most probably node with primary part has failed and' ||
+		' you need to promote replica. Promotion is not yet implemented, sorry :(';
+	END IF;
+	raise warning 'NEW IS %', NEW;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+-- And make replica writable again
+CREATE FUNCTION readonly_replica_off(relation regclass) RETURNS void AS $$
+BEGIN
+	EXECUTE format('DROP TRIGGER IF EXISTS shardman_readonly_replica ON %s',
+				   relation);
+	EXECUTE format('DROP TRIGGER IF EXISTS shardman_readonly_replica_stmt ON %s',
+				   relation);
+END $$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION inside_apply_worker() RETURNS bool AS 'pg_shardman' LANGUAGE C;
+
+-- Create two triggers firing exec_proc before any modification operation, make
+-- them ALWAYS ENABLE. We need two triggers because TRUNCATE doesn't work with
+-- FOR EACH ROW, while LR doesn't support STATEMENT triggers (well, there is no
+-- statements in WAL) and changes may sneak through it.
+-- If you are curious, we use %I to format any identifiers (e.g. quote identifier
+-- with "" if it contains spaces) and use %s while formatting regclass, because
+-- it quotes everything automatically while casting oid to name.
+CREATE FUNCTION create_modification_triggers(
+	relation regclass, trigname name, exec_proc text) RETURNS void AS $$
+DECLARE
+	stmt_trigname text;
+BEGIN
+	EXECUTE format(
+		'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE
+		ON %s FOR EACH ROW EXECUTE PROCEDURE %s;',
+		trigname, relation, exec_proc);
+	EXECUTE format(
+		'ALTER TABLE %s ENABLE ALWAYS TRIGGER %I;', relation::text, trigname);
+	stmt_trigname := format('%s_stmt', trigname);
+	EXECUTE format(
+		'CREATE TRIGGER %I BEFORE
+		TRUNCATE ON %s FOR EACH STATEMENT EXECUTE PROCEDURE %s;',
+		stmt_trigname, relation, exec_proc);
+	EXECUTE format(
+		'ALTER TABLE %s ENABLE ALWAYS TRIGGER %I;', relation::text, stmt_trigname);
 END $$ LANGUAGE plpgsql STRICT;
 
 CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS text

@@ -287,7 +287,7 @@ wait_notify()
 	/* eat all notifications at once */
 	while ((notify = PQnotifies(conn)) != NULL)
 	{
-		shmn_elog(LOG, "NOTIFY %s received from backend PID %d",
+		shmn_elog(DEBUG1, "NOTIFY %s received from backend PID %d",
 			 notify->relname, notify->be_pid);
 		PQfreemem(notify);
 	}
@@ -446,7 +446,7 @@ void
 cmd_canceled(Cmd *cmd)
 {
 	got_sigusr1 = false;
-	shmn_elog(LOG, "Command %ld canceled", cmd->id);
+	shmn_elog(INFO, "Command %ld canceled", cmd->id);
 	update_cmd_status(cmd->id, "canceled");
 }
 
@@ -755,14 +755,10 @@ get_primary_owner(const char *part_name)
 		part_name);
 
 	if (SPI_execute(sql, true, 0) < 0)
-	{
 		shmn_elog(FATAL, "Stmt failed : %s", sql);
-	}
 
 	if (SPI_processed == 0)
-	{
 		owner = -1;
-	}
 	else
 	{
 		owner =	DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
@@ -772,6 +768,42 @@ get_primary_owner(const char *part_name)
 
 	SPI_EPILOG;
 	return owner;
+}
+
+/*
+ * Get node id on which the last replica in the 'part_name' replica chain
+ * resides, and its partnum.  -1 is returned if such partition doesn't exist
+ * at all.
+ */
+int32
+get_reptail_owner(const char *part_name, int32 *owner, int32 *partnum)
+{
+	char *sql;
+	bool isnull;
+	int result = 0;
+
+	SPI_PROLOG;
+	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
+		"select owner from shardman.partitions where part_name = '%s'"
+		" and nxt is NULL;", part_name);
+
+	if (SPI_execute(sql, true, 0) < 0)
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+
+	if (SPI_processed == 0)
+		result = -1;
+	else
+	{
+		*owner = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											 SPI_tuptable->tupdesc,
+											 1, &isnull));
+		*partnum = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc,
+											   2, &isnull));
+	}
+
+	SPI_EPILOG;
+	return result;
 }
 
 /*

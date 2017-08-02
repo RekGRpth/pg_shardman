@@ -17,6 +17,7 @@
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
 #include "storage/lmgr.h"
+#include "replication/worker_internal.h"
 #include "libpq-fe.h"
 
 #include "pg_shardman.h"
@@ -294,4 +295,14 @@ reset_node_id_c(PG_FUNCTION_ARGS)
 {
 	shardman_my_node_id = SHMN_INVALID_NODE_ID;
 	PG_RETURN_VOID();
+}
+
+/* A bit hackish way to check whether we are inside LR apply worker or not */
+PG_FUNCTION_INFO_V1(inside_apply_worker);
+Datum
+inside_apply_worker(PG_FUNCTION_ARGS)
+{
+	bool inside = MyLogicalRepWorker != NULL;
+	shmn_elog(DEBUG1, "inside apply worker is %d", inside);
+	PG_RETURN_BOOL(inside);
 }
