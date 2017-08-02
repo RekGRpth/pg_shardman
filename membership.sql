@@ -7,7 +7,8 @@
  */
 
 -- active is the normal mode, others needed only for proper node add and removal
-CREATE TYPE worker_node_status AS ENUM ('active', 'add_in_progress', 'rm_in_progress');
+CREATE TYPE worker_node_status AS ENUM (
+	'active', 'add_in_progress', 'rm_in_progress', 'removed');
 
 -- list of nodes present in the cluster
 CREATE TABLE nodes (
@@ -30,7 +31,10 @@ CREATE TABLE nodes (
 -- of transaction. Later we should delete subscriptions fully.
 CREATE FUNCTION rm_node_worker_side() RETURNS TRIGGER AS $$
 BEGIN
-	PERFORM shardman.pg_shardman_cleanup(false);
+	IF OLD.id = (SELECT shardman.get_node_id()) THEN
+		RAISE DEBUG '[SHARDMAN] rm_node_worker_side called';
+		PERFORM shardman.pg_shardman_cleanup(false);
+	END IF;
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;

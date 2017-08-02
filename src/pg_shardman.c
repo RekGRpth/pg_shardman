@@ -690,11 +690,9 @@ rm_node(Cmd *cmd)
 	 */
 	sql = psprintf(
 		"select shardman.drop_repslot('shardman_meta_sub_%d');"
-		/* keep silent cmd_log fk constraint */
-		"update shardman.cmd_log set node_id = null where node_id = %d;"
-		"delete from shardman.nodes where id = %d;"
+		"update shardman.nodes set worker_status = 'removed' where id = %d;"
 		"update shardman.cmd_log set status = 'success' where id = %ld;",
-		node_id, node_id, node_id, cmd->id);
+		node_id, node_id, cmd->id);
 	void_spi(sql);
 	pfree(sql);
 	elog(INFO, "Node %d successfully removed", node_id);
