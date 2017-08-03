@@ -1103,7 +1103,7 @@ reset_pqconn_and_res(PGconn **conn, PGresult *res)
  */
 void configure_retry(CopyPartState *cps, int millis)
 {
-	shmn_elog(DEBUG1, "Copying mpart %s: sleeping %d ms and retrying",
+	shmn_elog(DEBUG1, "Copying part %s: sleeping %d ms and retrying",
 			  cps->part_name, millis);
 	cps->waketm = timespec_now_plus_millis(millis);
 	cps->exec_res = TASK_WAKEMEUP;

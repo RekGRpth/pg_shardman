@@ -6,6 +6,10 @@
  * ------------------------------------------------------------------------
  */
 
+------------------------------------------------------------
+-- Tables
+------------------------------------------------------------
+
 -- sharded tables
 CREATE TABLE tables (
 	relation text PRIMARY KEY, -- table name
@@ -60,6 +64,10 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER new_table_master_side AFTER INSERT ON shardman.tables
 	FOR EACH ROW EXECUTE PROCEDURE new_table_master_side();
 
+------------------------------------------------------------
+-- Partitions
+------------------------------------------------------------
+
 -- Primary shard and its replicas compose a doubly-linked list with 0 shard in
 -- the beginning.
 CREATE TABLE partitions (
@@ -67,15 +75,124 @@ CREATE TABLE partitions (
 	-- Shard number. 0 means primary shard.
 	num serial,
 	nxt int,
-	prev int,
+	prv int,
 	relation text NOT NULL REFERENCES tables(relation),
 	owner int REFERENCES nodes(id), -- node on which partition lies
 	PRIMARY KEY (part_name, num),
 	FOREIGN KEY (part_name, nxt) REFERENCES shardman.partitions(part_name, num),
-	FOREIGN KEY (part_name, prev) REFERENCES shardman.partitions(part_name, num),
-	-- primary has no prev, replica must have prev
-	CONSTRAINT prev_existence CHECK (num = 0 OR prev IS NOT NULL)
+	FOREIGN KEY (part_name, prv) REFERENCES shardman.partitions(part_name, num),
+	-- primary has no prv, replica must have prv
+	CONSTRAINT prv_existence CHECK (num = 0 OR prv IS NOT NULL)
 );
+
+------------------------------------------------------------
+-- Metadata triggers
+------------------------------------------------------------
+
+-- On adding new primary, create proper foreign server & foreign table and
+-- replace tmp (empty) partition with it.
+-- TODO: There is a race condition between this trigger and
+-- new_table_worker_side trigger during initial tablesync, we should deal with
+-- it.
+CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
+BEGIN
+	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
+		PERFORM shardman.replace_usual_part_with_foreign(NEW);
+	END IF;
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER new_primary AFTER INSERT ON shardman.partitions
+	FOR EACH ROW WHEN (NEW.num = 0) EXECUTE PROCEDURE new_primary();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_primary;
+
+-- Replace foreign table-partition with local. The latter must exist!
+-- Foreign table will be dropped.
+CREATE FUNCTION replace_foreign_part_with_usual(part partitions)
+	RETURNS void AS $$
+DECLARE
+	fdw_part_name name;
+BEGIN
+	ASSERT to_regclass(part.part_name) IS NOT NULL;
+	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
+	EXECUTE format('SELECT replace_hash_partition(%L, %L);',
+				   fdw_part_name, part.part_name);
+	EXECUTE format('DROP FOREIGN TABLE %I;', fdw_part_name);
+END $$ LANGUAGE plpgsql;
+
+-- Update metadata according to primary move
+CREATE FUNCTION primary_moved() RETURNS TRIGGER AS $$
+DECLARE
+	cp_logname text := format('shardman_copy_%s_%s_%s',
+							   OLD.part_name, OLD.owner, NEW.owner);
+	my_id int := shardman.get_node_id();
+BEGIN
+	ASSERT NEW.owner != OLD.owner, 'primary_moved handles only moved parts';
+	IF my_id = OLD.owner THEN -- src node
+		-- Drop publication & repslot used for copy
+		EXECUTE format('DROP PUBLICATION IF EXISTS %I', cp_logname);
+		PERFORM shardman.drop_repslot(cp_logname, true);
+		-- On src node, replace its partition with foreign one
+		PERFORM shardman.replace_usual_part_with_foreign(NEW);
+	ELSEIF my_id = NEW.owner THEN -- dst node
+		-- Drop subscription used for copy
+		PERFORM shardman.eliminate_sub(cp_logname);
+		-- And replace moved table with foreign one
+		PERFORM shardman.replace_foreign_part_with_usual(NEW);
+	ELSE -- other nodes
+		-- just update foreign server
+		PERFORM shardman.update_fdw_server(NEW);
+	END IF;
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER primary_moved AFTER UPDATE ON shardman.partitions
+	FOR EACH ROW EXECUTE PROCEDURE primary_moved();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER primary_moved;
+
+-- Update metadata according to new replica creation.
+CREATE FUNCTION replica_created() RETURNS TRIGGER AS $$
+DECLARE
+	cp_logname text := format('shardman_copy_%s_%s_%s',
+							   NEW.part_name, NEW.prv, NEW.owner);
+	my_id int := shardman.get_node_id();
+BEGIN
+	-- ASSERT NEW.owner != OLD.owner, 'partition_moved handles only moved parts';
+	-- cp_logname := format('shardman_copy_%s_%s_%s',
+	-- 						   OLD.part_name, OLD.owner, NEW.owner);
+	-- my_id := (SELECT shardman.get_node_id());
+	-- IF my_id = OLD.owner THEN -- src node
+	-- 	-- Drop publication & repslot used for copy
+	-- 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', cp_logname);
+	-- 	PERFORM shardman.drop_repslot(cp_logname, true);
+	-- 	-- On src node, replace its partition with foreign one
+	-- 	PERFORM shardman.replace_usual_part_with_foreign(NEW);
+	-- ELSEIF my_id = NEW.owner THEN -- dst node
+	-- 	-- Drop subscription used for copy
+	-- 	PERFORM shardman.eliminate_sub(cp_logname);
+	-- 	PERFORM shardman.replace_foreign_part_with_usual(NEW);
+	-- ELSE -- other nodes
+	-- 	-- just update foreign server
+	-- 	PERFORM shardman.update_fdw_server(NEW);
+	-- END IF;
+	-- RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER replica_created AFTER INSERT ON shardman.partitions
+	FOR EACH ROW WHEN (NEW.num != 0) EXECUTE PROCEDURE replica_created();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER replica_created;
+
+
+-- Otherwise partitioned tables on worker nodes not will be dropped properly,
+-- see pathman's docs.
+ALTER EVENT TRIGGER pathman_ddl_trigger ENABLE ALWAYS;
+
+------------------------------------------------------------
+-- Funcs related to fdw
+------------------------------------------------------------
 
 -- We use _fdw suffix for foreign tables to avoid interleaving with real
 -- ones.
@@ -207,90 +324,67 @@ BEGIN
 	EXECUTE format('DROP TABLE %I', part.part_name);
 END $$ LANGUAGE plpgsql;
 
--- On adding new partition, create proper foreign server & foreign table and
--- replace tmp (empty) partition with it.
--- TODO: There is a race condition between this trigger and
--- new_table_worker_side trigger during initial tablesync, we should deal with
--- it.
-CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
-BEGIN
-	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
-		PERFORM shardman.replace_usual_part_with_foreign(NEW);
-	END IF;
-	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
-CREATE TRIGGER new_primary AFTER INSERT ON shardman.partitions
-	FOR EACH ROW WHEN (NEW.num = 0) EXECUTE PROCEDURE new_primary();
--- fire trigger only on worker nodes
-ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_primary;
-
--- Replace foreign table-partition with local. The latter must exist!
--- Foreign table will be dropped.
-CREATE FUNCTION replace_foreign_part_with_usual(part partitions)
-	RETURNS void AS $$
+-- Options to postgres_fdw are specified in two places: user & password in user
+-- mapping and everything else in create server. The problem is that we use
+-- single connstring, however user mapping and server doesn't understand this
+-- format, i.e. we can't say create server ... options (dbname 'port=4848
+-- host=blabla.org'). So we have to parse the opts and pass them manually. libpq
+-- knows how to do it, but doesn't expose that. On the other hand, quote_literal
+-- (which is neccessary here) doesn't seem to have handy C API. I resorted to
+-- have C function which parses the opts and returns them in two parallel
+-- arrays, and this sql function joins them with quoting.
+-- prfx is prefix added before opt name, e.g. 'ADD ' for use in ALTER SERVER.
+-- Returns two strings: one with opts ready to pass to CREATE FOREIGN SERVER
+-- stmt, and one wih opts ready to pass to CREATE USER MAPPING.
+CREATE FUNCTION conninfo_to_postgres_fdw_opts(
+	IN connstring text, IN prfx text DEFAULT '',
+	OUT server_opts text, OUT um_opts text) RETURNS record AS $$
 DECLARE
-	fdw_part_name name;
+	connstring_keywords text[];
+	connstring_vals text[];
+	server_opts_first_time_through bool DEFAULT true;
+	um_opts_first_time_through bool DEFAULT true;
 BEGIN
-	ASSERT to_regclass(part.part_name) IS NOT NULL;
-	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
-	EXECUTE format('SELECT replace_hash_partition(%L, %L);',
-				   fdw_part_name, part.part_name);
-	EXECUTE format('DROP FOREIGN TABLE %I;', fdw_part_name);
-END $$ LANGUAGE plpgsql;
+	server_opts := '';
+	um_opts := '';
+	SELECT * FROM shardman.pq_conninfo_parse(connstring)
+	  INTO connstring_keywords, connstring_vals;
+	FOR i IN 1..(SELECT array_upper(connstring_keywords, 1)) LOOP
+		IF connstring_keywords[i] = 'client_encoding' OR
+			connstring_keywords[i] = 'fallback_application_name' THEN
+			CONTINUE; /* not allowed in postgres_fdw */
+		ELSIF connstring_keywords[i] = 'user' OR
+			connstring_keywords[i] = 'password' THEN -- user mapping option
+			IF NOT um_opts_first_time_through THEN
+				um_opts := um_opts || ', ';
+			END IF;
+			um_opts_first_time_through := false;
+			um_opts := prfx || um_opts ||
+				format('%s %L', connstring_keywords[i], connstring_vals[i]);
+		ELSE -- server option
+			IF NOT server_opts_first_time_through THEN
+				server_opts := server_opts || ', ';
+			END IF;
+			server_opts_first_time_through := false;
+			server_opts := prfx || server_opts ||
+				format('%s %L', connstring_keywords[i], connstring_vals[i]);
+		END IF;
+	END LOOP;
 
--- Update metadata according to partition move
--- On adding new partition, create proper foreign server & foreign table and
--- replace tmp (empty) partition with it.
-CREATE FUNCTION partition_moved() RETURNS TRIGGER AS $$
-DECLARE
-	movepart_logname text; -- name of logical pub, sub, repslot for copying, etc
-	my_id int;
-BEGIN
-	ASSERT NEW.owner != OLD.owner, 'partition_moved handles only moved parts';
-	movepart_logname := format('shardman_copy_%s_%s_%s',
-							   OLD.part_name, OLD.owner, NEW.owner);
-	my_id := (SELECT shardman.get_node_id());
-	IF my_id = OLD.owner THEN -- src node
-		-- Drop publication & repslot used for copy
-		EXECUTE format('DROP PUBLICATION IF EXISTS %I', movepart_logname);
-		PERFORM shardman.drop_repslot(movepart_logname, true);
-		-- On src node, replace its partition with foreign one
-		PERFORM shardman.replace_usual_part_with_foreign(NEW);
-	ELSEIF my_id = NEW.owner THEN -- dst node
-		-- Drop subscription used for copy
-		PERFORM shardman.eliminate_sub(movepart_logname);
-		PERFORM shardman.replace_foreign_part_with_usual(NEW);
-	ELSE -- other nodes
-		-- just update foreign server
-		PERFORM shardman.update_fdw_server(NEW);
+	-- OPTIONS () is syntax error, so add OPTIONS only if we really have opts
+	IF server_opts != '' THEN
+		server_opts := format(' OPTIONS (%s)', server_opts);
 	END IF;
-	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
-CREATE TRIGGER partition_moved AFTER UPDATE ON shardman.partitions
-	FOR EACH ROW EXECUTE PROCEDURE partition_moved();
--- fire trigger only on worker nodes
-ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER partition_moved;
+	IF um_opts != '' THEN
+		um_opts := format(' OPTIONS (%s)', um_opts);
+	END IF;
+END $$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals text[])
+	RETURNS record AS 'pg_shardman' LANGUAGE C STRICT;
 
--- Otherwise partitioned tables on worker nodes not will be dropped properly,
--- see pathman's docs.
-ALTER EVENT TRIGGER pathman_ddl_trigger ENABLE ALWAYS;
-
-
--- Utility funcs
-
--- generate one-column table with partition names as 'tablename'_'partnum''suffix'
-CREATE FUNCTION gen_part_names(relation text, partitions_count int,
-							   suffix text DEFAULT '')
-	RETURNS TABLE(part_name text) AS $$
-BEGIN
-	RETURN QUERY SELECT relation || '_' || range.num || suffix AS partname
-		FROM
-		(SELECT num FROM generate_series(0, partitions_count - 1, 1)
-							 AS range(num)) AS range;
-END
-$$ LANGUAGE plpgsql;
+------------------------------------------------------------
+-- Read-only tables and replicas
+------------------------------------------------------------
 
 -- Make table read-only
 CREATE FUNCTION readonly_table_on(relation regclass)
@@ -384,60 +478,18 @@ CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS tex
 CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 	RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
--- Options to postgres_fdw are specified in two places: user & password in user
--- mapping and everything else in create server. The problem is that we use
--- single connstring, however user mapping and server doesn't understand this
--- format, i.e. we can't say create server ... options (dbname 'port=4848
--- host=blabla.org'). So we have to parse the opts and pass them manually. libpq
--- knows how to do it, but doesn't expose that. On the other hand, quote_literal
--- (which is neccessary here) doesn't seem to have handy C API. I resorted to
--- have C function which parses the opts and returns them in two parallel
--- arrays, and this sql function joins them with quoting.
--- prfx is prefix added before opt name, e.g. 'ADD ' for use in ALTER SERVER.
--- Returns two strings: one with opts ready to pass to CREATE FOREIGN SERVER
--- stmt, and one wih opts ready to pass to CREATE USER MAPPING.
-CREATE FUNCTION conninfo_to_postgres_fdw_opts(
-	IN connstring text, IN prfx text DEFAULT '',
-	OUT server_opts text, OUT um_opts text) RETURNS record AS $$
-DECLARE
-	connstring_keywords text[];
-	connstring_vals text[];
-	server_opts_first_time_through bool DEFAULT true;
-	um_opts_first_time_through bool DEFAULT true;
-BEGIN
-	server_opts := '';
-	um_opts := '';
-	SELECT * FROM shardman.pq_conninfo_parse(connstring)
-	  INTO connstring_keywords, connstring_vals;
-	FOR i IN 1..(SELECT array_upper(connstring_keywords, 1)) LOOP
-		IF connstring_keywords[i] = 'client_encoding' OR
-			connstring_keywords[i] = 'fallback_application_name' THEN
-			CONTINUE; /* not allowed in postgres_fdw */
-		ELSIF connstring_keywords[i] = 'user' OR
-			connstring_keywords[i] = 'password' THEN -- user mapping option
-			IF NOT um_opts_first_time_through THEN
-				um_opts := um_opts || ', ';
-			END IF;
-			um_opts_first_time_through := false;
-			um_opts := prfx || um_opts ||
-				format('%s %L', connstring_keywords[i], connstring_vals[i]);
-		ELSE -- server option
-			IF NOT server_opts_first_time_through THEN
-				server_opts := server_opts || ', ';
-			END IF;
-			server_opts_first_time_through := false;
-			server_opts := prfx || server_opts ||
-				format('%s %L', connstring_keywords[i], connstring_vals[i]);
-		END IF;
-	END LOOP;
+------------------------------------------------------------
+-- Other funcs
+------------------------------------------------------------
 
-	-- OPTIONS () is syntax error, so add OPTIONS only if we really have opts
-	IF server_opts != '' THEN
-		server_opts := format(' OPTIONS (%s)', server_opts);
-	END IF;
-	IF um_opts != '' THEN
-		um_opts := format(' OPTIONS (%s)', um_opts);
-	END IF;
-END $$ LANGUAGE plpgsql STRICT;
-CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals text[])
-	RETURNS record AS 'pg_shardman' LANGUAGE C STRICT;
+-- generate one-column table with partition names as 'tablename'_'partnum''suffix'
+CREATE FUNCTION gen_part_names(relation text, partitions_count int,
+							   suffix text DEFAULT '')
+	RETURNS TABLE(part_name text) AS $$
+BEGIN
+	RETURN QUERY SELECT relation || '_' || range.num || suffix AS partname
+		FROM
+		(SELECT num FROM generate_series(0, partitions_count - 1, 1)
+							 AS range(num)) AS range;
+END
+$$ LANGUAGE plpgsql;

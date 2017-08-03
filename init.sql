@@ -24,7 +24,7 @@ $$;
 
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_primary');
+						 'move_primary', 'create_replica');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
 								'success');
@@ -104,6 +104,20 @@ DECLARE
 	c_id int;
 BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_primary')
+										   RETURNING id INTO c_id;
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
+	RETURN c_id;
+END $$ LANGUAGE plpgsql;
+
+-- Create replica partition. Params:
+-- 'part_name' is name of the partition to replicate
+-- 'dest' is id of the node on which part will be created
+CREATE FUNCTION create_replica(part_name text, dest int) RETURNS int AS $$
+DECLARE
+	c_id int;
+BEGIN
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'create_replica')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
