@@ -213,6 +213,14 @@ BEGIN
 				   pg_replication_slots WHERE slot_name = %L', slot_name);
 END $$ LANGUAGE plpgsql STRICT;
 
+-- Drop with fire repslot and publication with the same name. Useful for 1-to-1
+-- pub-sub.
+CREATE FUNCTION drop_repslot_and_pub(pub name) RETURNS void AS $$
+BEGIN
+	EXECUTE format('DROP PUBLICATION IF EXISTS %I', pub);
+	PERFORM shardman.drop_repslot(pub, true);
+END $$ LANGUAGE plpgsql STRICT;
+
 -- If sub exists, disable it, detach repslot from it and possibly drop. We
 -- manage repslots ourselves, so it is essential to detach rs before dropping
 -- sub, and repslots can't be detached while subscription is active.

@@ -54,7 +54,7 @@ ALTER TABLE shardman.tables ENABLE REPLICA TRIGGER new_table_worker_side;
 CREATE FUNCTION new_table_master_side() RETURNS TRIGGER AS $$
 BEGIN
 	INSERT INTO shardman.partitions
-	SELECT part_name, 0, NULL, NULL, NEW.relation AS relation, NEW.initial_node AS owner
+	SELECT part_name, NEW.initial_node AS owner, NULL, NULL, NEW.relation AS relation
 	  FROM (SELECT part_name FROM shardman.gen_part_names(
 		  NEW.relation, NEW.partitions_count))
 			   AS partnames;
@@ -68,21 +68,18 @@ CREATE TRIGGER new_table_master_side AFTER INSERT ON shardman.tables
 -- Partitions
 ------------------------------------------------------------
 
--- Primary shard and its replicas compose a doubly-linked list with 0 shard in
--- the beginning.
+-- Primary shard and its replicas compose a doubly-linked list: nxt refers to
+-- the node containing next replica, prv to node with previous replica (or
+-- primary, if we are the first replica). If prv is NULL, this is primary
+-- replica. We don't number parts separately since we are not ever going to
+-- allow several copies of the same partition on one node.
 CREATE TABLE partitions (
 	part_name text,
-	-- Shard number. 0 means primary shard.
-	num serial,
-	nxt int,
-	prv int,
+	owner int NOT NULL REFERENCES nodes(id), -- node on which partition lies
+	prv int REFERENCES nodes(id),
+	nxt int REFERENCES nodes(id),
 	relation text NOT NULL REFERENCES tables(relation),
-	owner int REFERENCES nodes(id), -- node on which partition lies
-	PRIMARY KEY (part_name, num),
-	FOREIGN KEY (part_name, nxt) REFERENCES shardman.partitions(part_name, num),
-	FOREIGN KEY (part_name, prv) REFERENCES shardman.partitions(part_name, num),
-	-- primary has no prv, replica must have prv
-	CONSTRAINT prv_existence CHECK (num = 0 OR prv IS NOT NULL)
+	PRIMARY KEY (part_name, owner)
 );
 
 ------------------------------------------------------------
@@ -96,43 +93,31 @@ CREATE TABLE partitions (
 -- it.
 CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
 BEGIN
-	IF NEW.owner != (SELECT shardman.get_node_id()) THEN
+	RAISE DEBUG '[SHARDMAN] new_primary trigger called for part %, owner %',
+		NEW.part_name, NEW.owner;
+	IF NEW.owner != shardman.get_node_id() THEN
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER new_primary AFTER INSERT ON shardman.partitions
-	FOR EACH ROW WHEN (NEW.num = 0) EXECUTE PROCEDURE new_primary();
+	FOR EACH ROW WHEN (NEW.prv IS NULL) EXECUTE PROCEDURE new_primary();
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_primary;
-
--- Replace foreign table-partition with local. The latter must exist!
--- Foreign table will be dropped.
-CREATE FUNCTION replace_foreign_part_with_usual(part partitions)
-	RETURNS void AS $$
-DECLARE
-	fdw_part_name name;
-BEGIN
-	ASSERT to_regclass(part.part_name) IS NOT NULL;
-	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
-	EXECUTE format('SELECT replace_hash_partition(%L, %L);',
-				   fdw_part_name, part.part_name);
-	EXECUTE format('DROP FOREIGN TABLE %I;', fdw_part_name);
-END $$ LANGUAGE plpgsql;
 
 -- Update metadata according to primary move
 CREATE FUNCTION primary_moved() RETURNS TRIGGER AS $$
 DECLARE
-	cp_logname text := format('shardman_copy_%s_%s_%s',
-							   OLD.part_name, OLD.owner, NEW.owner);
+	cp_logname text := shardman.get_cp_logname(OLD.part_name, OLD.owner, NEW.owner);
 	my_id int := shardman.get_node_id();
 BEGIN
+	RAISE DEBUG '[SHARDMAN] primary_moved trigger called for part %, owner %->%',
+		NEW.part_name, OLD.owner, NEW.owner;
 	ASSERT NEW.owner != OLD.owner, 'primary_moved handles only moved parts';
 	IF my_id = OLD.owner THEN -- src node
 		-- Drop publication & repslot used for copy
-		EXECUTE format('DROP PUBLICATION IF EXISTS %I', cp_logname);
-		PERFORM shardman.drop_repslot(cp_logname, true);
+		PERFORM shardman.drop_repslot_and_pub(cp_logname);
 		-- On src node, replace its partition with foreign one
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	ELSEIF my_id = NEW.owner THEN -- dst node
@@ -148,43 +133,74 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER primary_moved AFTER UPDATE ON shardman.partitions
-	FOR EACH ROW EXECUTE PROCEDURE primary_moved();
+	FOR EACH ROW WHEN (OLD.prv is NULL AND NEW.prv IS NULL -- it is primary
+					   AND OLD.owner != NEW.owner -- and it is really moved
+					   AND OLD.part_name = NEW.part_name) -- sanity check
+	EXECUTE PROCEDURE primary_moved();
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER primary_moved;
 
 -- Update metadata according to new replica creation.
+-- Old tail part is still read-only when this called. There are two main jobs
+-- to do: set up LR sync channel between old tail and new replica and update fdw
+-- everywhere. For the former we could configure already existing channel used
+-- for partition copy, but we will not do that, because
+-- * It is not easier than creating new pub & sub: we have to rename pub, drop
+--   and create repslot (there is no way to rename it), rename sub, alter sub's
+--   slot_name, alter sub's publication, probably rename sub application name,
+--   probably run REFRESH (which requires alive pub just as CREATE SUBSCRIPTION)
+--   and hope that everything will be ok. Not sure about refreshing, though -- I
+--   don't know is it ok not doing it if tables didn't change. Doc says it
+--   should be executed.
+-- * Since it is not possible to rename repslot and and it is not possible to
+--   specify since which lsn start replication, tables must be synced anyway
+--   during these operations, so what the point of reusing old sub? And copypart
+--   in shard.c really cares that tables are synced at this moment and src is
+--   read-only.
 CREATE FUNCTION replica_created() RETURNS TRIGGER AS $$
 DECLARE
-	cp_logname text := format('shardman_copy_%s_%s_%s',
-							   NEW.part_name, NEW.prv, NEW.owner);
+	cp_logname text := shardman.get_cp_logname(NEW.part_name, NEW.prv, NEW.owner);
+	oldtail_pubname name := shardman.get_data_pubname(NEW.part_name, NEW.prv);
+	oldtail_connstr text := shardman.get_worker_node_connstr(NEW.prv);
+	newtail_subname name := shardman.get_data_subname(NEW.part_name, NEW.prv, NEW.owner);
 	my_id int := shardman.get_node_id();
 BEGIN
-	-- ASSERT NEW.owner != OLD.owner, 'partition_moved handles only moved parts';
-	-- cp_logname := format('shardman_copy_%s_%s_%s',
-	-- 						   OLD.part_name, OLD.owner, NEW.owner);
-	-- my_id := (SELECT shardman.get_node_id());
-	-- IF my_id = OLD.owner THEN -- src node
-	-- 	-- Drop publication & repslot used for copy
-	-- 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', cp_logname);
-	-- 	PERFORM shardman.drop_repslot(cp_logname, true);
-	-- 	-- On src node, replace its partition with foreign one
-	-- 	PERFORM shardman.replace_usual_part_with_foreign(NEW);
-	-- ELSEIF my_id = NEW.owner THEN -- dst node
-	-- 	-- Drop subscription used for copy
-	-- 	PERFORM shardman.eliminate_sub(cp_logname);
-	-- 	PERFORM shardman.replace_foreign_part_with_usual(NEW);
-	-- ELSE -- other nodes
-	-- 	-- just update foreign server
-	-- 	PERFORM shardman.update_fdw_server(NEW);
-	-- END IF;
-	-- RETURN NULL;
+	RAISE DEBUG '[SHARDMAN] replica_created trigger called';
+	IF my_id = NEW.prv THEN -- old tail node
+		-- Drop publication & repslot used for copy
+		PERFORM shardman.drop_repslot_and_pub(cp_logname);
+		-- Create publication & repslot for new data channel
+		PERFORM shardman.create_repslot(oldtail_pubname);
+		EXECUTE format('DROP PUBLICATION IF EXISTS %I', oldtail_pubname);
+		EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
+					   oldtail_pubname, NEW.part_name);
+		-- Make this channel sync
+		PERFORM shardman.ensure_sync_standby(newtail_subname);
+		-- Now it is safe to make old tail writable again
+		PERFORM shardman.readonly_table_off(relation);
+	ELSEIF my_id = NEW.owner THEN -- created replica, i.e. new tail node
+		-- Drop subscription used for copy
+		PERFORM shardman.eliminate_sub(cp_logname);
+		-- And create subscription for new data channel
+		-- It should never exist at this moment, but just in case...
+		PERFORM shardman.eliminate_sub(newtail_subname);
+		EXECUTE format(
+			'CREATE SUBSCRIPTION %I connection %L
+			PUBLICATION %I with (create_slot = false, slot_name = %L);',
+			newtail_subname, oldtail_connstr, oldtail_pubname, oldtail_pubname);
+		-- Now fdw connstring to this part should include only primary and myself
+		PERFORM shardman.update_fdw_server(NEW);
+	ELSE -- other nodes
+		-- just update fdw connstr to add new replica
+		PERFORM shardman.update_fdw_server(NEW);
+	END IF;
+	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER replica_created AFTER INSERT ON shardman.partitions
-	FOR EACH ROW WHEN (NEW.num != 0) EXECUTE PROCEDURE replica_created();
+	FOR EACH ROW WHEN (NEW.prv IS NOT NULL) EXECUTE PROCEDURE replica_created();
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER replica_created;
-
 
 -- Otherwise partitioned tables on worker nodes not will be dropped properly,
 -- see pathman's docs.
@@ -194,8 +210,8 @@ ALTER EVENT TRIGGER pathman_ddl_trigger ENABLE ALWAYS;
 -- Funcs related to fdw
 ------------------------------------------------------------
 
--- We use _fdw suffix for foreign tables to avoid interleaving with real
--- ones.
+-- Convention: we use _fdw suffix for foreign tables to avoid interleaving with
+-- real ones.
 CREATE FUNCTION get_fdw_part_name(part_name name) RETURNS name AS $$
 BEGIN
 	RETURN format('%s_fdw', part_name);
@@ -322,6 +338,20 @@ BEGIN
 				   part.part_name, fdw_part_name);
 	-- And drop old table
 	EXECUTE format('DROP TABLE %I', part.part_name);
+END $$ LANGUAGE plpgsql;
+
+-- Replace foreign table-partition with local. The latter must exist!
+-- Foreign table will be dropped.
+CREATE FUNCTION replace_foreign_part_with_usual(part partitions)
+	RETURNS void AS $$
+DECLARE
+	fdw_part_name name;
+BEGIN
+	ASSERT to_regclass(part.part_name) IS NOT NULL;
+	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
+	EXECUTE format('SELECT replace_hash_partition(%L, %L);',
+				   fdw_part_name, part.part_name);
+	EXECUTE format('DROP FOREIGN TABLE %I;', fdw_part_name);
 END $$ LANGUAGE plpgsql;
 
 -- Options to postgres_fdw are specified in two places: user & password in user
@@ -493,3 +523,36 @@ BEGIN
 							 AS range(num)) AS range;
 END
 $$ LANGUAGE plpgsql;
+
+-- Convention about pub, sub and repslot name used for copying part part_name
+-- from src node to dst node.
+CREATE FUNCTION get_cp_logname(part_name text, src int, dst int)
+	RETURNS name AS $$
+BEGIN
+	RETURN format('shardman_copy_%s_%s_%s', part_name, src, dst);
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Convention about pub and repslot name used for data replication from part
+-- on pub_node node to any part. We don't change pub and repslot while
+-- switching subs, so sub node is not included here.
+CREATE FUNCTION get_data_pubname(part_name text, pub_node int)
+	RETURNS name AS $$
+BEGIN
+	RETURN format('shardman_data_%s_%s', part_name, pub_node);
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Convention about sub and application_name used for data replication. We do
+-- recreate sub while switching pub, so pub node is included here.
+-- See comment to replica_created on why we don't reuse subs.
+CREATE FUNCTION get_data_subname(part_name text, pub_node int, sub_node int)
+	RETURNS name AS $$
+BEGIN
+	RETURN format('shardman_data_%s_%s_%s', part_name, pub_node, sub_node);
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Make sure that standby_name is present in synchronous_standby_names. If not,
+-- add it via ALTER SYSTEM and SIGHUP postmaster to reread conf.
+CREATE FUNCTION ensure_sync_standby(newtail_subname text) RETURNS void as $$
+BEGIN
+	RAISE DEBUG '[SHARDMAN] imagine standby updated';
+END $$ LANGUAGE plpgsql STRICT;

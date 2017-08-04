@@ -707,7 +707,7 @@ rm_node(Cmd *cmd)
  * NULL is returned, if there is no such node.
  */
 char*
-get_worker_node_connstr(int node_id)
+get_worker_node_connstr(int32 node_id)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 	char *sql = psprintf("select connstring from shardman.nodes where id = %d"
@@ -753,7 +753,7 @@ get_primary_owner(const char *part_name)
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
-		"select owner from shardman.partitions where part_name = '%s' and num = 0;",
+		"select owner from shardman.partitions where part_name = '%s' and prv IS NULL;",
 		part_name);
 
 	if (SPI_execute(sql, true, 0) < 0)
@@ -774,15 +774,14 @@ get_primary_owner(const char *part_name)
 
 /*
  * Get node id on which the last replica in the 'part_name' replica chain
- * resides, and its partnum.  -1 is returned if such partition doesn't exist
- * at all.
+ * resides. -1 is returned if such partition doesn't exist at all.
  */
 int32
-get_reptail_owner(const char *part_name, int32 *owner, int32 *partnum)
+get_reptail_owner(const char *part_name)
 {
 	char *sql;
 	bool isnull;
-	int result = 0;
+	int owner;
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
@@ -793,19 +792,16 @@ get_reptail_owner(const char *part_name, int32 *owner, int32 *partnum)
 		shmn_elog(FATAL, "Stmt failed : %s", sql);
 
 	if (SPI_processed == 0)
-		result = -1;
+		owner = -1;
 	else
 	{
-		*owner = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-											 SPI_tuptable->tupdesc,
-											 1, &isnull));
-		*partnum = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc,
-											   2, &isnull));
+		owner = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc,
+											1, &isnull));
 	}
 
 	SPI_EPILOG;
-	return result;
+	return owner;
 }
 
 /*

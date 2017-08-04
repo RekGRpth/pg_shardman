@@ -406,8 +406,11 @@ init_mpp_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 	}
 	cps->update_metadata_sql = psprintf(
 		"update shardman.partitions set owner = %d where part_name = '%s'"
-		" and num = 0;",
-		dst_node, part_name);
+		" and prv IS NULL;"
+		" update shardman.partitions set prv = %d where part_name = '%s'"
+		" and prv = %d",
+		dst_node, part_name,
+		dst_node, part_name, cps->src_node);
 	cps->type = COPYPARTTASK_MOVE_PRIMARY;
 	/* The rest fields are common among copy part tasks */
 	init_cp_state(cps);
@@ -437,11 +440,9 @@ create_replica(Cmd *cmd)
 void
 init_cr_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 {
-	int32 tail_num; /* partition number of old tail */
-
-	cps->part_name = part_name;
 	cps->dst_node = dst_node;
-	if ((get_reptail_owner(part_name, &cps->src_node, &tail_num)) == -1)
+	cps->part_name = part_name;
+	if ((cps->src_node = get_reptail_owner(part_name)) == -1)
 	{
 		shmn_elog(WARNING, "Primary part %s doesn't exist, not creating"
 				  "replica for it it", part_name);
@@ -456,8 +457,11 @@ init_cr_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 		"select shardman.readonly_replica_on('%s')", part_name);
 	cps->update_metadata_sql = psprintf(
 		"insert into shardman.partitions values "
-		" ('%s', default, NULL, %d, '%s', %d);",
-		part_name, tail_num, cps->relation, dst_node);
+		" ('%s', %d, %d, NULL, '%s');"
+		" update shardman.partitions set nxt = %d where part_name = '%s' and "
+		" owner = %d",
+		part_name, dst_node, cps->src_node, cps->relation,
+		dst_node, part_name, cps->src_node);
 	cps->type = COPYPARTTASK_CREATE_REPLICA;
 }
 
@@ -469,6 +473,9 @@ init_cr_state(CopyPartState *cps, const char *part_name, int32 dst_node)
 void
 init_cp_state(CopyPartState *cps)
 {
+	Assert(cps->src_node != 0);
+	Assert(cps->dst_node != 0);
+	Assert(cps->part_name != NULL);
 	/* Task is ready to be processed right now */
 	cps->waketm = timespec_now();
 	cps->fd_to_epoll = -1;
@@ -1070,6 +1077,7 @@ ensure_pqconn_intern(PGconn **conn, const char *connstr,
 	}
 	if (*conn == NULL)
 	{
+		Assert(connstr != NULL);
 		*conn = PQconnectdb(connstr);
 		if (PQstatus(*conn) != CONNECTION_OK)
 		{

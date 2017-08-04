@@ -45,10 +45,9 @@ extern void check_for_sigterm(void);
 extern uint64 void_spi(char *sql);
 extern void update_cmd_status(int64 id, const char *new_status);
 extern void cmd_canceled(Cmd *cmd);
-extern char *get_worker_node_connstr(int node_id);
+extern char *get_worker_node_connstr(int32 node_id);
 extern int32 get_primary_owner(const char *part_name);
-extern int32 get_reptail_owner(const char *part_name, int32 *owner,
-							   int32 *partnum);
+extern int32 get_reptail_owner(const char *part_name);
 extern char *get_partition_relation(const char *part_name);
 
 #endif							/* PG_SHARDMAN_H */

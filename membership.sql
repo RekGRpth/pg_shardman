@@ -94,3 +94,15 @@ BEGIN
 	RETURN n_id;
 END
 $$ LANGUAGE plpgsql;
+
+-- Get connstr of worker node with id node_id. ERROR is raised if there isn't
+-- one.
+CREATE OR REPLACE FUNCTION get_worker_node_connstr(node_id int) RETURNS text as $$
+DECLARE
+	connstr text := connstring FROM shardman.nodes WHERE id = node_id AND worker;
+BEGIN
+	IF connstr IS NULL THEN
+		RAISE EXCEPTION 'Worker node with id % not found', node_id;
+	END IF;
+	RETURN connstr;
+END $$ LANGUAGE plpgsql STRICT;
