@@ -193,12 +193,12 @@ CREATE FUNCTION drop_repslot(slot_name text, with_fire bool DEFAULT false)
 DECLARE
 	slot_exists bool;
 BEGIN
-	RAISE DEBUG 'Dropping repslot %', slot_name;
+	RAISE DEBUG '[SHARDMAN] Dropping repslot %', slot_name;
 	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
 				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
 		IF with_fire THEN -- kill walsender twice
-			RAISE DEBUG 'Killing repslot % with fire', slot_name;
+			RAISE DEBUG '[SHARDMAN] Killing repslot % with fire', slot_name;
 			PERFORM shardman.terminate_repslot_walsender(slot_name);
 			PERFORM pg_sleep(1);
 			PERFORM shardman.terminate_repslot_walsender(slot_name);

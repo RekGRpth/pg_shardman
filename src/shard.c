@@ -41,6 +41,8 @@
  * The first is more handy, but dangerous: if pub node crashed, create
  * subscription will fail. We need either patch LR to overcome this or add
  * wrapper which will continiously try to create subscription if it fails.
+ * Besides, there is no way to create logical replication slot if current trxn
+ * had written something.
  *
  * General copy partition implementation:
  * - Disable subscription on destination, otherwise we can't drop rep slot on
@@ -194,7 +196,6 @@ typedef struct
 	char *substate_sql; /* get current state of subscription */
 	char *readonly_sql; /* make src table read-only */
 	char *received_lsn_sql; /* get last received lsn on dst */
-	char *make_readonly_replica_sql; /* make copied replica readonly */
 	char *update_metadata_sql;
 
 	XLogRecPtr sync_point; /* when dst reached this point, it is synced */
@@ -202,6 +203,15 @@ typedef struct
 	ExecTaskRes exec_res; /* result of the last iteration */
 	TaskRes res; /* result of the whole move */
 } CopyPartState;
+
+/* State of create replica task */
+typedef struct
+{
+	CopyPartState cp;
+	char *rebuild_lr_drop_cp_sub_sql;
+	char *rebuild_lr_create_data_pub;
+	char *rebuild_lr_create_data_sub;
+} CreateReplicaState;
 
 typedef struct
 {
@@ -213,7 +223,7 @@ static void cmd_single_task_exec_finished(Cmd *cmd, CopyPartState *cps);
 static void init_cp_state(CopyPartState *cps);
 static void init_mpp_state(CopyPartState *cps, const char *part_name,
 						   int32 dst_node);
-static void init_cr_state(CopyPartState *cps, const char *part_name,
+static void init_cr_state(CreateReplicaState *cps, const char *part_name,
 						   int32 dst_node);
 static void finalize_cp_state(CopyPartState *cps);
 static void exec_tasks(CopyPartState **tasks, int ntasks);
@@ -222,8 +232,8 @@ static void epoll_subscribe(int epfd, CopyPartState *cps);
 static void exec_task(CopyPartState *cps);
 static void exec_cp(CopyPartState *cps);
 static void exec_move_primary(CopyPartState *cps);
-static void exec_create_replica(CopyPartState *cps);
-static int cr_make_readonly(CopyPartState *cps);
+static void exec_create_replica(CreateReplicaState *cps);
+static int cr_rebuild_lr(CreateReplicaState *cps);
 static void exec_move_replica(CopyPartState *cps);
 static int cp_start_tablesync(CopyPartState *cpts);
 static int cp_start_finalsync(CopyPartState *cpts);
@@ -426,43 +436,52 @@ create_replica(Cmd *cmd)
 	int32 dst_node = atoi(cmd->opts[1]);
 
 	CopyPartState **tasks = palloc(sizeof(CopyPartState*));
-	CopyPartState *cps = palloc(sizeof(CopyPartState));
-	tasks[0] = cps;
-	init_cr_state(cps, part_name, dst_node);
+	CreateReplicaState *crs = palloc(sizeof(CreateReplicaState));
+	tasks[0] = (CopyPartState *) crs;
+	init_cr_state(crs, part_name, dst_node);
 
 	exec_tasks(tasks, 1);
-	cmd_single_task_exec_finished(cmd, cps);
+	cmd_single_task_exec_finished(cmd, (CopyPartState *) crs);
 }
 
 /*
  * Fill CopyPartState for creating replica
  */
 void
-init_cr_state(CopyPartState *cps, const char *part_name, int32 dst_node)
+init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 {
-	cps->dst_node = dst_node;
-	cps->part_name = part_name;
-	if ((cps->src_node = get_reptail_owner(part_name)) == -1)
+	/* Set up fields neccesary to call init_cp_state */
+	crs->cp.dst_node = dst_node;
+	crs->cp.part_name = part_name;
+	if ((crs->cp.src_node = get_reptail_owner(part_name)) == -1)
 	{
 		shmn_elog(WARNING, "Primary part %s doesn't exist, not creating"
 				  "replica for it it", part_name);
-		cps->res = TASK_FAILED;
+		crs->cp.res = TASK_FAILED;
 		return;
 	}
 
 	/* Fields common among copy part tasks */
-	init_cp_state(cps);
+	init_cp_state((CopyPartState *) crs);
 
-	cps->make_readonly_replica_sql = psprintf(
-		"select shardman.readonly_replica_on('%s')", part_name);
-	cps->update_metadata_sql = psprintf(
+	crs->cp.update_metadata_sql = psprintf(
 		"insert into shardman.partitions values "
 		" ('%s', %d, %d, NULL, '%s');"
 		" update shardman.partitions set nxt = %d where part_name = '%s' and "
 		" owner = %d",
-		part_name, dst_node, cps->src_node, cps->relation,
-		dst_node, part_name, cps->src_node);
-	cps->type = COPYPARTTASK_CREATE_REPLICA;
+		part_name, dst_node, crs->cp.src_node, crs->cp.relation,
+		dst_node, part_name, crs->cp.src_node);
+	crs->cp.type = COPYPARTTASK_CREATE_REPLICA;
+
+	crs->rebuild_lr_drop_cp_sub_sql = psprintf(
+		"select shardman.replica_created_rebuild_drop_cp_sub('%s', %d, %d);",
+		part_name, crs->cp.src_node, crs->cp.dst_node);
+	crs->rebuild_lr_create_data_pub = psprintf(
+		"select shardman.replica_created_rebuild_lr_create_data_pub('%s', %d, %d);",
+		part_name, crs->cp.src_node, crs->cp.dst_node);
+	crs->rebuild_lr_create_data_sub = psprintf(
+		"select shardman.replica_created_rebuild_lr_create_data_sub('%s', %d, %d);",
+		part_name, crs->cp.src_node, crs->cp.dst_node);
 }
 
 /*
@@ -762,7 +781,7 @@ exec_task(CopyPartState *cps)
 			break;
 
 		case COPYPARTTASK_CREATE_REPLICA:
-			exec_create_replica(cps);
+			exec_create_replica((CreateReplicaState *) cps);
 			break;
 
 		case COPYPARTTASK_MOVE_REPLICA:
@@ -782,6 +801,8 @@ exec_move_primary(CopyPartState *cps)
 		return;
 
 	void_spi(cps->update_metadata_sql);
+	shmn_elog(LOG, "Primary move %s: %d->%d successfully done",
+			  cps->part_name, cps->src_node, cps->dst_node);
 	cps->res = TASK_SUCCESS;
 	cps->exec_res = TASK_DONE;
 }
@@ -790,43 +811,99 @@ exec_move_primary(CopyPartState *cps)
  * One iteration of add replica task execution
  */
 void
-exec_create_replica(CopyPartState *cps)
+exec_create_replica(CreateReplicaState *crs)
 {
-	exec_cp(cps);
-	if (cps->curstep != COPYPART_DONE)
+	exec_cp((CopyPartState *) crs);
+	if (crs->cp.curstep != COPYPART_DONE)
 		return;
 
-	if (cr_make_readonly(cps) == -1)
+	if (cr_rebuild_lr(crs) == -1)
 		return;
 
-	void_spi(cps->update_metadata_sql);
-	cps->res = TASK_SUCCESS;
-	cps->exec_res = TASK_DONE;
+	/* Also handles fdw connstring updates via trigger */
+	void_spi(crs->cp.update_metadata_sql);
+	shmn_elog(LOG, "Creating replica %s on node %d successfully done",
+			  crs->cp.part_name, crs->cp.dst_node);
+	crs->cp.res = TASK_SUCCESS;
+	crs->cp.exec_res = TASK_DONE;
 }
 
 /*
- * Make newly created replica as read-only for all but LR apply workers
+ * Reconfigure LR channels for freshly created replica.
+ *
+ * Old tail part is still read-only when this called. On old tail, we need to
+ * create proper repslot & pub, on new tail we need to create sub. It is
+ * impossible to rename logical repslot, so we are dropping one used for copy
+ * and create new one.  As for sub, we could just rename one used for
+ * partition copy, but we will not do that, because
+ * - It is not easier than creating a new one: we have to rename sub, alter
+ *   sub's slot_name, alter sub's publication, probably update sub application
+ *   name, probably run REFRESH (which requires alive pub just as CREATE
+ *   SUBSCRIPTION) and hope that everything will be ok. Not sure about
+ *   refreshing, though -- I don't know is it ok not doing it if tables didn't
+ *   change. Doc says it should be executed.
+ * - Since it is not possible to rename repslot and and it is not possible to
+ *   specify since which lsn start replication, tables must be synced anyway
+ *   during these operations, so what the point of reusing old sub? And
+ *   copypart in really cared that tables are synced at this moment and src is
+ *   read-only.
+ *
+ * Work to do in general is described below. We execute them in steps written
+ * in parentheses so that every time we create sub, pub is already exist and
+ * every time we drop pub, sub is already dropped.
+ * On old tail node, i.e. src:
+ * - Drop repslot & pub used for copy (create_data_pub)
+ * - Create repslot & pub for new data channel (create_data_pub)
+ * - Make it synchronous; make table writable. (create_data_pub)
+ * On new tail node, i.e. dst:
+ * - Make table read-only for all but apply workers (drop_cp_sub)
+ * - Drop sub used for copy (drop_cp_sub)
+ * - Create sub for new data channel. (create_data_sub)
  */
 int
-cr_make_readonly(CopyPartState *cps)
+cr_rebuild_lr(CreateReplicaState *crs)
 {
-
 	PGresult *res;
 
-	if (ensure_pqconn(cps, ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn((CopyPartState *) crs,
+					  ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
-	res = PQexec(cps->dst_conn, cps->make_readonly_replica_sql);
+	res = PQexec(crs->cp.dst_conn, crs->rebuild_lr_drop_cp_sub_sql);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		shmn_elog(NOTICE, "Failed to make new replica read-only: %s",
-				  PQerrorMessage(cps->dst_conn));
-		reset_pqconn_and_res(&cps->dst_conn, res);
-		configure_retry(cps, shardman_cmd_retry_naptime);
+		shmn_elog(NOTICE, "Creating replica %s: failed to configure LR, step 1: %s",
+				  crs->cp.part_name, PQerrorMessage(crs->cp.dst_conn));
+		reset_pqconn_and_res(&crs->cp.dst_conn, res);
+		configure_retry((CopyPartState *) crs, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	PQclear(res);
-	shmn_elog(DEBUG1, "cr %s: new replica made read-only", cps->part_name);
+	shmn_elog(DEBUG1, "cr %s: drop_cp_sub done", crs->cp.part_name);
+
+	res = PQexec(crs->cp.src_conn, crs->rebuild_lr_create_data_pub);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(NOTICE, "Creating replica %s: failed to configure LR, step 2: %s",
+				  crs->cp.part_name, PQerrorMessage(crs->cp.src_conn));
+		reset_pqconn_and_res(&crs->cp.src_conn, res);
+		configure_retry((CopyPartState *) crs, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	PQclear(res);
+	shmn_elog(DEBUG1, "cr %s: create_data_pub done", crs->cp.part_name);
+
+	res = PQexec(crs->cp.dst_conn, crs->rebuild_lr_create_data_sub);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(NOTICE, "Creating replica %s: failed to configure LR, step 3: %s",
+				  crs->cp.part_name, PQerrorMessage(crs->cp.dst_conn));
+		reset_pqconn_and_res(&crs->cp.dst_conn, res);
+		configure_retry((CopyPartState *) crs, shardman_cmd_retry_naptime);
+		return -1;
+	}
+	PQclear(res);
+	shmn_elog(DEBUG1, "cr %s: create_data_sub done", crs->cp.part_name);
 
 	return 0;
 }

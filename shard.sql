@@ -83,7 +83,7 @@ CREATE TABLE partitions (
 );
 
 ------------------------------------------------------------
--- Metadata triggers
+-- Metadata triggers and funcs called from libpq updating metadata & LR channels
 ------------------------------------------------------------
 
 -- On adding new primary, create proper foreign server & foreign table and
@@ -140,67 +140,73 @@ CREATE TRIGGER primary_moved AFTER UPDATE ON shardman.partitions
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER primary_moved;
 
--- Update metadata according to new replica creation.
--- Old tail part is still read-only when this called. There are two main jobs
--- to do: set up LR sync channel between old tail and new replica and update fdw
--- everywhere. For the former we could configure already existing channel used
--- for partition copy, but we will not do that, because
--- * It is not easier than creating new pub & sub: we have to rename pub, drop
---   and create repslot (there is no way to rename it), rename sub, alter sub's
---   slot_name, alter sub's publication, probably rename sub application name,
---   probably run REFRESH (which requires alive pub just as CREATE SUBSCRIPTION)
---   and hope that everything will be ok. Not sure about refreshing, though -- I
---   don't know is it ok not doing it if tables didn't change. Doc says it
---   should be executed.
--- * Since it is not possible to rename repslot and and it is not possible to
---   specify since which lsn start replication, tables must be synced anyway
---   during these operations, so what the point of reusing old sub? And copypart
---   in shard.c really cares that tables are synced at this moment and src is
---   read-only.
-CREATE FUNCTION replica_created() RETURNS TRIGGER AS $$
+-- Executed on newtail node, see cr_rebuild_lr
+CREATE FUNCTION replica_created_rebuild_drop_cp_sub(
+	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
-	cp_logname text := shardman.get_cp_logname(NEW.part_name, NEW.prv, NEW.owner);
-	oldtail_pubname name := shardman.get_data_pubname(NEW.part_name, NEW.prv);
-	oldtail_connstr text := shardman.get_worker_node_connstr(NEW.prv);
-	newtail_subname name := shardman.get_data_subname(NEW.part_name, NEW.prv, NEW.owner);
-	my_id int := shardman.get_node_id();
+	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
 BEGIN
-	RAISE DEBUG '[SHARDMAN] replica_created trigger called';
-	IF my_id = NEW.prv THEN -- old tail node
-		-- Drop publication & repslot used for copy
-		PERFORM shardman.drop_repslot_and_pub(cp_logname);
-		-- Create publication & repslot for new data channel
-		PERFORM shardman.create_repslot(oldtail_pubname);
-		EXECUTE format('DROP PUBLICATION IF EXISTS %I', oldtail_pubname);
-		EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
-					   oldtail_pubname, NEW.part_name);
-		-- Make this channel sync
-		PERFORM shardman.ensure_sync_standby(newtail_subname);
-		-- Now it is safe to make old tail writable again
-		PERFORM shardman.readonly_table_off(relation);
-	ELSEIF my_id = NEW.owner THEN -- created replica, i.e. new tail node
-		-- Drop subscription used for copy
-		PERFORM shardman.eliminate_sub(cp_logname);
-		-- And create subscription for new data channel
-		-- It should never exist at this moment, but just in case...
-		PERFORM shardman.eliminate_sub(newtail_subname);
-		EXECUTE format(
-			'CREATE SUBSCRIPTION %I connection %L
-			PUBLICATION %I with (create_slot = false, slot_name = %L);',
-			newtail_subname, oldtail_connstr, oldtail_pubname, oldtail_pubname);
-		-- Now fdw connstring to this part should include only primary and myself
-		PERFORM shardman.update_fdw_server(NEW);
-	ELSE -- other nodes
-		-- just update fdw connstr to add new replica
-		PERFORM shardman.update_fdw_server(NEW);
-	END IF;
-	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
-CREATE TRIGGER replica_created AFTER INSERT ON shardman.partitions
-	FOR EACH ROW WHEN (NEW.prv IS NOT NULL) EXECUTE PROCEDURE replica_created();
+	PERFORM shardman.readonly_replica_on(part_name::regclass);
+	-- Drop subscription used for copy
+	PERFORM shardman.eliminate_sub(cp_logname);
+END $$ LANGUAGE plpgsql;
+
+-- Executed on oldtail node, see cr_rebuild_lr
+CREATE FUNCTION replica_created_rebuild_lr_create_data_pub(
+	part_name name, oldtail int, newtail int) RETURNS void AS $$
+DECLARE
+	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
+	oldtail_pubname name := shardman.get_data_pubname(part_name, oldtail);
+	newtail_subname name := shardman.get_data_subname(part_name, oldtail, newtail);
+BEGIN
+	-- Repslot for new data channel. Must be first, since we "cannot create
+	-- logical replication slot in transaction that has performed writes"
+	PERFORM shardman.create_repslot(oldtail_pubname);
+	-- Drop publication & repslot used for copy
+	PERFORM shardman.drop_repslot_and_pub(cp_logname);
+	-- Create publication for new data channel
+	EXECUTE format('DROP PUBLICATION IF EXISTS %I', oldtail_pubname);
+	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
+				   oldtail_pubname, part_name);
+	-- Make this channel sync
+	PERFORM shardman.ensure_sync_standby(newtail_subname);
+	-- Now it is safe to make old tail writable again
+	PERFORM shardman.readonly_table_off(part_name::regclass);
+END $$ LANGUAGE plpgsql;
+
+-- Executed on oldtail node, see cr_rebuild_lr
+CREATE FUNCTION replica_created_rebuild_lr_create_data_sub(
+	part_name name, oldtail int, newtail int) RETURNS void AS $$
+DECLARE
+	oldtail_pubname name := shardman.get_data_pubname(part_name, oldtail);
+	oldtail_connstr text := shardman.get_worker_node_connstr(oldtail);
+	newtail_subname name := shardman.get_data_subname(part_name, oldtail, newtail);
+BEGIN
+	-- Create subscription for new data channel
+	-- It should never exist at this moment, but just in case...
+	PERFORM shardman.eliminate_sub(newtail_subname);
+	EXECUTE format(
+		'CREATE SUBSCRIPTION %I connection %L
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
+		newtail_subname, oldtail_connstr, oldtail_pubname, oldtail_pubname);
+END $$ LANGUAGE plpgsql;
+
+-- TODO
+-- Update fdw according to new replica creation. We update it on newtail node --
+-- its connstring to this part should include only primary and newtail itself,
+-- and on all other nodes except oldtail, so they learn about new replica.
+-- CREATE FUNCTION replica_created_update_fdw() RETURNS TRIGGER AS $$
+-- BEGIN
+	-- RAISE DEBUG '[SHARDMAN] replica_created_update_fdw trigger called';
+	-- IF shardman.get_node_id() != NEW.prv THEN -- don't update on oldtail node
+		-- PERFORM shardman.update_fdw_server(NEW);
+	-- END IF;
+	-- RETURN NULL;
+-- END $$ LANGUAGE plpgsql;
+-- CREATE TRIGGER replica_created AFTER INSERT ON shardman.partitions
+	-- FOR EACH ROW WHEN (NEW.prv IS NOT NULL) EXECUTE PROCEDURE replica_created();
 -- fire trigger only on worker nodes
-ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER replica_created;
+-- ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER replica_created;
 
 -- Otherwise partitioned tables on worker nodes not will be dropped properly,
 -- see pathman's docs.
@@ -462,7 +468,6 @@ BEGIN
 		'If you see this, most probably node with primary part has failed and' ||
 		' you need to promote replica. Promotion is not yet implemented, sorry :(';
 	END IF;
-	raise warning 'NEW IS %', NEW;
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 -- And make replica writable again
