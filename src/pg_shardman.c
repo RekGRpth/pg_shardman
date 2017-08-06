@@ -792,7 +792,7 @@ get_reptail_owner(const char *part_name)
 		shmn_elog(FATAL, "Stmt failed : %s", sql);
 
 	if (SPI_processed == 0)
-		owner = -1;
+		owner = SHMN_INVALID_NODE_ID;
 	else
 	{
 		owner = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
@@ -802,6 +802,41 @@ get_reptail_owner(const char *part_name)
 
 	SPI_EPILOG;
 	return owner;
+}
+
+/*
+ * Get node on which replica next to 'node_id' node in the 'part_name' replica
+ * chain resides. SHMN_INVALID_NODE_ID is returned if such partition doesn't
+ * exist at all or there is no next replica.
+ */
+int32
+get_next_node(const char *part_name, int32 node_id)
+{
+	char *sql;
+	bool isnull;
+	int32 next;
+
+	SPI_PROLOG;
+	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
+		"select nxt from shardman.partitions where part_name = '%s'"
+		" and owner = %d;", part_name, node_id);
+
+	if (SPI_execute(sql, true, 0) < 0)
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+
+	if (SPI_processed == 0)
+		next = SHMN_INVALID_NODE_ID;
+	else
+	{
+		next = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc,
+										   1, &isnull));
+		if (isnull)
+			next = SHMN_INVALID_NODE_ID;
+	}
+
+	SPI_EPILOG;
+	return next;
 }
 
 /*

@@ -18,11 +18,11 @@ master_port=5432
 # declare -a worker_datadirs=("${HOME}/postgres/data2")
 # declare -a worker_ports=("5433")
 
-declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3")
-declare -a worker_ports=("5433" "5434")
+# declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3")
+# declare -a worker_ports=("5433" "5434")
 
-# declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3" "${HOME}/postgres/data4")
-# declare -a worker_ports=("5433" "5434" "5435")
+declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3" "${HOME}/postgres/data4")
+declare -a worker_ports=("5433" "5434" "5435")
 
 #------------------------------------------------------------
 PATH="$PATH:${pgpath}bin/"
@@ -64,5 +64,10 @@ function run_demo()
     psql -p 5433 -c "INSERT INTO pt SELECT generate_series(1, 10), random();"
     psql -c "select shardman.add_node('port=5433');"
     psql -c "select shardman.add_node('port=5434');"
+    psql -p 5433 -c "drop table if exists pt_0;" # drop replica
     psql -c "select shardman.create_hash_partitions(2, 'pt', 'id', 2);"
+
+    psql -c "select shardman.add_node('port=5435');"
+    psql -c "select shardman.move_primary('pt_0', 4);"
+    psql -c "select shardman.create_replica('pt_0', 2);"
 }

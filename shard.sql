@@ -106,6 +106,48 @@ CREATE TRIGGER new_primary AFTER INSERT ON shardman.partitions
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_primary;
 
+-- Executed on node with new primary, see mp_rebuild_lr
+CREATE FUNCTION primary_moved_create_data_pub(p_name name, src int, dst int)
+	RETURNS void AS $$
+DECLARE
+	-- Metadata is not yet updated, so taking nxt from src node
+	replica int := nxt FROM shardman.partitions
+				WHERE part_name = p_name AND owner = src;
+	new_pubname text := shardman.get_data_pubname(p_name, dst);
+	new_subname text := shardman.get_data_subname(p_name, dst, replica);
+BEGIN
+	PERFORM shardman.create_repslot(new_pubname);
+	-- Create publication for new data channel
+	EXECUTE format('DROP PUBLICATION IF EXISTS %I', new_pubname);
+	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
+				   new_pubname, p_name);
+	-- Make this channel sync
+	PERFORM shardman.ensure_sync_standby(new_subname);
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Executed on nearest replica after primary moved, see mp_rebuild_lr
+CREATE FUNCTION primary_moved_create_data_sub(p_name name, src int, dst int)
+	RETURNS void AS $$
+DECLARE
+	-- Metadata is not yet updated, so taking nxt from src node
+	replica int := nxt FROM shardman.partitions
+				WHERE part_name = p_name AND owner = src;
+	new_pubname text := shardman.get_data_pubname(p_name, dst);
+	new_subname text := shardman.get_data_subname(p_name, dst, replica);
+	cp_logname text := shardman.get_cp_logname(p_name, src, dst);
+	new_connstr text := shardman.get_worker_node_connstr(dst);
+BEGIN
+	-- Drop subscription used for copy
+	PERFORM shardman.eliminate_sub(cp_logname);
+	-- Create subscription for new data channel
+	-- It should never exist at this moment, but just in case...
+	PERFORM shardman.eliminate_sub(new_subname);
+	EXECUTE format(
+		'CREATE SUBSCRIPTION %I connection %L
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
+		new_subname, new_connstr, new_pubname, new_pubname);
+END $$ LANGUAGE plpgsql STRICT;
+
 -- Update metadata according to primary move
 CREATE FUNCTION primary_moved() RETURNS TRIGGER AS $$
 DECLARE
@@ -115,6 +157,8 @@ BEGIN
 	RAISE DEBUG '[SHARDMAN] primary_moved trigger called for part %, owner %->%',
 		NEW.part_name, OLD.owner, NEW.owner;
 	ASSERT NEW.owner != OLD.owner, 'primary_moved handles only moved parts';
+	ASSERT NEW.nxt = OLD.nxt OR (NEW.nxt IS NULL AND OLD.nxt IS NULL),
+		'both primary and replica must not be moved in one update';
 	IF my_id = OLD.owner THEN -- src node
 		-- Drop publication & repslot used for copy
 		PERFORM shardman.drop_repslot_and_pub(cp_logname);
@@ -141,7 +185,7 @@ CREATE TRIGGER primary_moved AFTER UPDATE ON shardman.partitions
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER primary_moved;
 
 -- Executed on newtail node, see cr_rebuild_lr
-CREATE FUNCTION replica_created_rebuild_drop_cp_sub(
+CREATE FUNCTION replica_created_drop_cp_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
@@ -152,7 +196,7 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 
 -- Executed on oldtail node, see cr_rebuild_lr
-CREATE FUNCTION replica_created_rebuild_lr_create_data_pub(
+CREATE FUNCTION replica_created_create_data_pub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
@@ -175,7 +219,7 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 
 -- Executed on oldtail node, see cr_rebuild_lr
-CREATE FUNCTION replica_created_rebuild_lr_create_data_sub(
+CREATE FUNCTION replica_created_create_data_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
 	oldtail_pubname name := shardman.get_data_pubname(part_name, oldtail);
