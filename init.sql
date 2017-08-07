@@ -24,7 +24,7 @@ $$;
 
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_primary', 'create_replica');
+						 'move_part', 'create_replica');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
 								'success');
@@ -96,16 +96,19 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Move master partition to another node. Params:
+-- Move primary or replica partition to another node. Params:
 -- 'part_name' is name of the partition to move
 -- 'dest' is id of the destination node
-CREATE FUNCTION move_primary(part_name text, dest int) RETURNS int AS $$
+-- 'src' is id of the node with partition. If NULL, primary partition is moved.
+CREATE FUNCTION move_part(part_name text, dest int, src int DEFAULT NULL)
+	RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_primary')
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_part')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, src);
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
 	RETURN c_id;
 END $$ LANGUAGE plpgsql;
@@ -118,21 +121,6 @@ DECLARE
 	c_id int;
 BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'create_replica')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
-	RETURN c_id;
-END $$ LANGUAGE plpgsql;
-
--- Move primary or replica partition to another node. Params:
--- 'part_name' is name of the partition to move
--- 'src' is id of the node with partition
--- 'dest' is id of the destination node
-CREATE FUNCTION move_part(part_name text, src int, dest int) RETURNS int AS $$
-DECLARE
-	c_id int;
-BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_primary')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);

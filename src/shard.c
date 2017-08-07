@@ -128,7 +128,6 @@
 /* Bitmask for ensure_pqconn */
 #define ENSURE_PQCONN_SRC (1 << 0)
 #define ENSURE_PQCONN_DST (1 << 1)
-#define ENSURE_PQCONN_MP_REPLICA (1 << 2)
 
 /* Type of task involving partition copy */
 typedef enum
@@ -205,16 +204,11 @@ typedef struct
 	TaskRes res; /* result of the whole move */
 } CopyPartState;
 
-/* State of move primary task */
 typedef struct
 {
-	CopyPartState cp;
-	int32 rep_node; /* nearest (nxt) replica, if exists */
-	const char *rep_connstr;
-	PGconn *rep_conn; /* connection to replica */
-	char *create_data_pub_sql;
-	char *create_data_sub_sql;
-} MovePrimaryState;
+	slist_node list_node;
+	CopyPartState *cps;
+} CopyPartStateNode;
 
 /* State of create replica task */
 typedef struct
@@ -225,16 +219,26 @@ typedef struct
 	char *create_data_sub_sql;
 } CreateReplicaState;
 
+/* State of move partition task */
 typedef struct
 {
-	slist_node list_node;
-	CopyPartState *cps;
-} CopyPartStateNode;
+	CopyPartState cp;
+	int32 next_node; /* next replica, if exists */
+	const char *next_connstr;
+	PGconn *next_conn; /* connection to next replica */
+	int32 prev_node; /* previous replica, if exists */
+	const char *prev_connstr;
+	PGconn *prev_conn; /* connection to previous replica */
+	/* SQL executed to reconfigure LR channels */
+	char *prev_sql;
+	char *dst_sql;
+	char *next_sql;
+} MovePartState;
 
 static void cmd_single_task_exec_finished(Cmd *cmd, CopyPartState *cps);
 static void init_cp_state(CopyPartState *cps);
-static void init_mp_state(MovePrimaryState *mps, const char *part_name,
-						   int32 dst_node);
+static void init_mp_state(MovePartState *mps, const char *part_name,
+						  int32 src_node, int32 dst_node);
 static void init_cr_state(CreateReplicaState *cps, const char *part_name,
 						   int32 dst_node);
 static void finalize_cp_state(CopyPartState *cps);
@@ -243,16 +247,16 @@ static int calc_timeout(slist_head *timeout_states);
 static void epoll_subscribe(int epfd, CopyPartState *cps);
 static void exec_task(CopyPartState *cps);
 static void exec_cp(CopyPartState *cps);
-static void exec_move_primary(MovePrimaryState *cps);
+static void exec_move_part(MovePartState *cps);
 static void exec_create_replica(CreateReplicaState *cps);
-static int mp_rebuild_lr(MovePrimaryState *cps);
+static int mp_rebuild_lr(MovePartState *cps);
 static int cr_rebuild_lr(CreateReplicaState *cps);
 static void exec_move_replica(CopyPartState *cps);
 static int cp_start_tablesync(CopyPartState *cpts);
 static int cp_start_finalsync(CopyPartState *cpts);
 static int cp_finalize(CopyPartState *cpts);
-static int ensure_pqconn(CopyPartState *cpts, int nodes);
-static int ensure_pqconn_intern(PGconn **conn, const char *connstr,
+static int ensure_pqconn_cp(CopyPartState *cpts, int nodes);
+static int ensure_pqconn(PGconn **conn, const char *connstr,
 								CopyPartState *cps);
 static void reset_pqconn(PGconn **conn);
 static void reset_pqconn_and_res(PGconn **conn, PGresult *res);
@@ -395,67 +399,106 @@ cmd_single_task_exec_finished(Cmd *cmd, CopyPartState *cps)
 }
 
 /*
- * Move primary partition.
+ * Move partition.
  */
 void
-move_primary(Cmd *cmd)
+move_part(Cmd *cmd)
 {
 	char *part_name = cmd->opts[0];
-	int32 dst_node = atoi(cmd->opts[1]);
-
+	char *src_node_str = cmd->opts[1];
+	int32 src_node = src_node_str != NULL ? atoi(src_node_str) :
+		SHMN_INVALID_NODE_ID;
+	int32 dst_node = atoi(cmd->opts[2]);
 	CopyPartState **tasks = palloc(sizeof(CopyPartState*));
-	MovePrimaryState *mps = palloc0(sizeof(MovePrimaryState));
-	tasks[0] = (CopyPartState *) mps;
-	init_mp_state(mps, part_name, dst_node);
+	MovePartState *mps = palloc0(sizeof(MovePartState));
+	init_mp_state(mps, part_name, src_node, dst_node);
 
+	tasks[0] = (CopyPartState *) mps;
 	exec_tasks(tasks, 1);
 	cmd_single_task_exec_finished(cmd, (CopyPartState *) mps);
 }
 
 /*
- * Fill CopyPartState for moving primary partition
+ * Fill MovePartState for moving partition. If src_node is
+ * SHMN_INVALID_NODE_ID, assume primary partition must be moved.
  */
 void
-init_mp_state(MovePrimaryState *mps, const char *part_name, int32 dst_node)
+init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
+			  int32 dst_node)
 {
 	/* Set up fields neccesary to call init_cp_state */
 	mps->cp.part_name = part_name;
-	mps->cp.dst_node = dst_node;
-	if ((mps->cp.src_node = get_primary_owner(part_name)) == -1)
+	if (src_node == SHMN_INVALID_NODE_ID)
 	{
-		shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
-				  part_name);
-		mps->cp.res = TASK_FAILED;
-		return;
+		if ((mps->cp.src_node = get_primary_owner(part_name)) ==
+			SHMN_INVALID_NODE_ID)
+		{
+			shmn_elog(WARNING, "Partition %s doesn't exist, not moving it",
+					  part_name);
+			mps->cp.res = TASK_FAILED;
+			return;
+		}
+		mps->cp.type = COPYPARTTASK_MOVE_PRIMARY;
 	}
-	mps->cp.type = COPYPARTTASK_MOVE_PRIMARY;
+	else
+	{
+		bool part_exists;
+		/*
+		 * Make sure that part exists on the node and get prev at the same
+		 * time to see whether it is a primary or no.
+		 */
+		mps->prev_node = get_prev_node(part_name, src_node, &part_exists);
+		if (!part_exists)
+		{
+			shmn_elog(WARNING, "There is no partition %s on node %d, not moving it",
+					  part_name, src_node);
+			mps->cp.res = TASK_FAILED;
+			return;
+		}
+		mps->cp.src_node = src_node;
+		if (mps->prev_node == SHMN_INVALID_NODE_ID)
+			mps->cp.type = COPYPARTTASK_MOVE_PRIMARY;
+		else
+		{
+			mps->cp.type = COPYPARTTASK_MOVE_REPLICA;
+			mps->prev_connstr = get_worker_node_connstr(mps->prev_node);
+		}
+	}
+	mps->cp.dst_node = dst_node;
+
 
 	/* Fields common among copy part tasks */
 	init_cp_state((CopyPartState *) mps);
 
-	mps->cp.update_metadata_sql = psprintf(
-		"update shardman.partitions set owner = %d where part_name = '%s'"
-		" and prv IS NULL;"
-		" update shardman.partitions set prv = %d where part_name = '%s'"
-		" and prv = %d",
-		dst_node, part_name,
-		dst_node, part_name, mps->cp.src_node);
-
-	if ((mps->rep_node = get_next_node(mps->cp.part_name, mps->cp.src_node))
+	if ((mps->next_node = get_next_node(mps->cp.part_name, mps->cp.src_node))
 		!= SHMN_INVALID_NODE_ID)
 	{
 		/*
-		 * This primary has replica, so after moving primary we have to
-		 * reconfigure LR channel to it.
+		 * This part has replica, so after moving part we have to
+		 * reconfigure LR channel properly.
 		 */
-		mps->rep_connstr = get_worker_node_connstr(mps->rep_node);
+		mps->next_connstr = get_worker_node_connstr(mps->next_node);
 	}
 
-	mps->create_data_pub_sql = psprintf(
-		"select shardman.primary_moved_create_data_pub('%s', %d, %d);",
+	mps->cp.update_metadata_sql = psprintf(
+		"update shardman.partitions set owner = %d where part_name = '%s'"
+		" and owner = %d;"
+		" update shardman.partitions set nxt = %d where part_name = '%s'"
+		" and nxt = %d;" /* prev replica */
+		" update shardman.partitions set prv = %d where part_name = '%s'"
+		" and prv = %d;", /* next replica */
+		mps->cp.dst_node, part_name, mps->cp.src_node,
+		mps->cp.dst_node, part_name, mps->cp.src_node,
+		mps->cp.dst_node, part_name, mps->cp.src_node);
+
+	mps->prev_sql = psprintf(
+		"select shardman.part_moved_prev('%s', %d, %d);",
 		part_name, mps->cp.src_node, mps->cp.dst_node);
-	mps->create_data_sub_sql = psprintf(
-		"select shardman.primary_moved_create_data_sub('%s', %d, %d);",
+	mps->dst_sql = psprintf(
+		"select shardman.part_moved_dst('%s', %d, %d);",
+		part_name, mps->cp.src_node, mps->cp.dst_node);
+	mps->next_sql = psprintf(
+		"select shardman.part_moved_next('%s', %d, %d);",
 		part_name, mps->cp.src_node, mps->cp.dst_node);
 }
 
@@ -538,7 +581,8 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 /*
  * Fill CopyPartState, retrieving needed data. If something goes wrong, we
  * don't bother to fill the rest of fields and mark task as failed.
- * src_node, dst_node and part_name must be already set when called.
+ * src_node, dst_node and part_name must be already set when called. src_node
+ * and dst_node must exits.
  */
 void
 init_cp_state(CopyPartState *cps)
@@ -551,17 +595,10 @@ init_cp_state(CopyPartState *cps)
 	cps->fd_to_epoll = -1;
 	cps->fd_in_epoll_set = -1;
 
-	/* src_connstr is surely not NULL since src_node is referenced by
-	   part_name */
 	cps->src_connstr = get_worker_node_connstr(cps->src_node);
+	Assert(cps->src_connstr != NULL);
 	cps->dst_connstr = get_worker_node_connstr(cps->dst_node);
-	if (cps->dst_connstr == NULL)
-	{
-		shmn_elog(WARNING, "Node %d doesn't exist, not copying %s to it",
-				  cps->dst_node, cps->part_name);
-		cps->res = TASK_FAILED;
-		return;
-	}
+	Assert(cps->dst_connstr != NULL);
 
 	/* constant strings */
 	cps->logname = psprintf("shardman_copy_%s_%d_%d",
@@ -824,16 +861,13 @@ exec_task(CopyPartState *cps)
 {
 	switch (cps->type)
 	{
-		case COPYPARTTASK_MOVE_PRIMARY:
-			exec_move_primary((MovePrimaryState *) cps);
-			break;
-
 		case COPYPARTTASK_CREATE_REPLICA:
 			exec_create_replica((CreateReplicaState *) cps);
 			break;
 
+		case COPYPARTTASK_MOVE_PRIMARY:
 		case COPYPARTTASK_MOVE_REPLICA:
-			exec_move_replica(cps);
+			exec_move_part((MovePartState *) cps);
 			break;
 	}
 }
@@ -842,62 +876,85 @@ exec_task(CopyPartState *cps)
  * One iteration of move primary task execution
  */
 void
-exec_move_primary(MovePrimaryState *mps)
+exec_move_part(MovePartState *mps)
 {
 	exec_cp((CopyPartState *) mps);
 	if (mps->cp.curstep != COPYPART_DONE)
 		return;
 
-	if ((mps->rep_node != SHMN_INVALID_NODE_ID) && (mp_rebuild_lr(mps) == -1))
+	if (((mps->next_node != SHMN_INVALID_NODE_ID) ||
+		 mps->prev_node != SHMN_INVALID_NODE_ID) && (mp_rebuild_lr(mps) == -1))
 		return;
 
 	void_spi(mps->cp.update_metadata_sql);
-	shmn_elog(LOG, "Primary move %s: %d -> %d successfully done",
+	shmn_elog(LOG, "Part move %s: %d -> %d successfully done",
 			  mps->cp.part_name, mps->cp.src_node, mps->cp.dst_node);
 	mps->cp.res = TASK_SUCCESS;
 	mps->cp.exec_res = TASK_DONE;
 }
 
 /*
- * Reconfigure LR primary-replica channel for moved primary.
+ * Reconfigure LR channel for moved primary: prev to moved, moved to next or
+ * both, if they exist.
  *
- * We need to 1) create repslot & pub on node with moved primary, set up sync
- * rep 2) create sub on replica.
+ * We execute code on nodes in the following order: prev, dst, next, so that
+ * every time we create sub, pub already exists.
  */
 int
-mp_rebuild_lr(MovePrimaryState *mps)
+mp_rebuild_lr(MovePartState *mps)
 {
 	PGresult *res;
-	/* must be called only when replica exists */
-	Assert(mps->rep_node != SHMN_INVALID_NODE_ID);
 
-	if (ensure_pqconn((CopyPartState *) mps,
-					  ENSURE_PQCONN_DST | ENSURE_PQCONN_MP_REPLICA) == -1)
+	if (mps->prev_node != SHMN_INVALID_NODE_ID)
+	{
+		if (ensure_pqconn(&mps->prev_conn, mps->prev_connstr,
+					   (CopyPartState *) mps) == -1)
+			return -1;
+		res = PQexec(mps->prev_conn, mps->prev_sql);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			shmn_elog(NOTICE, "Moving part %s: failed to configure LR on prev replica: %s",
+					  mps->cp.part_name, PQerrorMessage(mps->prev_conn));
+			reset_pqconn_and_res(&mps->prev_conn, res);
+			configure_retry((CopyPartState *) mps, shardman_cmd_retry_naptime);
+			return -1;
+		}
+		PQclear(res);
+		shmn_elog(DEBUG1, "mp %s: LR conf on prev done", mps->cp.part_name);
+	}
+
+	if (ensure_pqconn_cp((CopyPartState *) mps,
+						 ENSURE_PQCONN_DST) == -1)
 		return -1;
-
-	res = PQexec(mps->cp.dst_conn, mps->create_data_pub_sql);
+	res = PQexec(mps->cp.dst_conn, mps->dst_sql);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		shmn_elog(NOTICE, "Moving primary %s: failed to configure LR, step 1: %s",
+		shmn_elog(NOTICE, "Moving part %s: failed to configure LR on dst : %s",
 				  mps->cp.part_name, PQerrorMessage(mps->cp.dst_conn));
 		reset_pqconn_and_res(&mps->cp.dst_conn, res);
 		configure_retry((CopyPartState *) mps, shardman_cmd_retry_naptime);
 		return -1;
 	}
 	PQclear(res);
-	shmn_elog(DEBUG1, "mp %s: create_data_pub done", mps->cp.part_name);
+	shmn_elog(DEBUG1, "mp %s: LR conf on dst done", mps->cp.part_name);
 
-	res = PQexec(mps->rep_conn, mps->create_data_sub_sql);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	if (mps->next_node != SHMN_INVALID_NODE_ID)
 	{
-		shmn_elog(NOTICE, "Moving primary %s: failed to configure LR, step 2: %s",
-				  mps->cp.part_name, PQerrorMessage(mps->rep_conn));
-		reset_pqconn_and_res(&mps->rep_conn, res);
-		configure_retry((CopyPartState *) mps, shardman_cmd_retry_naptime);
-		return -1;
+		if (ensure_pqconn(&mps->next_conn, mps->next_connstr,
+						  (CopyPartState *) mps) == -1)
+			return -1;
+		res = PQexec(mps->next_conn, mps->next_sql);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			shmn_elog(NOTICE, "Moving part %s: failed to configure LR on next replica: %s",
+					  mps->cp.part_name, PQerrorMessage(mps->next_conn));
+			reset_pqconn_and_res(&mps->next_conn, res);
+			configure_retry((CopyPartState *) mps, shardman_cmd_retry_naptime);
+			return -1;
+		}
+		PQclear(res);
+		shmn_elog(DEBUG1, "mp %s: LR conf on next done", mps->cp.part_name);
 	}
-	PQclear(res);
-	shmn_elog(DEBUG1, "mp %s: create_data_sub done", mps->cp.part_name);
 
 	return 0;
 }
@@ -960,8 +1017,8 @@ cr_rebuild_lr(CreateReplicaState *crs)
 {
 	PGresult *res;
 
-	if (ensure_pqconn((CopyPartState *) crs,
-					  ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn_cp((CopyPartState *) crs,
+						 ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
 	res = PQexec(crs->cp.dst_conn, crs->drop_cp_sub_sql);
@@ -1046,7 +1103,7 @@ cp_start_tablesync(CopyPartState *cps)
 {
 	PGresult *res;
 
-	if (ensure_pqconn(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn_cp(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
 	res = PQexec(cps->dst_conn, cps->dst_drop_sub_sql);
@@ -1105,7 +1162,7 @@ cp_start_finalsync(CopyPartState *cps)
 	char substate;
 	char *sync_point;
 
-	if (ensure_pqconn(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn_cp(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
 	res = PQexec(cps->dst_conn, cps->substate_sql);
@@ -1183,7 +1240,7 @@ cp_finalize(CopyPartState *cps)
 	XLogRecPtr received_lsn;
 	char *received_lsn_str;
 
-	if (ensure_pqconn(cps, ENSURE_PQCONN_DST) == -1)
+	if (ensure_pqconn_cp(cps, ENSURE_PQCONN_DST) == -1)
 		return -1;
 
 	res = PQexec(cps->dst_conn, cps->received_lsn_sql);
@@ -1218,35 +1275,30 @@ cp_finalize(CopyPartState *cps)
 }
 
 /*
- * Ensure that pq connection to required nodes is CONNECTION_OK. nodes is a
- * bitmask specifying with which nodes connection must be ensured. -1 is
- * returned if we have failed to establish connection; cps is then configured
- * to sleep retry time. 0 is returned if ok.
+ * Ensure that pq connection to is CONNECTION_OK. nodes is a bitmask
+ * specifying with which nodes connection must be ensured, src, dst or
+ * bouth. -1 is returned if we have failed to establish connection; cps is
+ * then configured to sleep retry time. 0 is returned if ok.
  */
 int
-ensure_pqconn(CopyPartState *cps, int nodes)
+ensure_pqconn_cp(CopyPartState *cps, int nodes)
 {
 	if ((nodes & ENSURE_PQCONN_SRC) &&
-		(ensure_pqconn_intern(&cps->src_conn, cps->src_connstr, cps) == -1))
+		(ensure_pqconn(&cps->src_conn, cps->src_connstr, cps) == -1))
 		return -1;
 	if ((nodes & ENSURE_PQCONN_DST) &&
-		(ensure_pqconn_intern(&cps->dst_conn, cps->dst_connstr, cps) == -1))
+		(ensure_pqconn(&cps->dst_conn, cps->dst_connstr, cps) == -1))
 		return -1;
-	if (nodes & ENSURE_PQCONN_MP_REPLICA)
-	{
-		MovePrimaryState *mps = (MovePrimaryState *) cps;
-		if (ensure_pqconn_intern(&mps->rep_conn, mps->rep_connstr, cps) == -1)
-			return -1;
-	}
 	return 0;
 }
 
 /*
- * Working horse of ensure_pqconn
+ * Make sure that given conn is CONNECTION_OK, reconnect if not, and configure
+ * cps to sleep if we can't.
  */
 int
-ensure_pqconn_intern(PGconn **conn, const char *connstr,
-					   CopyPartState *cps)
+ensure_pqconn(PGconn **conn, const char *connstr,
+			  CopyPartState *cps)
 {
 	if (*conn != NULL &&
 		PQstatus(*conn) != CONNECTION_OK)

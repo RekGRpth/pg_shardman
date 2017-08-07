@@ -49,6 +49,7 @@ extern char *get_worker_node_connstr(int32 node_id);
 extern int32 get_primary_owner(const char *part_name);
 extern int32 get_reptail_owner(const char *part_name);
 extern int32 get_next_node(const char *part_name, int32 node_id);
+extern int32 get_prev_node(const char *part_name, int32 node_id, bool *part_exists);
 extern char *get_partition_relation(const char *part_name);
 
 #endif							/* PG_SHARDMAN_H */

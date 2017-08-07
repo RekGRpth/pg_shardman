@@ -201,8 +201,8 @@ shardmaster_main(Datum main_arg)
 				rm_node(cmd);
 			else if (strcmp(cmd->cmd_type, "create_hash_partitions") == 0)
 				create_hash_partitions(cmd);
-			else if (strcmp(cmd->cmd_type, "move_primary") == 0)
-				move_primary(cmd);
+			else if (strcmp(cmd->cmd_type, "move_part") == 0)
+				move_part(cmd);
 			else if (strcmp(cmd->cmd_type, "create_replica") == 0)
 				create_replica(cmd);
 			else
@@ -741,8 +741,8 @@ get_worker_node_connstr(int32 node_id)
 }
 
 /*
- * Get node id on which given primary is stored. -1 is returned if there is
- * no such primary.
+ * Get node id on which given primary is stored. SHMN_INVALID_NODE_ID is
+ * returned if there is no such primary.
  */
 int32
 get_primary_owner(const char *part_name)
@@ -760,7 +760,7 @@ get_primary_owner(const char *part_name)
 		shmn_elog(FATAL, "Stmt failed : %s", sql);
 
 	if (SPI_processed == 0)
-		owner = -1;
+		owner = SHMN_INVALID_NODE_ID;
 	else
 	{
 		owner =	DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
@@ -774,7 +774,8 @@ get_primary_owner(const char *part_name)
 
 /*
  * Get node id on which the last replica in the 'part_name' replica chain
- * resides. -1 is returned if such partition doesn't exist at all.
+ * resides. SHMN_INVALID_NODE_ID is returned if such partition doesn't exist
+ * at all.
  */
 int32
 get_reptail_owner(const char *part_name)
@@ -837,6 +838,46 @@ get_next_node(const char *part_name, int32 node_id)
 
 	SPI_EPILOG;
 	return next;
+}
+
+/*
+ * Get node on which replica prev to 'node_id' node in the 'part_name' replica
+ * chain resides. SHMN_INVALID_NODE_ID is returned if such partition doesn't
+ * exist at all on that node or there is no next replica. part_exists is set
+ * to false in the former case.
+ */
+int32
+get_prev_node(const char *part_name, int32 node_id, bool *part_exists)
+{
+	char *sql;
+	bool isnull;
+	int32 prev;
+	*part_exists = true;
+
+	SPI_PROLOG;
+	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
+		"select prev from shardman.partitions where part_name = '%s'"
+		" and owner = %d;", part_name, node_id);
+
+	if (SPI_execute(sql, true, 0) < 0)
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+
+	if (SPI_processed == 0)
+	{
+		prev = SHMN_INVALID_NODE_ID;
+		*part_exists = false;
+	}
+	else
+	{
+		prev = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc,
+										   1, &isnull));
+		if (isnull)
+			prev = SHMN_INVALID_NODE_ID;
+	}
+
+	SPI_EPILOG;
+	return prev;
 }
 
 /*

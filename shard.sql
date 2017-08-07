@@ -106,83 +106,142 @@ CREATE TRIGGER new_primary AFTER INSERT ON shardman.partitions
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_primary;
 
--- Executed on node with new primary, see mp_rebuild_lr
-CREATE FUNCTION primary_moved_create_data_pub(p_name name, src int, dst int)
+-- Executed on prev replica after partition move, see mp_rebuild_lr
+CREATE FUNCTION part_moved_prev(p_name name, src int, dst int)
 	RETURNS void AS $$
 DECLARE
-	-- Metadata is not yet updated, so taking nxt from src node
-	replica int := nxt FROM shardman.partitions
-				WHERE part_name = p_name AND owner = src;
-	new_pubname text := shardman.get_data_pubname(p_name, dst);
-	new_subname text := shardman.get_data_subname(p_name, dst, replica);
+	me int := shardman.get_node_id();
+	lname text := shardman.get_data_lname(p_name, me, dst);
 BEGIN
-	PERFORM shardman.create_repslot(new_pubname);
-	-- Create publication for new data channel
-	EXECUTE format('DROP PUBLICATION IF EXISTS %I', new_pubname);
-	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
-				   new_pubname, p_name);
-	-- Make this channel sync
-	PERFORM shardman.ensure_sync_standby(new_subname);
+	PERFORM shardman.create_repslot(lname);
+	-- Create publication for new data channel prev replica -> dst, make it sync
+	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
+	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, p_name);
+	PERFORM shardman.ensure_sync_standby(lname);
 END $$ LANGUAGE plpgsql STRICT;
 
--- Executed on nearest replica after primary moved, see mp_rebuild_lr
-CREATE FUNCTION primary_moved_create_data_sub(p_name name, src int, dst int)
+-- Executed on node with new part, see mp_rebuild_lr
+CREATE FUNCTION part_moved_dst(p_name name, src int, dst int)
 	RETURNS void AS $$
 DECLARE
-	-- Metadata is not yet updated, so taking nxt from src node
-	replica int := nxt FROM shardman.partitions
-				WHERE part_name = p_name AND owner = src;
-	new_pubname text := shardman.get_data_pubname(p_name, dst);
-	new_subname text := shardman.get_data_subname(p_name, dst, replica);
-	cp_logname text := shardman.get_cp_logname(p_name, src, dst);
-	new_connstr text := shardman.get_worker_node_connstr(dst);
+	next_rep int := nxt FROM shardman.partitions WHERE part_name = p_name
+				 AND owner = src;
+	prev_rep int := prv FROM shardman.partitions WHERE part_name = p_name
+				 AND owner = src;
+	next_lname text;
+	prev_lname text;
+	prev_connstr text;
 BEGIN
-	-- Drop subscription used for copy
-	PERFORM shardman.eliminate_sub(cp_logname);
-	-- Create subscription for new data channel
+	ASSERT dst = shardman.get_node_id(), 'part_moved_dst must be called on dst';
+	IF next_rep IS NOT NULL THEN -- we need to setup channel dst -> next replica
+		next_lname := shardman.get_data_lname(p_name, dst, next_rep);
+		-- This must be first write in the transaction!
+		PERFORM shardman.create_repslot(next_lname);
+		EXECUTE format('DROP PUBLICATION IF EXISTS %I', next_lname);
+		EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
+					   next_lname, p_name);
+		-- Make this channel sync
+		PERFORM shardman.ensure_sync_standby(next_lname);
+	END IF;
+
+	IF prev_rep IS NOT NULL THEN -- we need to setup channel prev replica -> dst
+		prev_lname := shardman.get_data_lname(p_name, prev_rep, dst);
+		prev_connstr := shardman.get_worker_node_connstr(prev_rep);
+		PERFORM shardman.eliminate_sub(prev_lname);
+		EXECUTE format(
+			'CREATE SUBSCRIPTION %I connection %L
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
+		prev_lname, prev_connstr, prev_lname, prev_lname);
+	END IF;
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Executed on next replica after partition move, see mp_rebuild_lr
+CREATE FUNCTION part_moved_next(p_name name, src int, dst int)
+	RETURNS void AS $$
+DECLARE
+	me int := shardman.get_node_id();
+	lname text := shardman.get_data_lname(p_name, dst, me);
+	dst_connstr text := shardman.get_worker_node_connstr(dst);
+BEGIN
+	-- Create subscription for new data channel dst -> next replica
 	-- It should never exist at this moment, but just in case...
-	PERFORM shardman.eliminate_sub(new_subname);
+	PERFORM shardman.eliminate_sub(lname);
 	EXECUTE format(
 		'CREATE SUBSCRIPTION %I connection %L
 		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
-		new_subname, new_connstr, new_pubname, new_pubname);
+		lname, dst_connstr, lname, lname);
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Update metadata according to primary move
-CREATE FUNCTION primary_moved() RETURNS TRIGGER AS $$
+CREATE FUNCTION part_moved() RETURNS TRIGGER AS $$
 DECLARE
-	cp_logname text := shardman.get_cp_logname(OLD.part_name, OLD.owner, NEW.owner);
-	my_id int := shardman.get_node_id();
+	cp_logname text := shardman.get_cp_logname(NEW.part_name, OLD.owner, NEW.owner);
+	me int := shardman.get_node_id();
+	prev_src_lname text;
+	src_next_lname text;
 BEGIN
-	RAISE DEBUG '[SHARDMAN] primary_moved trigger called for part %, owner %->%',
+	ASSERT NEW.owner != OLD.owner, 'part_moved handles only moved parts';
+	RAISE DEBUG '[SHARDMAN] part_moved trigger called for part %, owner % -> %',
 		NEW.part_name, OLD.owner, NEW.owner;
-	ASSERT NEW.owner != OLD.owner, 'primary_moved handles only moved parts';
 	ASSERT NEW.nxt = OLD.nxt OR (NEW.nxt IS NULL AND OLD.nxt IS NULL),
-		'both primary and replica must not be moved in one update';
-	IF my_id = OLD.owner THEN -- src node
+		'both part and replica must not be moved in one update';
+	ASSERT NEW.prv = OLD.prv OR (NEW.prv IS NULL AND OLD.prv IS NULL),
+		'both part and replica must not be moved in one update';
+	IF NEW.prv IS NOT NULL THEN
+		prev_src_lname := shardman.get_data_lname(NEW.part_name, NEW.prv, OLD.owner);
+	END IF;
+	IF NEW.nxt IS NOT NULL THEN
+		src_next_lname := shardman.get_data_lname(NEW.part_name, OLD.owner, NEW.nxt);
+	END IF;
+
+	IF me = OLD.owner THEN -- src node
 		-- Drop publication & repslot used for copy
 		PERFORM shardman.drop_repslot_and_pub(cp_logname);
-		-- On src node, replace its partition with foreign one
-		PERFORM shardman.replace_usual_part_with_foreign(NEW);
-	ELSEIF my_id = NEW.owner THEN -- dst node
+		-- If primary part was moved, replace on src node its partition with
+		-- foreign one
+		IF NEW.prv IS NULL THEN
+			PERFORM shardman.replace_usual_part_with_foreign(NEW);
+		ELSE
+			-- On the other hand, if prev replica existed, drop sub for old
+			-- channel prev -> src
+			PERFORM shardman.eliminate_sub(src_next_lname);
+		END IF;
+		IF NEW.nxt IS NOT NULL THEN
+			-- If next replica existed, drop pub for old channel src -> next
+			PERFORM shardman.drop_repslot_and_pub(src_next_lname);
+			PERFORM shardman.remove_sync_standby(src_next_lname);
+		END IF;
+		-- Drop old table anyway;
+		EXECUTE format('DROP TABLE IF EXISTS %I', NEW.part_name);
+
+	ELSEIF me = NEW.owner THEN -- dst node
 		-- Drop subscription used for copy
 		PERFORM shardman.eliminate_sub(cp_logname);
-		-- And replace moved table with foreign one
-		PERFORM shardman.replace_foreign_part_with_usual(NEW);
-	ELSE -- other nodes
-		-- just update foreign server
-		PERFORM shardman.update_fdw_server(NEW);
+		-- If primary part was moved, replace moved table with foreign one
+		IF NEW.prev IS NULL THEN
+			PERFORM shardman.replace_foreign_part_with_usual(NEW);
+		END IF;
+	ELSEIF me = NEW.prv THEN -- node with prev replica
+		-- Drop pub for old channel prev -> src
+		PERFORM shardman.drop_repslot_and_pub(prev_src_lname);
+		PERFORM shardman.remove_sync_standby(prev_src_lname);
+	ELSEIF me = NEW.nxt THEN -- node with next replica
+		-- Drop sub for old channel src -> next
+		PERFORM shardman.eliminate_sub(src_next_lname);
 	END IF;
+
+	-- And update fdw almost everywhere
+	PERFORM shardman.update_fdw_server(NEW);
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
-CREATE TRIGGER primary_moved AFTER UPDATE ON shardman.partitions
+CREATE TRIGGER part_moved AFTER UPDATE ON shardman.partitions
 	FOR EACH ROW WHEN (OLD.prv is NULL AND NEW.prv IS NULL -- it is primary
 					   AND OLD.owner != NEW.owner -- and it is really moved
 					   AND OLD.part_name = NEW.part_name) -- sanity check
-	EXECUTE PROCEDURE primary_moved();
+	EXECUTE PROCEDURE part_moved();
 -- fire trigger only on worker nodes
-ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER primary_moved;
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER part_moved;
 
 -- Executed on newtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_drop_cp_sub(
@@ -190,7 +249,6 @@ CREATE FUNCTION replica_created_drop_cp_sub(
 DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
 BEGIN
-	PERFORM shardman.readonly_replica_on(part_name::regclass);
 	-- Drop subscription used for copy
 	PERFORM shardman.eliminate_sub(cp_logname);
 END $$ LANGUAGE plpgsql;
@@ -200,39 +258,37 @@ CREATE FUNCTION replica_created_create_data_pub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
-	oldtail_pubname name := shardman.get_data_pubname(part_name, oldtail);
-	newtail_subname name := shardman.get_data_subname(part_name, oldtail, newtail);
+	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
 BEGIN
 	-- Repslot for new data channel. Must be first, since we "cannot create
 	-- logical replication slot in transaction that has performed writes"
-	PERFORM shardman.create_repslot(oldtail_pubname);
+	PERFORM shardman.create_repslot(lname);
 	-- Drop publication & repslot used for copy
 	PERFORM shardman.drop_repslot_and_pub(cp_logname);
 	-- Create publication for new data channel
-	EXECUTE format('DROP PUBLICATION IF EXISTS %I', oldtail_pubname);
-	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
-				   oldtail_pubname, part_name);
+	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
+	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, part_name);
 	-- Make this channel sync
-	PERFORM shardman.ensure_sync_standby(newtail_subname);
+	PERFORM shardman.ensure_sync_standby(lname);
 	-- Now it is safe to make old tail writable again
 	PERFORM shardman.readonly_table_off(part_name::regclass);
 END $$ LANGUAGE plpgsql;
 
--- Executed on oldtail node, see cr_rebuild_lr
+-- Executed on newtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_create_data_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
-	oldtail_pubname name := shardman.get_data_pubname(part_name, oldtail);
+	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
 	oldtail_connstr text := shardman.get_worker_node_connstr(oldtail);
-	newtail_subname name := shardman.get_data_subname(part_name, oldtail, newtail);
 BEGIN
+	PERFORM shardman.readonly_replica_on(part_name::regclass);
 	-- Create subscription for new data channel
 	-- It should never exist at this moment, but just in case...
-	PERFORM shardman.eliminate_sub(newtail_subname);
+	PERFORM shardman.eliminate_sub(lname);
 	EXECUTE format(
 		'CREATE SUBSCRIPTION %I connection %L
 		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
-		newtail_subname, oldtail_connstr, oldtail_pubname, oldtail_pubname);
+		lname, oldtail_connstr, lname, lname);
 END $$ LANGUAGE plpgsql;
 
 -- TODO
@@ -581,19 +637,11 @@ BEGIN
 	RETURN format('shardman_copy_%s_%s_%s', part_name, src, dst);
 END $$ LANGUAGE plpgsql STRICT;
 
--- Convention about pub and repslot name used for data replication from part
--- on pub_node node to any part. We don't change pub and repslot while
--- switching subs, so sub node is not included here.
-CREATE FUNCTION get_data_pubname(part_name text, pub_node int)
-	RETURNS name AS $$
-BEGIN
-	RETURN format('shardman_data_%s_%s', part_name, pub_node);
-END $$ LANGUAGE plpgsql STRICT;
-
--- Convention about sub and application_name used for data replication. We do
--- recreate sub while switching pub, so pub node is included here.
--- See comment to replica_created on why we don't reuse subs.
-CREATE FUNCTION get_data_subname(part_name text, pub_node int, sub_node int)
+-- Convention about pub, repslot, sub and application_name used for data
+-- replication. We do recreate sub while switching pub, so pub node is included
+-- here, and recreate pub when switching sub, so including both in the name. See
+-- comment to replica_created on why we don't reuse pubs and subs.
+CREATE FUNCTION get_data_lname(part_name text, pub_node int, sub_node int)
 	RETURNS name AS $$
 BEGIN
 	RETURN format('shardman_data_%s_%s_%s', part_name, pub_node, sub_node);
@@ -601,7 +649,14 @@ END $$ LANGUAGE plpgsql STRICT;
 
 -- Make sure that standby_name is present in synchronous_standby_names. If not,
 -- add it via ALTER SYSTEM and SIGHUP postmaster to reread conf.
-CREATE FUNCTION ensure_sync_standby(newtail_subname text) RETURNS void as $$
+CREATE FUNCTION ensure_sync_standby(standby text) RETURNS void as $$
 BEGIN
-	RAISE DEBUG '[SHARDMAN] imagine standby updated';
+	RAISE DEBUG '[SHARDMAN] imagine standby % added', standby;
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Remove 'standby' from in synchronous_standby_names, if it is there, and SIGHUP
+-- postmaster.
+CREATE FUNCTION remove_sync_standby(standby text) RETURNS void as $$
+BEGIN
+	RAISE DEBUG '[SHARDMAN] imagine standby % removed', standby;
 END $$ LANGUAGE plpgsql STRICT;
