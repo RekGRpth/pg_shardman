@@ -856,7 +856,7 @@ get_prev_node(const char *part_name, int32 node_id, bool *part_exists)
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
-		"select prev from shardman.partitions where part_name = '%s'"
+		"select prv from shardman.partitions where part_name = '%s'"
 		" and owner = %d;", part_name, node_id);
 
 	if (SPI_execute(sql, true, 0) < 0)

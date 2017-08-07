@@ -251,7 +251,6 @@ static void exec_move_part(MovePartState *cps);
 static void exec_create_replica(CreateReplicaState *cps);
 static int mp_rebuild_lr(MovePartState *cps);
 static int cr_rebuild_lr(CreateReplicaState *cps);
-static void exec_move_replica(CopyPartState *cps);
 static int cp_start_tablesync(CopyPartState *cpts);
 static int cp_start_finalsync(CopyPartState *cpts);
 static int cp_finalize(CopyPartState *cpts);
@@ -439,12 +438,13 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 			return;
 		}
 		mps->cp.type = COPYPARTTASK_MOVE_PRIMARY;
+		mps->prev_node = SHMN_INVALID_NODE_ID;
 	}
 	else
 	{
 		bool part_exists;
 		/*
-		 * Make sure that part exists on the node and get prev at the same
+		 * Make sure that part exists on src node and get prev at the same
 		 * time to see whether it is a primary or no.
 		 */
 		mps->prev_node = get_prev_node(part_name, src_node, &part_exists);
@@ -457,7 +457,10 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 		}
 		mps->cp.src_node = src_node;
 		if (mps->prev_node == SHMN_INVALID_NODE_ID)
+		{
 			mps->cp.type = COPYPARTTASK_MOVE_PRIMARY;
+			mps->prev_node = SHMN_INVALID_NODE_ID;
+		}
 		else
 		{
 			mps->cp.type = COPYPARTTASK_MOVE_REPLICA;
@@ -1058,15 +1061,6 @@ cr_rebuild_lr(CreateReplicaState *crs)
 	shmn_elog(DEBUG1, "cr %s: create_data_sub done", crs->cp.part_name);
 
 	return 0;
-}
-
-/*
- * One iteration of move replica task execution
- */
-void
-exec_move_replica(CopyPartState *cps)
-{
-
 }
 
 /*

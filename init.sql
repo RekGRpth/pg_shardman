@@ -52,7 +52,7 @@ CREATE TRIGGER cmd_log_inserts
 CREATE TABLE cmd_opts (
 	id bigserial PRIMARY KEY,
 	cmd_id bigint REFERENCES cmd_log(id),
-	opt text NOT NULL
+	opt text
 );
 
 -- Interface functions

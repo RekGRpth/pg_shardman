@@ -93,8 +93,8 @@ CREATE TABLE partitions (
 -- it.
 CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
 BEGIN
-	RAISE DEBUG '[SHARDMAN] new_primary trigger called for part %, owner %',
-		NEW.part_name, NEW.owner;
+	RAISE DEBUG '[SHARDMAN] new_primary trigger called on node % for part %, owner %',
+		shardman.get_node_id(), NEW.part_name, NEW.owner;
 	IF NEW.owner != shardman.get_node_id() THEN
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
@@ -150,7 +150,7 @@ BEGIN
 		PERFORM shardman.eliminate_sub(prev_lname);
 		EXECUTE format(
 			'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
 		prev_lname, prev_connstr, prev_lname, prev_lname);
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
@@ -168,7 +168,7 @@ BEGIN
 	PERFORM shardman.eliminate_sub(lname);
 	EXECUTE format(
 		'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
 		lname, dst_connstr, lname, lname);
 END $$ LANGUAGE plpgsql STRICT;
 
@@ -204,7 +204,7 @@ BEGIN
 		ELSE
 			-- On the other hand, if prev replica existed, drop sub for old
 			-- channel prev -> src
-			PERFORM shardman.eliminate_sub(src_next_lname);
+			PERFORM shardman.eliminate_sub(prev_src_lname);
 		END IF;
 		IF NEW.nxt IS NOT NULL THEN
 			-- If next replica existed, drop pub for old channel src -> next
@@ -218,7 +218,7 @@ BEGIN
 		-- Drop subscription used for copy
 		PERFORM shardman.eliminate_sub(cp_logname);
 		-- If primary part was moved, replace moved table with foreign one
-		IF NEW.prev IS NULL THEN
+		IF NEW.prv IS NULL THEN
 			PERFORM shardman.replace_foreign_part_with_usual(NEW);
 		END IF;
 	ELSEIF me = NEW.prv THEN -- node with prev replica
@@ -236,8 +236,7 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER part_moved AFTER UPDATE ON shardman.partitions
-	FOR EACH ROW WHEN (OLD.prv is NULL AND NEW.prv IS NULL -- it is primary
-					   AND OLD.owner != NEW.owner -- and it is really moved
+	FOR EACH ROW WHEN (OLD.owner != NEW.owner -- part is really moved
 					   AND OLD.part_name = NEW.part_name) -- sanity check
 	EXECUTE PROCEDURE part_moved();
 -- fire trigger only on worker nodes
@@ -287,7 +286,7 @@ BEGIN
 	PERFORM shardman.eliminate_sub(lname);
 	EXECUTE format(
 		'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
 		lname, oldtail_connstr, lname, lname);
 END $$ LANGUAGE plpgsql;
 
@@ -324,18 +323,19 @@ BEGIN
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Drop all foreign server's options. Yes, I don't know simpler ways.
-CREATE FUNCTION reset_foreign_server_opts(srvname name) RETURNS void AS $$
+CREATE FUNCTION reset_foreign_server_opts(sname name) RETURNS void AS $$
 DECLARE
 	opts text[];
 	opt text;
 	opt_key text;
 BEGIN
-	EXECUTE format($q$select coalesce(srvoptions, '{}'::text[]) FROM
+	ASSERT EXISTS (SELECT 1 FROM pg_foreign_server WHERE srvname = sname);
+	EXECUTE format($q$SELECT coalesce(srvoptions, '{}'::text[]) FROM
 									  pg_foreign_server WHERE srvname = %L$q$,
-									  srvname) INTO opts;
+									  sname) INTO opts;
 	FOREACH opt IN ARRAY opts LOOP
 		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
-		EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', srvname, opt_key);
+		EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', sname, opt_key);
 	END LOOP;
 END $$ LANGUAGE plpgsql STRICT;
 -- Same for resetting user mapping opts
@@ -359,28 +359,48 @@ BEGIN
 	END LOOP;
 END $$ LANGUAGE plpgsql STRICT;
 
--- Update foreign server and user mapping params according to partition part, so
--- this is expected to be called on server/um params change. We use dedicated
--- server for each partition because we plan to use multiple hosts/ports in
--- connstrings for transient fallback to replica if server with main partition
--- fails. FDW server, user mapping, foreign table and (obviously) parent partition
--- must exist when called.
+-- Update foreign server and user mapping params on current node according to
+-- partition part, so this is expected to be called on server/um params
+-- change. We use dedicated server for each partition because we plan to use
+-- multiple hosts/ports in connstrings for transient fallback to replica if
+-- server with main partition fails. FDW server, user mapping, foreign table and
+-- (obviously) parent partition must exist when called if they need to be
+-- updated; however, it is ok to call this func on nodes which don't need fdw
+-- setup for this part because they hold primary partition.
 CREATE FUNCTION update_fdw_server(part partitions) RETURNS void AS $$
 DECLARE
 	connstring text;
 	server_opts text;
 	um_opts text;
+	me int := shardman.get_node_id();
+	my_part shardman.partitions;
 BEGIN
-	-- ALTER FOREIGN TABLE doesn't support changing server, ALTER SERVER doesn't
-	-- support dropping all params, and I don't want to recreate foreign table
-	-- each time server params change, so resorting to these hacks.
-	PERFORM shardman.reset_foreign_server_opts(part.part_name);
-	PERFORM shardman.reset_um_opts(part.part_name, current_user::regrole);
+	RAISE DEBUG '[SHARDMAN %] update_fdw_server called for part %, owner %',
+		shardman.get_node_id(), part.part_name, part.owner;
+
+	SELECT * FROM shardman.partitions WHERE part_name = part.part_name AND
+											owner = me INTO my_part;
+	IF my_part.part_name IS NOT NULL THEN -- we are holding the part
+		IF my_part.prv IS NULL THEN
+			RAISE DEBUG '[SHARDMAN %] we are holding primary for part %s, not updating fdw server for it',
+			me, part.part_name;
+			RETURN;
+		ELSE
+			RAISE DEBUG '[SHARDMAN %] we are holding replica for part %s, updating fdw server for it',
+			me, part.part_name;
+		END IF;
+	END IF;
 
 	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
 		INTO connstring;
 	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring, 'ADD ')
 	INTO server_opts, um_opts;
+
+	-- ALTER FOREIGN TABLE doesn't support changing server, ALTER SERVER doesn't
+	-- support dropping all params, and I don't want to recreate foreign table
+	-- each time server params change, so resorting to these hacks.
+	PERFORM shardman.reset_foreign_server_opts(part.part_name);
+	PERFORM shardman.reset_um_opts(part.part_name, current_user::regrole);
 
 	IF server_opts != '' THEN
 		EXECUTE format('ALTER SERVER %I %s', part.part_name, server_opts);
