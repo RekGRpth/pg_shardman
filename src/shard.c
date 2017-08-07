@@ -404,7 +404,7 @@ move_primary(Cmd *cmd)
 	int32 dst_node = atoi(cmd->opts[1]);
 
 	CopyPartState **tasks = palloc(sizeof(CopyPartState*));
-	MovePrimaryState *mps = palloc(sizeof(MovePrimaryState));
+	MovePrimaryState *mps = palloc0(sizeof(MovePrimaryState));
 	tasks[0] = (CopyPartState *) mps;
 	init_mp_state(mps, part_name, dst_node);
 
@@ -450,7 +450,6 @@ init_mp_state(MovePrimaryState *mps, const char *part_name, int32 dst_node)
 		 */
 		mps->rep_connstr = get_worker_node_connstr(mps->rep_node);
 	}
-	mps->rep_conn = NULL;
 
 	mps->create_data_pub_sql = psprintf(
 		"select shardman.primary_moved_create_data_pub('%s', %d, %d);",
@@ -470,7 +469,8 @@ create_replica(Cmd *cmd)
 	int32 dst_node = atoi(cmd->opts[1]);
 
 	CopyPartState **tasks = palloc(sizeof(CopyPartState*));
-	CreateReplicaState *crs = palloc(sizeof(CreateReplicaState));
+	/* palloc0 is important to set ptrs to NULL */
+	CreateReplicaState *crs = palloc0(sizeof(CreateReplicaState));
 	tasks[0] = (CopyPartState *) crs;
 	init_cr_state(crs, part_name, dst_node);
 
@@ -484,6 +484,23 @@ create_replica(Cmd *cmd)
 void
 init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 {
+	char *sql;
+	uint64 shard_exists;
+
+	/* Check that table with such name is not already exists on dst node */
+	sql = psprintf(
+		"select owner from shardman.partitions where part_name = '%s' and owner = %d",
+		part_name, dst_node);
+	shard_exists = void_spi(sql);
+	if (shard_exists)
+	{
+		shmn_elog(WARNING,
+				  "Shard %s already exists on node %d, won't create replica on it.",
+				  part_name, dst_node);
+		crs->cp.res = TASK_FAILED;
+		return;
+	}
+
 	/* Set up fields neccesary to call init_cp_state */
 	crs->cp.dst_node = dst_node;
 	crs->cp.part_name = part_name;
@@ -545,8 +562,6 @@ init_cp_state(CopyPartState *cps)
 		cps->res = TASK_FAILED;
 		return;
 	}
-	cps->src_conn = NULL;
-	cps->dst_conn = NULL;
 
 	/* constant strings */
 	cps->logname = psprintf("shardman_copy_%s_%d_%d",

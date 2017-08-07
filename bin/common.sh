@@ -68,6 +68,6 @@ function run_demo()
     psql -c "select shardman.create_hash_partitions(2, 'pt', 'id', 2);"
 
     psql -c "select shardman.add_node('port=5435');"
-    psql -c "select shardman.move_primary('pt_0', 4);"
-    psql -c "select shardman.create_replica('pt_0', 2);"
+    # psql -c "select shardman.move_primary('pt_0', 4);"
+    # psql -c "select shardman.create_replica('pt_0', 2);"
 }

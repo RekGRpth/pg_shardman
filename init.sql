@@ -124,6 +124,21 @@ BEGIN
 	RETURN c_id;
 END $$ LANGUAGE plpgsql;
 
+-- Move primary or replica partition to another node. Params:
+-- 'part_name' is name of the partition to move
+-- 'src' is id of the node with partition
+-- 'dest' is id of the destination node
+CREATE FUNCTION move_part(part_name text, src int, dest int) RETURNS int AS $$
+DECLARE
+	c_id int;
+BEGIN
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_primary')
+										   RETURNING id INTO c_id;
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
+	RETURN c_id;
+END $$ LANGUAGE plpgsql;
+
 -- Internal functions
 
 -- Called on shardmaster bgw start. Add itself to nodes table, set id, create
