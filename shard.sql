@@ -117,7 +117,6 @@ BEGIN
 	-- Create publication for new data channel prev replica -> dst, make it sync
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
 	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, p_name);
-	PERFORM shardman.ensure_sync_standby(lname);
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Executed on node with new part, see mp_rebuild_lr
@@ -140,8 +139,6 @@ BEGIN
 		EXECUTE format('DROP PUBLICATION IF EXISTS %I', next_lname);
 		EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
 					   next_lname, p_name);
-		-- Make this channel sync
-		PERFORM shardman.ensure_sync_standby(next_lname);
 	END IF;
 
 	IF prev_rep IS NOT NULL THEN -- we need to setup channel prev replica -> dst
@@ -172,7 +169,7 @@ BEGIN
 		lname, dst_connstr, lname, lname);
 END $$ LANGUAGE plpgsql STRICT;
 
--- Update metadata according to primary move
+-- Partition moved, update fdw and drop old LR channels.
 CREATE FUNCTION part_moved() RETURNS TRIGGER AS $$
 DECLARE
 	cp_logname text := shardman.get_cp_logname(NEW.part_name, OLD.owner, NEW.owner);
@@ -488,7 +485,8 @@ END $$ LANGUAGE plpgsql;
 -- knows how to do it, but doesn't expose that. On the other hand, quote_literal
 -- (which is neccessary here) doesn't seem to have handy C API. I resorted to
 -- have C function which parses the opts and returns them in two parallel
--- arrays, and this sql function joins them with quoting.
+-- arrays, and this sql function joins them with quoting. TODO: of course,
+-- quote_literal_cstr exists.
 -- prfx is prefix added before opt name, e.g. 'ADD ' for use in ALTER SERVER.
 -- Returns two strings: one with opts ready to pass to CREATE FOREIGN SERVER
 -- stmt, and one wih opts ready to pass to CREATE USER MAPPING.
@@ -657,19 +655,12 @@ BEGIN
 	RETURN format('shardman_copy_%s_%s_%s', part_name, src, dst);
 END $$ LANGUAGE plpgsql STRICT;
 
--- Convention about pub, repslot, sub and application_name used for data
--- replication. We do recreate sub while switching pub, so pub node is included
--- here, and recreate pub when switching sub, so including both in the name. See
--- comment to replica_created on why we don't reuse pubs and subs.
 CREATE FUNCTION get_data_lname(part_name text, pub_node int, sub_node int)
-	RETURNS name AS $$
-BEGIN
-	RETURN format('shardman_data_%s_%s_%s', part_name, pub_node, sub_node);
-END $$ LANGUAGE plpgsql STRICT;
+	RETURNS text AS  'pg_shardman' LANGUAGE C;
 
 -- Make sure that standby_name is present in synchronous_standby_names. If not,
 -- add it via ALTER SYSTEM and SIGHUP postmaster to reread conf.
-CREATE FUNCTION ensure_sync_standby(standby text) RETURNS void as $$
+CREATE FUNCTION ensure_sync_standby(standby text) RETURNS void AS $$
 DECLARE
 	newval text := shardman.ensure_sync_standby_c(standby);
 BEGIN
@@ -682,7 +673,7 @@ END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION ensure_sync_standby_c(standby text) RETURNS text
     AS 'pg_shardman' LANGUAGE C;
 
--- Remove 'standby' from in synchronous_standby_names, if it is there, and SIGHUP
+-- Remove 'standby' from synchronous_standby_names, if it is there, and SIGHUP
 -- postmaster.
 CREATE FUNCTION remove_sync_standby(standby text) RETURNS void as $$
 DECLARE

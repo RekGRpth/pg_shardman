@@ -706,7 +706,7 @@ rm_node(Cmd *cmd)
  * Get connstr of worker node with id node_id. Memory is palloc'ed.
  * NULL is returned, if there is no such node.
  */
-char*
+char *
 get_worker_node_connstr(int32 node_id)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
@@ -884,7 +884,7 @@ get_prev_node(const char *part_name, int32 node_id, bool *part_exists)
  * Get relation name of partition part_name. Memory is palloc'ed.
  * NULL is returned, if there is no such partition.
  */
-char*
+char *
 get_partition_relation(const char *part_name)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;

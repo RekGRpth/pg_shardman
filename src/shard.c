@@ -9,19 +9,20 @@
  *
  * Since we want to execute several actions in parallel, e.g. move partitions,
  * but shardlord works only on one user command at time, we divide commands
- * into 'tasks', e.g. move one partition. Every task it atomic in a sense that
+ * into 'tasks', e.g. move one partition. Every task is atomic in a sense that
  * it either completes fully or not completes at all (though in latter case we
  * currently leave some garbage here and there which should be cleaned).
  * Parallel execution of tasks is accomplished via event loop: we work on task
  * until it says 'I am done, don't wake me again', 'Wake me again after n
- * sec', or 'Wake me again when data on socket x arrives'. Currently I plan to
- * support the following types of tasks: moving primary, moving replica and
- * creating replicas. Because of parallel execution we may face dependency
- * issues: for example, if we move primary and at the same time add replica
- * by copying this primary to some node, replica might lost some data which
- * as written at new primary location when LR channel between new primary and
- * and replica was not yet established. To simplify things, we will not allow
- * parallel execution of copy part tasks involving the same src partition.
+ * sec', or 'Wake me again when data on socket x arrives'. Currently the
+ * following types of tasks are supported: moving part (primary or replica)
+ * and creating replicas. Because of parallel execution we may face dependency
+ * issues: for example, if we move primary and at the same time add replica by
+ * copying this primary to some node, replica might lost some data which has
+ * written at new primary location when LR channel between new primary and and
+ * replica was not yet established. To simplify things, we should not allow
+ * parallel execution of copy part tasks involving the same src partition, but
+ * this is not yet implemented
  *
  * We have other issues as well. Imagine the following nodes with primary part
  * on A and replica on B:
@@ -32,52 +33,48 @@
  * D. Rr has moved first, Pr second, A quickly learns about this and drops
  * partition & repslot since it has moved to C. Now slow D learns what
  * happened; since Rr move was first, it creates subscription pointing to the
- * table on A, but the repslot doesn't exist anymore, so we will receive a
+ * table on A, but the repslot doesn't exist anymore, so we will see a
  * bunch of errors in the log. Happily, this doesn't mean that CREATE
  * SUBSCRIPTION fails, so things will get fixed eventually.
  *
  * As with most actions, we can create/alter/drop pubs, subs and repslots in
- * two ways: via triggers on tables with metadata and manually via libpq.
- * The first is more handy, but dangerous: if pub node crashed, create
+ * two ways: via triggers on tables with metadata and manually via libpq.  The
+ * first is more handy, but dangerous: if pub node crashed, create
  * subscription will fail. We need either patch LR to overcome this or add
  * wrapper which will continiously try to create subscription if it fails.
  * Besides, there is no way to create logical replication slot if current trxn
- * had written something.
+ * had written something, and so it is impossible to do that from trigger on
+ * update. Finally, it is a pretty bad idea to add entry to
+ * synchronous_standy_names (obviously non-transactional action) from the
+ * transaction that wrote something, because if remote end is not up, such
+ * transaction will hang forever during the commit. The moral is that we
+ * manage LR only manually.
  *
- * General copy partition implementation:
- * - Disable subscription on destination, otherwise we can't drop rep slot on
- *   source.
- * - Idempotently create publication and repl slot on source.
- * - Idempotently create table and async subscription on destination.
- *   We use async subscription, because sync would block table while copy is
- *   in progress. But with async, we have to lock the table after initial sync.
- * - Now inital copy has started.
- * - Sleep & check in connection to the dest waiting for completion of the
- *   initial sync. Later this should be substituted with listen/notify.
- * - When done, lock writes (better lock reads too to avoid stale reads)
- *	 on source and remember pg_current_wal_lsn() on it.
- * - Now final sync has started.
- * - Sleep & check in connection to dest waiting for completion of final sync,
- *   i.e. when received_lsn is equal to remembered lsn on src. This is harder
- *   to replace with notify, but we can try that too.
- * - Done. src table drop and foreign settings rebuilding is done via metadata
- *   update.
- *
- *  If we don't save progress (whether initial sync started or done, lsn,
- *  etc), we have to start everything from the ground if master reboots. This
- *  is arguably fine.
- *
- *  Short description of all tasks:
- *  move_primary:
- *    copy part, update metadata
- *    On metadata update:
- *    on src node, drop lr copy stuff, create foreign table and replace
- *      table with it, drop table. Drop primary lr stuff.
- *    on dst node, replace foreign table with fresh copy (lock it until
- *      sync_standby_names updated?), drop the former. drop lr copy stuff.
- *      Create primary lr stuff (including sync_standby_names)
- *    On node with replica (if exists) alter sub and alter fdw server.
- *    on others, alter fdw server.
+ * As always, implementations must be written atomically, so that if anything
+ * reboots, things are not broken. This requires special attention while
+ * handling LR channels: it means that we can't touch old LR channels while
+ * metadata is not yet updated, and we update metadata only when all new
+ * channels are built. So we configure new channels first manually, then
+ * update metadata, and finally destroy old channels in update metadata
+ * triggers.
+
+ * Often, while altering LR channel, we need to change only publisher or only
+ * subscriber, or rename endpoints. One might think that we could reuse sub or
+ * pub/repslot in such cases. No, it is a bad idea. First of all, tt is
+ * impossible to rename logical repslot, so we are drop old and create new one
+ * if we need to rename it. Then, we can't reuse old replication slot if we
+ * change subscription, because when we create new sub, old is normally alive
+ * (because of the atomicity), and two subs per one replication slot doesn't sound
+ * good. Renaming subs is not easy too:
+ * - It is not easier than creating a new one: we have to rename sub, alter
+ *   sub's slot_name, alter sub's publication, probably update sub application
+ *   name, probably run REFRESH (which requires alive pub just as CREATE
+ *   SUBSCRIPTION) and hope that everything will be ok. Not sure about
+ *   refreshing, though -- I don't know is it ok not doing it if tables didn't
+ *   change. Doc says it should be executed.
+ * - Since it is not possible to rename repslot and and it is not possible to
+ *   specify since which lsn start replication, tables must be synced anyway
+ *   during these operations, so what the point of reusing old sub?
  *
  *  About fdws on replicas: we have to keep partition of parent table as fdw,
  *  because otherwise we would not be able to write anything to it. On the
@@ -85,25 +82,9 @@
  *  slower in case of primary failure: we need actually only primary and
  *  ourself.
  *
- *  create_replica:
- *    copy part from the last replica (because only the last replica knows
- *      when it has created sync lr channel and can make table writable again).
- *      Make dst table read-only for all but lr workers, update metadata.
- *    On metadata update:
- *    on (old) last replica, alter cp lr channel to make it sync (and rename),
- *      make table writable.
- *    on node with fresh replica, rename lr channel, alter fdw server.
- *    on others, alter fdw server.
- *
- *  move_replica:
- *    copy part. Make dst table read-only for all but lr worker, update
- *    metadata.
- *    On metadata update:
- *    On src, drop lr copy stuff, alter fdw server. Drop lr pub (if any) and
- *      sub stuff. Drop table.
- *    On dst, drop lr copy stuff, create lr pub & sync sub, alter fdw server.
- *    On previous part node, alter lr channel
- *    On following part node (if any), recreate sub.
+ *  Currently we don't save progress of separate tasks (e.g. for copy part
+ *  whether initial sync started or done, lsn, etc), so we have to start
+ *  everything from the ground if shardlord reboots. This is arguably fine.
  *
  * -------------------------------------------------------------------------
  */
@@ -260,6 +241,7 @@ static int ensure_pqconn(PGconn **conn, const char *connstr,
 static void reset_pqconn(PGconn **conn);
 static void reset_pqconn_and_res(PGconn **conn, PGresult *res);
 static void configure_retry(CopyPartState *cpts, int millis);
+char *get_data_lname_cstr(const char *part_name, int32 pub_node, int32 sub_node);
 static struct timespec timespec_now_plus_millis(int millis);
 struct timespec timespec_now(void);
 
@@ -425,6 +407,9 @@ void
 init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 			  int32 dst_node)
 {
+	char *prev_dst_lname;
+	char *dst_next_lname;
+
 	/* Set up fields neccesary to call init_cp_state */
 	mps->cp.part_name = part_name;
 	if (src_node == SHMN_INVALID_NODE_ID)
@@ -494,15 +479,36 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 		mps->cp.dst_node, part_name, mps->cp.src_node,
 		mps->cp.dst_node, part_name, mps->cp.src_node);
 
-	mps->prev_sql = psprintf(
-		"select shardman.part_moved_prev('%s', %d, %d);",
-		part_name, mps->cp.src_node, mps->cp.dst_node);
+	/*
+	 * Note the careful placement of ensure_sync_standby's. They will
+	 * immediately block the database, because we firstly create pub &
+	 * repslots along with calling those, and only then create subs. We
+	 * execute them in separate transactions to allow other changes commit.
+	 */
+	if (mps->prev_node != SHMN_INVALID_NODE_ID)
+	{
+		prev_dst_lname = get_data_lname_cstr(part_name, mps->prev_node,
+										  mps->cp.dst_node);
+		mps->prev_sql = psprintf(
+			"begin; select shardman.part_moved_prev('%s', %d, %d); end;"
+			" select shardman.ensure_sync_standby('%s');",
+			part_name, mps->cp.src_node, mps->cp.dst_node,
+			prev_dst_lname);
+	}
 	mps->dst_sql = psprintf(
-		"select shardman.part_moved_dst('%s', %d, %d);",
+		"begin; select shardman.part_moved_dst('%s', %d, %d); end;",
 		part_name, mps->cp.src_node, mps->cp.dst_node);
-	mps->next_sql = psprintf(
-		"select shardman.part_moved_next('%s', %d, %d);",
-		part_name, mps->cp.src_node, mps->cp.dst_node);
+	if (mps->next_node != SHMN_INVALID_NODE_ID)
+	{
+		dst_next_lname = get_data_lname_cstr(part_name, mps->cp.dst_node,
+											 mps->next_node);
+		mps->dst_sql = psprintf(
+			"%s select shardman.ensure_sync_standby('%s');",
+			mps->dst_sql, dst_next_lname);
+		mps->next_sql = psprintf(
+			"select shardman.part_moved_next('%s', %d, %d);",
+			part_name, mps->cp.src_node, mps->cp.dst_node);
+	}
 }
 
 /*
@@ -532,6 +538,7 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 {
 	char *sql;
 	uint64 shard_exists;
+	char *lname;
 
 	/* Check that table with such name is not already exists on dst node */
 	sql = psprintf(
@@ -573,9 +580,18 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 	crs->drop_cp_sub_sql = psprintf(
 		"select shardman.replica_created_drop_cp_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
+	lname = get_data_lname_cstr(part_name, crs->cp.src_node, crs->cp.dst_node);
+	/*
+	 * Separate trxn for ensure_sync_standby as in init_mp_state. It is
+	 * interesting that while I got expected behaviour (hanged transaction) in
+	 * move_part if ensure_sync_standby was executed in one trxn with create
+	 * repslot and pub, here I didn't. Probably it is committing so fast that
+	 * settings are not getting reloaded, but not sure why.
+	 */
 	crs->create_data_pub_sql = psprintf(
-		"select shardman.replica_created_create_data_pub('%s', %d, %d);",
-		part_name, crs->cp.src_node, crs->cp.dst_node);
+		"begin; select shardman.replica_created_create_data_pub('%s', %d, %d); end;"
+		" select shardman.ensure_sync_standby('%s');",
+		part_name, crs->cp.src_node, crs->cp.dst_node, lname);
 	crs->create_data_sub_sql = psprintf(
 		"select shardman.replica_created_create_data_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
@@ -876,7 +892,21 @@ exec_task(CopyPartState *cps)
 }
 
 /*
- * One iteration of move primary task execution
+ * One iteration of move primary task execution.
+ *
+ * Maximum 4 nodes are actively involved here: src, dst, previous replica (or
+ * primary) and next replica. The whole task workflow:
+ * - copy part
+ * - create pub, repslot, turn on sync rep for prev -> dst channel
+ * - create pub, repslot, turn on sync rep for dst -> next channel
+ * - create sub for prev -> dst channel
+ * - create sub from dst -> next channel
+ * - update metadata, in triggers:
+ *   * Update fdw connstrings;
+ *   * Replace foreign table with new part on dst (dropping the former) and
+       old part with foreign on src (dropping the former),
+ *   * Drop all old LR stuff via update metadata triggers.
+ *   * Replication channel used for copy is dropped here too.
  */
 void
 exec_move_part(MovePartState *mps)
@@ -963,7 +993,9 @@ mp_rebuild_lr(MovePartState *mps)
 }
 
 /*
- * One iteration of add replica task execution
+ * One iteration of add replica task execution.
+ *
+ * Only two nodes involved here, old and new tail of replica chain.
  */
 void
 exec_create_replica(CreateReplicaState *crs)
@@ -975,7 +1007,6 @@ exec_create_replica(CreateReplicaState *crs)
 	if (cr_rebuild_lr(crs) == -1)
 		return;
 
-	/* Also handles fdw connstring updates via trigger */
 	void_spi(crs->cp.update_metadata_sql);
 	shmn_elog(LOG, "Creating replica %s on node %d successfully done",
 			  crs->cp.part_name, crs->cp.dst_node);
@@ -986,22 +1017,8 @@ exec_create_replica(CreateReplicaState *crs)
 /*
  * Reconfigure LR channels for freshly created replica.
  *
- * Old tail part is still read-only when this called. On old tail, we need to
- * create proper repslot & pub, on new tail we need to create sub. It is
- * impossible to rename logical repslot, so we are dropping one used for copy
- * and create new one.  As for sub, we could just rename one used for
- * partition copy, but we will not do that, because
- * - It is not easier than creating a new one: we have to rename sub, alter
- *   sub's slot_name, alter sub's publication, probably update sub application
- *   name, probably run REFRESH (which requires alive pub just as CREATE
- *   SUBSCRIPTION) and hope that everything will be ok. Not sure about
- *   refreshing, though -- I don't know is it ok not doing it if tables didn't
- *   change. Doc says it should be executed.
- * - Since it is not possible to rename repslot and and it is not possible to
- *   specify since which lsn start replication, tables must be synced anyway
- *   during these operations, so what the point of reusing old sub? And
- *   copypart in really cared that tables are synced at this moment and src is
- *   read-only.
+ * TODO: simplify things and drop cp channel in triggers, or better let cp
+ * part code itself do that.
  *
  * Work to do in general is described below. We execute them in steps written
  * in parentheses so that every time we create sub, pub is already exist and
@@ -1064,8 +1081,31 @@ cr_rebuild_lr(CreateReplicaState *crs)
 }
 
 /*
- * Actually run CopyPartState state machine. On return, cps values say when (if
- * ever) we want to be executed again.
+ * Actually run CopyPartState state machine. On return, cps values say when
+ * (if ever) we want to be executed again.
+ *
+ * Workflow is:
+ * - Disable subscription on destination, otherwise we can't drop rep slot on
+ *   source.
+ * - Idempotently create publication and repl slot on source.
+ * - Idempotently create table and async subscription on destination.
+ *   We use async subscription, because sync would block table while copy is
+ *   in progress. But with async, we have to lock the table after initial sync.
+ * - Now inital copy has started.
+ * - Sleep & check in connection to the dest waiting for completion of the
+ *   initial sync. Later this should be substituted with listen/notify, we use
+ *   epoll here for precisely for this reason, but this is not currently
+ *   implemented, we need to add hook on initial tablesync completion.
+ * - When done, lock writes (better lock reads too to avoid stale reads, in
+ *	 fact) on source and remember pg_current_wal_lsn() on it.
+ * - Now final sync has started.
+ * - Sleep & check in connection to dest waiting for completion of final sync,
+ *   i.e. when received_lsn is equal to remembered lsn on src. This is harder
+ *   to replace with notify, but we can try that too.
+ * - Done. After successfull execution, we are left with two copies of the
+ *   table with src one locked for writes and with LR channel configured
+ *   between them. TODO: drop channel here, because we don't reuse it anyway.
+ *   Currently we drop the channel in metadata update triggers.
  */
 void
 exec_cp(CopyPartState *cps)
@@ -1339,6 +1379,29 @@ void configure_retry(CopyPartState *cps, int millis)
 			  cps->part_name, millis);
 	cps->waketm = timespec_now_plus_millis(millis);
 	cps->exec_res = TASK_WAKEMEUP;
+}
+
+/*
+ * Convention about pub, repslot, sub and application_name used for data
+ * replication. We recreate sub while switching pub and recreate pub when
+ * switching sub, so including both in the name. See top comment on why we
+ * don't reuse pubs and subs.
+ */
+char *
+get_data_lname_cstr(const char *part_name, int32 pub_node, int32 sub_node)
+{
+	return psprintf("shardman_data_%s_%d_%d", part_name, pub_node, sub_node);
+}
+/* SQL interface to it */
+PG_FUNCTION_INFO_V1(get_data_lname);
+Datum
+get_data_lname(PG_FUNCTION_ARGS)
+{
+	char *part_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32 pub_node = PG_GETARG_INT32(1);
+	int32 sub_node = PG_GETARG_INT32(2);
+	PG_RETURN_TEXT_P(cstring_to_text(
+						 get_data_lname_cstr(part_name, pub_node, sub_node)));
 }
 
 /*

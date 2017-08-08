@@ -274,6 +274,10 @@ BEGIN
 		WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
 		PERFORM shardman.drop_repslot(rs.slot_name, true);
 	END LOOP;
+	-- TODO: remove only shardman's standbys
+	IF shardman.my_id() IS NOT NULL THEN
+		PERFORM shardman.set_sync_standbys('');
+	END IF;
 
 	PERFORM shardman.reset_node_id();
 END;
