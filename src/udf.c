@@ -18,6 +18,7 @@
 #include "catalog/pg_type.h"
 #include "storage/lmgr.h"
 #include "replication/logicalworker.h"
+#include "replication/syncrep.h"
 #include "libpq-fe.h"
 
 #include "pg_shardman.h"
@@ -138,8 +139,6 @@ reconstruct_table_attrs(PG_FUNCTION_ARGS)
 	Relation local_rel = heap_open(relid, AccessExclusiveLock);
 	TupleDesc local_descr = RelationGetDescr(local_rel);
 	int i;
-	text *text_query;
-	int32 text_query_size;
 
 	initStringInfo(&query);
 	appendStringInfoChar(&query, '(');
@@ -165,15 +164,9 @@ reconstruct_table_attrs(PG_FUNCTION_ARGS)
 
 	appendStringInfoChar(&query, ')');
 
-	/* Now prepare result as 'text' */
-	text_query_size = VARHDRSZ + query.len;
-	text_query = (text *) palloc(text_query_size);
-	SET_VARSIZE(text_query, text_query_size);
-	memcpy(VARDATA(text_query), query.data, query.len);
-
 	/* Let xact unlock this */
 	heap_close(local_rel, NoLock);
-	PG_RETURN_TEXT_P(text_query);
+	PG_RETURN_TEXT_P(cstring_to_text(query.data));
 }
 
 /*
@@ -297,9 +290,152 @@ reset_node_id_c(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/* Are we a logical apply worker? */
 PG_FUNCTION_INFO_V1(inside_apply_worker);
 Datum
 inside_apply_worker(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_BOOL(IsLogicalWorker());
+}
+
+/*
+ * Check whether 'standby' is present in current value of
+ * synchronous_standby_names. If yes, return NULL. Otherwise, form properly
+ * quoted new value of the setting with 'standby' appended. Currently we
+ * support only the case when *all* standbys must agree on commit, so FIRST or
+ * ANY doesn't matter here. '*' wildcard is not supported too.
+ */
+PG_FUNCTION_INFO_V1(ensure_sync_standby_c);
+Datum
+ensure_sync_standby_c(PG_FUNCTION_ARGS)
+{
+	char *standby = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *cur_standby_name;
+	StringInfoData standby_list;
+	char *newval;
+	int processed = 0;
+
+	initStringInfo(&standby_list);
+	if (SyncRepConfig != NULL)
+	{
+		Assert(SyncRepConfig->num_sync == SyncRepConfig->nmembers);
+
+		cur_standby_name = SyncRepConfig->member_names;
+		for (; processed < SyncRepConfig->nmembers; processed++)
+		{
+			Assert(strcmp(cur_standby_name, "*") != 0);
+			if (pg_strcasecmp(cur_standby_name, standby) == 0)
+			{
+				PG_RETURN_NULL(); /* already set */
+			}
+
+			if (processed != 0)
+				appendStringInfoString(&standby_list, ", ");
+			appendStringInfoString(&standby_list, quote_identifier(cur_standby_name));
+
+			cur_standby_name += strlen(cur_standby_name) + 1;
+		}
+	}
+
+	if (processed != 0)
+		appendStringInfoString(&standby_list, ", ");
+	appendStringInfoString(&standby_list, quote_identifier(standby));
+
+	newval = psprintf("FIRST %d (%s)", processed + 1, standby_list.data);
+	PG_RETURN_TEXT_P(cstring_to_text(newval));
+}
+
+/*
+ * Check whether 'standby' is present in current value of
+ * synchronous_standby_names. If no, return NULL. Otherwise, form properly
+ * quoted new value of the setting with 'standby' removed. Currently we
+ * support only the case when *all* standbys must agree on commit, so FIRST or
+ * ANY doesn't matter here. '*' wildcard is not supported too.
+ * All entries are removed.
+ */
+PG_FUNCTION_INFO_V1(remove_sync_standby_c);
+Datum
+remove_sync_standby_c(PG_FUNCTION_ARGS)
+{
+	char *standby = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *cur_standby_name;
+	StringInfoData standby_list;
+	char *newval;
+	int processed;
+	int num_sync;
+
+	if (SyncRepConfig == NULL)
+		PG_RETURN_NULL();
+
+	initStringInfo(&standby_list);
+	Assert(SyncRepConfig->num_sync == SyncRepConfig->nmembers);
+
+	cur_standby_name = SyncRepConfig->member_names;
+	num_sync = 0;
+	for (processed = 0; processed < SyncRepConfig->nmembers; processed++)
+	{
+		Assert(strcmp(cur_standby_name, "*") != 0);
+		if (pg_strcasecmp(cur_standby_name, standby) != 0)
+		{
+			if (num_sync != 0)
+				appendStringInfoString(&standby_list, ", ");
+			appendStringInfoString(&standby_list, quote_identifier(cur_standby_name));
+			num_sync++;
+		}
+
+		cur_standby_name += strlen(cur_standby_name) + 1;
+	}
+
+	if (SyncRepConfig->num_sync == num_sync)
+		PG_RETURN_NULL(); /* nothing was removed */
+
+	if (num_sync > 0)
+		newval = psprintf("FIRST %d (%s)", num_sync, standby_list.data);
+	else
+		newval = "";
+	PG_RETURN_TEXT_P(cstring_to_text(newval));
+}
+
+/*
+ * Execute ALTER SYSTEM SET synchronous_standby_names TO 'arg'. We can't do
+ * that from usual function, because ALTER SYSTEM cannon be executed within
+ * transaction, so we resort to another exquisite hack: we connect to
+ * ourselves via libpq and perform the job.
+ */
+PG_FUNCTION_INFO_V1(set_sync_standbys);
+Datum
+set_sync_standbys(PG_FUNCTION_ARGS)
+{
+	char *standbys = quote_literal_cstr(text_to_cstring(PG_GETARG_TEXT_PP(0)));
+	char *cmd = psprintf("alter system set synchronous_standby_names to %s",
+						 standbys);
+	char *my_id_sql = "select shardman.my_connstr();";
+	char *connstr;
+	PGconn *conn = NULL;
+	PGresult *res = NULL;
+
+	SPI_connect();
+	if (SPI_execute(my_id_sql, true, 0) < 0 || SPI_processed != 1)
+		elog(FATAL, "Stmt failed: %s", my_id_sql);
+	connstr = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+	conn = PQconnectdb(connstr);
+	if (PQstatus(conn) != CONNECTION_OK)
+	{
+		PQfinish(conn);
+		elog(ERROR, "Connection to myself with connstr %s failed", connstr);
+
+	}
+	res = PQexec(conn, cmd);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		PQfinish(conn);
+		elog(ERROR, "setting sync standby namesfailed");
+	}
+
+	PQclear(res);
+	PQfinish(conn);
+	SPI_finish(); /* Can't do earlier since connstr is allocated there */
+	PG_RETURN_VOID();
 }

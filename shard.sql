@@ -29,7 +29,7 @@ DECLARE
 	partition_names text[];
 	pname text;
 BEGIN
-	IF NEW.initial_node != (SELECT shardman.get_node_id()) THEN
+	IF NEW.initial_node != (SELECT shardman.my_id()) THEN
 		EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', NEW.relation);
 		partition_names :=
 			(SELECT ARRAY(SELECT part_name FROM shardman.gen_part_names(
@@ -94,8 +94,8 @@ CREATE TABLE partitions (
 CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
 BEGIN
 	RAISE DEBUG '[SHARDMAN] new_primary trigger called on node % for part %, owner %',
-		shardman.get_node_id(), NEW.part_name, NEW.owner;
-	IF NEW.owner != shardman.get_node_id() THEN
+		shardman.my_id(), NEW.part_name, NEW.owner;
+	IF NEW.owner != shardman.my_id() THEN
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
 	RETURN NULL;
@@ -110,7 +110,7 @@ ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER new_primary;
 CREATE FUNCTION part_moved_prev(p_name name, src int, dst int)
 	RETURNS void AS $$
 DECLARE
-	me int := shardman.get_node_id();
+	me int := shardman.my_id();
 	lname text := shardman.get_data_lname(p_name, me, dst);
 BEGIN
 	PERFORM shardman.create_repslot(lname);
@@ -132,7 +132,7 @@ DECLARE
 	prev_lname text;
 	prev_connstr text;
 BEGIN
-	ASSERT dst = shardman.get_node_id(), 'part_moved_dst must be called on dst';
+	ASSERT dst = shardman.my_id(), 'part_moved_dst must be called on dst';
 	IF next_rep IS NOT NULL THEN -- we need to setup channel dst -> next replica
 		next_lname := shardman.get_data_lname(p_name, dst, next_rep);
 		-- This must be first write in the transaction!
@@ -159,7 +159,7 @@ END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION part_moved_next(p_name name, src int, dst int)
 	RETURNS void AS $$
 DECLARE
-	me int := shardman.get_node_id();
+	me int := shardman.my_id();
 	lname text := shardman.get_data_lname(p_name, dst, me);
 	dst_connstr text := shardman.get_worker_node_connstr(dst);
 BEGIN
@@ -176,7 +176,7 @@ END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION part_moved() RETURNS TRIGGER AS $$
 DECLARE
 	cp_logname text := shardman.get_cp_logname(NEW.part_name, OLD.owner, NEW.owner);
-	me int := shardman.get_node_id();
+	me int := shardman.my_id();
 	prev_src_lname text;
 	src_next_lname text;
 BEGIN
@@ -297,7 +297,7 @@ END $$ LANGUAGE plpgsql;
 -- CREATE FUNCTION replica_created_update_fdw() RETURNS TRIGGER AS $$
 -- BEGIN
 	-- RAISE DEBUG '[SHARDMAN] replica_created_update_fdw trigger called';
-	-- IF shardman.get_node_id() != NEW.prv THEN -- don't update on oldtail node
+	-- IF shardman.my_id() != NEW.prv THEN -- don't update on oldtail node
 		-- PERFORM shardman.update_fdw_server(NEW);
 	-- END IF;
 	-- RETURN NULL;
@@ -372,11 +372,11 @@ DECLARE
 	connstring text;
 	server_opts text;
 	um_opts text;
-	me int := shardman.get_node_id();
+	me int := shardman.my_id();
 	my_part shardman.partitions;
 BEGIN
 	RAISE DEBUG '[SHARDMAN %] update_fdw_server called for part %, owner %',
-		shardman.get_node_id(), part.part_name, part.owner;
+		shardman.my_id(), part.part_name, part.owner;
 
 	SELECT * FROM shardman.partitions WHERE part_name = part.part_name AND
 											owner = me INTO my_part;
@@ -451,7 +451,7 @@ BEGIN
 	-- change reached us? We might also use it with local table (create
 	-- foreign server pointing to it, etc), but that's just ugly.
 	RAISE DEBUG '[SHARDMAN] my id: %, creating ft %',
-		shardman.get_node_id(), part.part_name;
+		shardman.my_id(), part.part_name;
 	EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I OPTIONS (table_name %L)',
 				   fdw_part_name,
 				   (SELECT
@@ -628,7 +628,7 @@ BEGIN
 END $$ LANGUAGE plpgsql STRICT;
 
 CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS text
-    AS 'pg_shardman' LANGUAGE C;
+    AS 'pg_shardman' LANGUAGE C STRICT;
 
 CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 	RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
@@ -670,13 +670,32 @@ END $$ LANGUAGE plpgsql STRICT;
 -- Make sure that standby_name is present in synchronous_standby_names. If not,
 -- add it via ALTER SYSTEM and SIGHUP postmaster to reread conf.
 CREATE FUNCTION ensure_sync_standby(standby text) RETURNS void as $$
+DECLARE
+	newval text := shardman.ensure_sync_standby_c(standby);
 BEGIN
-	RAISE DEBUG '[SHARDMAN] imagine standby % added', standby;
+	IF newval IS NOT NULL THEN
+		RAISE DEBUG '[SHARDMAN] Adding standby %, new value is %', standby, newval;
+		PERFORM shardman.set_sync_standbys(newval);
+		PERFORM pg_reload_conf();
+	END IF;
 END $$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION ensure_sync_standby_c(standby text) RETURNS text
+    AS 'pg_shardman' LANGUAGE C;
 
 -- Remove 'standby' from in synchronous_standby_names, if it is there, and SIGHUP
 -- postmaster.
 CREATE FUNCTION remove_sync_standby(standby text) RETURNS void as $$
+DECLARE
+	newval text := shardman.remove_sync_standby_c(standby);
 BEGIN
-	RAISE DEBUG '[SHARDMAN] imagine standby % removed', standby;
+	IF newval IS NOT NULL THEN
+		RAISE DEBUG '[SHARDMAN] Removing standby %, new value is %', standby, newval;
+		PERFORM shardman.set_sync_standbys(newval);
+		PERFORM pg_reload_conf();
+	END IF;
 END $$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION remove_sync_standby_c(standby text) RETURNS text
+	AS 'pg_shardman' LANGUAGE C;
+
+CREATE FUNCTION set_sync_standbys(standby text) RETURNS void
+	AS 'pg_shardman' LANGUAGE C;

@@ -504,7 +504,7 @@ add_node(Cmd *cmd)
 		{
 			/* extension is installed, so we have to check whether this node
 			 * is already in the cluster */
-			res = PQexec(conn, "select shardman.get_node_id();");
+			res = PQexec(conn, "select shardman.my_id();");
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			{
 				shmn_elog(NOTICE, "Failed to get node id, %s", PQerrorMessage(conn));

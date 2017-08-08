@@ -31,7 +31,7 @@ CREATE TABLE nodes (
 -- of transaction. Later we should delete subscriptions fully.
 CREATE FUNCTION rm_node_worker_side() RETURNS TRIGGER AS $$
 BEGIN
-	IF OLD.id = (SELECT shardman.get_node_id()) THEN
+	IF OLD.id = (SELECT shardman.my_id()) THEN
 		RAISE DEBUG '[SHARDMAN] rm_node_worker_side called';
 		PERFORM shardman.pg_shardman_cleanup(false);
 	END IF;
@@ -53,7 +53,7 @@ CREATE TABLE local_meta (
 INSERT INTO shardman.local_meta VALUES ('node_id', NULL);
 
 -- Get local node id. NULL means node is not in the cluster yet.
-CREATE FUNCTION get_node_id() RETURNS int AS $$
+CREATE FUNCTION my_id() RETURNS int AS $$
 	SELECT v::int FROM shardman.local_meta WHERE k = 'node_id';
 $$ LANGUAGE sql;
 
@@ -95,9 +95,20 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Get local node connstr. Throws an error, if node is not in cluster
+CREATE FUNCTION my_connstr() RETURNS text AS $$
+DECLARE
+	connstr text := connstring FROM shardman.nodes WHERE id = shardman.my_id();
+BEGIN
+	IF connstr IS NULL THEN
+		RAISE EXCEPTION 'Node not in cluster, can''t get its connstring';
+	END IF;
+	RETURN connstr;
+END $$ LANGUAGE plpgsql;
+
 -- Get connstr of worker node with id node_id. ERROR is raised if there isn't
 -- one.
-CREATE OR REPLACE FUNCTION get_worker_node_connstr(node_id int) RETURNS text as $$
+CREATE FUNCTION get_worker_node_connstr(node_id int) RETURNS text AS $$
 DECLARE
 	connstr text := connstring FROM shardman.nodes WHERE id = node_id AND worker;
 BEGIN

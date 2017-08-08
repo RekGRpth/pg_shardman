@@ -141,7 +141,7 @@ BEGIN
 	raise INFO 'Booting master';
 	PERFORM shardman.create_meta_pub();
 
-	master_id := shardman.get_node_id();
+	master_id := shardman.my_id();
 	IF master_id IS NULL THEN
 		SELECT pg_settings.setting into master_connstring from pg_settings
 			WHERE NAME = 'shardman.master_connstring';
