@@ -157,6 +157,8 @@ BEGIN
 			'CREATE SUBSCRIPTION %I connection %L
 		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
 		prev_lname, prev_connstr, prev_lname, prev_lname);
+		-- If we have prev, we are replica
+		PERFORM shardman.readonly_replica_on(p_name::regclass);
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 

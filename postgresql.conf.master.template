@@ -2,5 +2,5 @@
 shardman.master = on
 shardman.master_dbname = ars
 shardman.master_connstring = 'port=5432'
-shardman.cmd_retry_naptime = 3000
-shardman.poll_interval = 3000
+shardman.cmd_retry_naptime = 500
+shardman.poll_interval = 500
