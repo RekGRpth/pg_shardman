@@ -262,6 +262,8 @@ DECLARE
 	sub record;
 	rs record;
 BEGIN
+	RAISE DEBUG '[SHARDMAN %] pg_shardman is dropping, cleaning up', shardman.my_id();
+
 	FOR pub IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'shardman_%' LOOP
 		EXECUTE format('DROP PUBLICATION %I', pub.pubname);
 	END LOOP;
@@ -274,8 +276,10 @@ BEGIN
 		WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
 		PERFORM shardman.drop_repslot(rs.slot_name, true);
 	END LOOP;
-	-- TODO: remove only shardman's standbys
 	IF shardman.my_id() IS NOT NULL THEN
+		-- otherwise we will hang
+		SET LOCAL synchronous_commit TO local;
+		-- TODO: remove only shardman's standbys
 		PERFORM shardman.set_sync_standbys('');
 	END IF;
 
@@ -285,5 +289,5 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION pg_shardman_cleanup_c() RETURNS event_trigger
     AS 'pg_shardman' LANGUAGE C;
 CREATE EVENT TRIGGER cleanup_lr_trigger ON ddl_command_start
-	WHEN TAG in ('DROP EXTENSION')
+	WHEN TAG IN ('DROP EXTENSION')
 	EXECUTE PROCEDURE pg_shardman_cleanup_c();

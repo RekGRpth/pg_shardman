@@ -287,23 +287,6 @@ BEGIN
 		lname, oldtail_connstr, lname, lname);
 END $$ LANGUAGE plpgsql;
 
--- TODO
--- Update fdw according to new replica creation. We update it on newtail node --
--- its connstring to this part should include only primary and newtail itself,
--- and on all other nodes except oldtail, so they learn about new replica.
--- CREATE FUNCTION replica_created_update_fdw() RETURNS TRIGGER AS $$
--- BEGIN
-	-- RAISE DEBUG '[SHARDMAN] replica_created_update_fdw trigger called';
-	-- IF shardman.my_id() != NEW.prv THEN -- don't update on oldtail node
-		-- PERFORM shardman.update_fdw_server(NEW);
-	-- END IF;
-	-- RETURN NULL;
--- END $$ LANGUAGE plpgsql;
--- CREATE TRIGGER replica_created AFTER INSERT ON shardman.partitions
-	-- FOR EACH ROW WHEN (NEW.prv IS NOT NULL) EXECUTE PROCEDURE replica_created();
--- fire trigger only on worker nodes
--- ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER replica_created;
-
 -- Otherwise partitioned tables on worker nodes not will be dropped properly,
 -- see pathman's docs.
 ALTER EVENT TRIGGER pathman_ddl_trigger ENABLE ALWAYS;
@@ -656,7 +639,7 @@ BEGIN
 END $$ LANGUAGE plpgsql STRICT;
 
 CREATE FUNCTION get_data_lname(part_name text, pub_node int, sub_node int)
-	RETURNS text AS  'pg_shardman' LANGUAGE C;
+	RETURNS text AS  'pg_shardman' LANGUAGE C STRICT;
 
 -- Make sure that standby_name is present in synchronous_standby_names. If not,
 -- add it via ALTER SYSTEM and SIGHUP postmaster to reread conf.
@@ -667,26 +650,30 @@ BEGIN
 	IF newval IS NOT NULL THEN
 		RAISE DEBUG '[SHARDMAN] Adding standby %, new value is %', standby, newval;
 		PERFORM shardman.set_sync_standbys(newval);
-		PERFORM pg_reload_conf();
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION ensure_sync_standby_c(standby text) RETURNS text
-    AS 'pg_shardman' LANGUAGE C;
+    AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Remove 'standby' from synchronous_standby_names, if it is there, and SIGHUP
 -- postmaster.
-CREATE FUNCTION remove_sync_standby(standby text) RETURNS void as $$
+CREATE FUNCTION remove_sync_standby(standby text) RETURNS void AS $$
 DECLARE
 	newval text := shardman.remove_sync_standby_c(standby);
 BEGIN
 	IF newval IS NOT NULL THEN
 		RAISE DEBUG '[SHARDMAN] Removing standby %, new value is %', standby, newval;
 		PERFORM shardman.set_sync_standbys(newval);
-		PERFORM pg_reload_conf();
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION remove_sync_standby_c(standby text) RETURNS text
-	AS 'pg_shardman' LANGUAGE C;
+	AS 'pg_shardman' LANGUAGE C STRICT;
 
-CREATE FUNCTION set_sync_standbys(standby text) RETURNS void
-	AS 'pg_shardman' LANGUAGE C;
+CREATE FUNCTION set_sync_standbys(standby text) RETURNS void AS $$
+BEGIN
+	PERFORM pg_reload_conf();
+	PERFORM shardman.set_sync_standbys_c(standby);
+	RAISE DEBUG '[SHARDMAN] sync_standbys set to %', standby;
+END $$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION set_sync_standbys_c(standby text) RETURNS void
+	AS 'pg_shardman' LANGUAGE C STRICT;

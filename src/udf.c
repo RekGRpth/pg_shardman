@@ -402,9 +402,9 @@ remove_sync_standby_c(PG_FUNCTION_ARGS)
  * transaction, so we resort to another exquisite hack: we connect to
  * ourselves via libpq and perform the job.
  */
-PG_FUNCTION_INFO_V1(set_sync_standbys);
+PG_FUNCTION_INFO_V1(set_sync_standbys_c);
 Datum
-set_sync_standbys(PG_FUNCTION_ARGS)
+set_sync_standbys_c(PG_FUNCTION_ARGS)
 {
 	char *standbys = quote_literal_cstr(text_to_cstring(PG_GETARG_TEXT_PP(0)));
 	char *cmd = psprintf("alter system set synchronous_standby_names to %s",
