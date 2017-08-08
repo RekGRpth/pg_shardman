@@ -44,11 +44,7 @@
  * wrapper which will continiously try to create subscription if it fails.
  * Besides, there is no way to create logical replication slot if current trxn
  * had written something, and so it is impossible to do that from trigger on
- * update. Finally, it is a pretty bad idea to add entry to
- * synchronous_standy_names (obviously non-transactional action) from the
- * transaction that wrote something, because if remote end is not up, such
- * transaction will hang forever during the commit. The moral is that we
- * manage LR only manually.
+ * update. The moral is that we manage LR only manually.
  *
  * As always, implementations must be written atomically, so that if anything
  * reboots, things are not broken. This requires special attention while
@@ -407,9 +403,6 @@ void
 init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 			  int32 dst_node)
 {
-	char *prev_dst_lname;
-	char *dst_next_lname;
-
 	/* Set up fields neccesary to call init_cp_state */
 	mps->cp.part_name = part_name;
 	if (src_node == SHMN_INVALID_NODE_ID)
@@ -479,32 +472,17 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 		mps->cp.dst_node, part_name, mps->cp.src_node,
 		mps->cp.dst_node, part_name, mps->cp.src_node);
 
-	/*
-	 * Note the careful placement of ensure_sync_standby's. They will
-	 * immediately block the database, because we firstly create pub &
-	 * repslots along with calling those, and only then create subs. We
-	 * execute them in separate transactions to allow other changes commit.
-	 */
 	if (mps->prev_node != SHMN_INVALID_NODE_ID)
 	{
-		prev_dst_lname = get_data_lname_cstr(part_name, mps->prev_node,
-										  mps->cp.dst_node);
 		mps->prev_sql = psprintf(
-			"begin; select shardman.part_moved_prev('%s', %d, %d); end;"
-			" select shardman.ensure_sync_standby('%s');",
-			part_name, mps->cp.src_node, mps->cp.dst_node,
-			prev_dst_lname);
+			"select shardman.part_moved_prev('%s', %d, %d);",
+			part_name, mps->cp.src_node, mps->cp.dst_node);
 	}
 	mps->dst_sql = psprintf(
-		"begin; select shardman.part_moved_dst('%s', %d, %d); end;",
+		"select shardman.part_moved_dst('%s', %d, %d);",
 		part_name, mps->cp.src_node, mps->cp.dst_node);
 	if (mps->next_node != SHMN_INVALID_NODE_ID)
 	{
-		dst_next_lname = get_data_lname_cstr(part_name, mps->cp.dst_node,
-											 mps->next_node);
-		mps->dst_sql = psprintf(
-			"%s select shardman.ensure_sync_standby('%s');",
-			mps->dst_sql, dst_next_lname);
 		mps->next_sql = psprintf(
 			"select shardman.part_moved_next('%s', %d, %d);",
 			part_name, mps->cp.src_node, mps->cp.dst_node);
@@ -538,7 +516,6 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 {
 	char *sql;
 	uint64 shard_exists;
-	char *lname;
 
 	/* Check that table with such name is not already exists on dst node */
 	sql = psprintf(
@@ -580,7 +557,6 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 	crs->drop_cp_sub_sql = psprintf(
 		"select shardman.replica_created_drop_cp_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
-	lname = get_data_lname_cstr(part_name, crs->cp.src_node, crs->cp.dst_node);
 	/*
 	 * Separate trxn for ensure_sync_standby as in init_mp_state. It is
 	 * interesting that while I got expected behaviour (hanged transaction) in
@@ -589,9 +565,8 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 	 * settings are not getting reloaded, but not sure why.
 	 */
 	crs->create_data_pub_sql = psprintf(
-		"begin; select shardman.replica_created_create_data_pub('%s', %d, %d); end;"
-		" select shardman.ensure_sync_standby('%s');",
-		part_name, crs->cp.src_node, crs->cp.dst_node, lname);
+		"select shardman.replica_created_create_data_pub('%s', %d, %d);",
+		part_name, crs->cp.src_node, crs->cp.dst_node);
 	crs->create_data_sub_sql = psprintf(
 		"select shardman.replica_created_create_data_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
@@ -1379,29 +1354,6 @@ void configure_retry(CopyPartState *cps, int millis)
 			  cps->part_name, millis);
 	cps->waketm = timespec_now_plus_millis(millis);
 	cps->exec_res = TASK_WAKEMEUP;
-}
-
-/*
- * Convention about pub, repslot, sub and application_name used for data
- * replication. We recreate sub while switching pub and recreate pub when
- * switching sub, so including both in the name. See top comment on why we
- * don't reuse pubs and subs.
- */
-char *
-get_data_lname_cstr(const char *part_name, int32 pub_node, int32 sub_node)
-{
-	return psprintf("shardman_data_%s_%d_%d", part_name, pub_node, sub_node);
-}
-/* SQL interface to it */
-PG_FUNCTION_INFO_V1(get_data_lname);
-Datum
-get_data_lname(PG_FUNCTION_ARGS)
-{
-	char *part_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	int32 pub_node = PG_GETARG_INT32(1);
-	int32 sub_node = PG_GETARG_INT32(2);
-	PG_RETURN_TEXT_P(cstring_to_text(
-						 get_data_lname_cstr(part_name, pub_node, sub_node)));
 }
 
 /*

@@ -117,6 +117,10 @@ BEGIN
 	-- Create publication for new data channel prev replica -> dst, make it sync
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
 	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, p_name);
+	-- This is neccessary since sub is not created, and with sync commit we will
+	-- hang forever
+	SET LOCAL synchronous_commit TO local;
+	PERFORM shardman.ensure_sync_standby(lname);
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Executed on node with new part, see mp_rebuild_lr
@@ -139,6 +143,10 @@ BEGIN
 		EXECUTE format('DROP PUBLICATION IF EXISTS %I', next_lname);
 		EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
 					   next_lname, p_name);
+		-- This is neccessary since sub is not created, and with sync commit we will
+		-- hang forever
+		SET LOCAL synchronous_commit TO local;
+		PERFORM shardman.ensure_sync_standby(next_lname);
 	END IF;
 
 	IF prev_rep IS NOT NULL THEN -- we need to setup channel prev replica -> dst
@@ -257,14 +265,17 @@ DECLARE
 	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
 BEGIN
 	-- Repslot for new data channel. Must be first, since we "cannot create
-	-- logical replication slot in transaction that has performed writes"
+	-- logical replication slot in transaction that has performed writes".
 	PERFORM shardman.create_repslot(lname);
 	-- Drop publication & repslot used for copy
 	PERFORM shardman.drop_repslot_and_pub(cp_logname);
 	-- Create publication for new data channel
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
 	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, part_name);
-	-- Make this channel sync
+	-- Make this channel sync.
+	-- This is neccessary since sub is not created, and with sync commit we will
+	-- hang forever.
+	SET LOCAL synchronous_commit TO local;
 	PERFORM shardman.ensure_sync_standby(lname);
 	-- Now it is safe to make old tail writable again
 	PERFORM shardman.readonly_table_off(part_name::regclass);
@@ -638,8 +649,17 @@ BEGIN
 	RETURN format('shardman_copy_%s_%s_%s', part_name, src, dst);
 END $$ LANGUAGE plpgsql STRICT;
 
+/*
+ * Convention about pub, repslot, sub and application_name used for data
+ * replication. We recreate sub while switching pub and recreate pub when
+ * switching sub, so including both in the name. See top comment on why we
+ * don't reuse pubs and subs.
+ */
 CREATE FUNCTION get_data_lname(part_name text, pub_node int, sub_node int)
-	RETURNS text AS  'pg_shardman' LANGUAGE C STRICT;
+	RETURNS name AS $$
+BEGIN
+	RETURN format('shardman_data_%s_%s_%s', part_name, pub_node, sub_node);
+END $$ LANGUAGE plpgsql STRICT;
 
 -- Make sure that standby_name is present in synchronous_standby_names. If not,
 -- add it via ALTER SYSTEM and SIGHUP postmaster to reread conf.
