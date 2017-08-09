@@ -631,6 +631,18 @@ CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 -- Other funcs
 ------------------------------------------------------------
 
+-- Drop (locally) all partitions of given table, if they exist
+CREATE OR REPLACE FUNCTION drop_parts(relation text, partitions_count int)
+	RETURNS void as $$
+DECLARE
+	r record;
+BEGIN
+	FOR r IN SELECT part_name
+		FROM shardman.gen_part_names(relation, partitions_count) LOOP
+		EXECUTE format('DROP TABLE IF EXISTS %I;', r.part_name);
+	END LOOP;
+END $$ LANGUAGE plpgsql STRICT;
+
 -- generate one-column table with partition names as 'tablename'_'partnum''suffix'
 CREATE FUNCTION gen_part_names(relation text, partitions_count int,
 							   suffix text DEFAULT '')

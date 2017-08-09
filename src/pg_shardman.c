@@ -208,6 +208,8 @@ shardmaster_main(Datum main_arg)
 				create_replica(cmd);
 			else if (strcmp(cmd->cmd_type, "rebalance") == 0)
 				rebalance(cmd);
+			else if (strcmp(cmd->cmd_type, "set_replevel") == 0)
+				set_replevel(cmd);
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
@@ -996,4 +998,45 @@ get_parts(const char *relation, uint64 *num_parts)
 
 	SPI_EPILOG;
 	return parts;
+}
+
+/*
+ * Calculate how many replicas has each partitions of given relation
+ */
+RepCount *
+get_repcount(const char *relation, uint64 *num_parts)
+{
+	char *sql;
+	bool isnull;
+	RepCount *repcounts;
+	TupleDesc rowdesc;
+	MemoryContext spicxt;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	uint64 i;
+
+	SPI_PROLOG;
+	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
+		"select part_name, count(case when prv is not null then 1 end) from"
+		" shardman.partitions where relation = '%s' group by part_name;",
+		relation);
+
+	if (SPI_execute(sql, true, 0) < 0)
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+	rowdesc = SPI_tuptable->tupdesc;
+
+	*num_parts = SPI_processed;
+	/* We need to allocate in our ctxt, not spi's */
+	spicxt = MemoryContextSwitchTo(oldcxt);
+	repcounts = palloc(sizeof(RepCount) * (*num_parts));
+	for (i = 0; i < *num_parts; i++)
+	{
+		HeapTuple tuple = SPI_tuptable->vals[i];
+		repcounts[i].part_name = SPI_getvalue(tuple, rowdesc, 1);
+		repcounts[i].count = DatumGetInt64(SPI_getbinval(tuple, rowdesc, 2,
+														 &isnull));
+	}
+	MemoryContextSwitchTo(spicxt);
+
+	SPI_EPILOG;
+	return repcounts;
 }

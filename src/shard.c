@@ -7,6 +7,8 @@
  */
 #include "postgres.h"
 
+#include <time.h>
+
 #include "copypart.h"
 #include "pg_shardman.h"
 #include "shard.h"
@@ -61,8 +63,10 @@ create_hash_partitions(Cmd *cmd)
 	 * we have a deadlock between pathman and pg_dump. pfree'd with ctxt
 	 */
 	sql = psprintf(
-		"begin; select create_hash_partitions('%s', '%s', %d); end;"
+		"begin; select shardman.drop_parts('%s', '%d');"
+		" select create_hash_partitions('%s', '%s', %d); end;"
 		"select shardman.gen_create_table_sql('%s', '%s');",
+		relation, partitions_count,
 		relation, expr, partitions_count,
 		relation, connstr);
 
@@ -197,10 +201,9 @@ rebalance(Cmd *cmd)
 	char *relation = cmd->opts[0];
 	uint64 num_workers;
 	int32 *workers = get_workers(&num_workers);
+	uint64 worker_idx;
 	uint64 num_parts;
 	Partition *parts = get_parts(relation, &num_parts);
-	uint64 i;
-	uint64 worker_idx;
 	uint64 part_idx;
 	CopyPartState **tasks = palloc(sizeof(CopyPartState*) * num_parts);
 
@@ -219,10 +222,6 @@ rebalance(Cmd *cmd)
 		update_cmd_status(cmd->id, "failed");
 		return;
 	}
-
-	shmn_elog(DEBUG1, "parts of %s are:", relation);
-	for (i = 0; i < num_parts; i++)
-		shmn_elog(DEBUG1, "%s on %d", parts[i].part_name, parts[i].owner);
 
 	for (part_idx = 0, worker_idx = 0; part_idx < num_parts; part_idx++)
 	{
@@ -243,5 +242,85 @@ rebalance(Cmd *cmd)
 		return;
 	}
 
+	shmn_elog(INFO, "Relation %s rebalanced:", relation);
 	update_cmd_status(cmd->id, "done");
+}
+
+/*
+ * Add replicas to parts of given relation until we reach replevel replicas
+ * for each one. Worker nodes are choosen in random manner.
+ */
+void
+set_replevel(Cmd *cmd)
+{
+	char *relation = cmd->opts[0];
+	uint32 replevel = atoi(cmd->opts[1]);
+	uint64 num_workers;
+	int32 *workers = get_workers(&num_workers);
+	uint64 num_parts;
+	RepCount *repcounts = NULL;
+	uint64 part_idx;
+	CopyPartState **tasks = NULL;
+	int ntasks;
+	int i;
+
+	if (num_workers == 0)
+	{
+		elog(WARNING, "Set replevel on table %s failed: no active workers",
+			 relation);
+		update_cmd_status(cmd->id, "failed");
+		return;
+	}
+
+	if (replevel > num_workers - 1)
+	{
+		elog(WARNING, "Set replevel on table %s: using replevel %ld instead of"
+			 "%d as we have only %ld active workers",
+			 relation, num_workers - 1, replevel, num_workers);
+		replevel = num_workers - 1;
+	}
+
+	srand(time(NULL));
+	/*
+	 * We can add only one replica per part in one exec_tasks; loop until
+	 * required number of replicas are reached.
+	 */
+	while (1948)
+	{
+		repcounts = get_repcount(relation, &num_parts);
+		tasks = palloc(sizeof(CopyPartState*) * num_parts);
+		ntasks = 0;
+
+		for (part_idx = 0; part_idx < num_parts; part_idx++)
+		{
+			RepCount rc = repcounts[part_idx];
+			if (rc.count < replevel)
+			{
+				CreateReplicaState *crs = palloc0(sizeof(CreateReplicaState));
+				init_cr_state(crs, rc.part_name, workers[rand() % num_workers]);
+				tasks[ntasks] = (CopyPartState *) crs;
+				ntasks++;
+			}
+		}
+
+		if (ntasks == 0)
+			break;
+
+		exec_tasks(tasks, ntasks);
+		check_for_sigterm();
+		if (got_sigusr1)
+		{
+			cmd_canceled(cmd);
+			return;
+		}
+
+		pfree(repcounts);
+		for (i = 0; i < ntasks; i++)
+			pfree(tasks[i]);
+		pfree(tasks);
+	}
+
+	shmn_elog(INFO, "Relation %s now has at least %d replicas", relation,
+			  replevel);
+	update_cmd_status(cmd->id, "success");
 }

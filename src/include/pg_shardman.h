@@ -45,6 +45,12 @@ typedef struct Partition
 	int32 owner;
 } Partition;
 
+typedef struct RepCount
+{
+	char *part_name;
+	int64 count;
+} RepCount;
+
 extern void _PG_init(void);
 extern void shardmaster_main(Datum main_arg);
 extern void check_for_sigterm(void);
@@ -59,5 +65,6 @@ extern int32 get_next_node(const char *part_name, int32 node_id);
 extern int32 get_prev_node(const char *part_name, int32 node_id, bool *part_exists);
 extern char *get_partition_relation(const char *part_name);
 extern Partition *get_parts(const char *relation, uint64 *num_parts);
+extern RepCount *get_repcount(const char *relation, uint64 *num_parts);
 
 #endif							/* PG_SHARDMAN_H */

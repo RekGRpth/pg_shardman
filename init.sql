@@ -24,7 +24,8 @@ $$;
 
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_part', 'create_replica', 'rebalance');
+						 'move_part', 'create_replica', 'rebalance',
+						 'set_replevel');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
 								'success', 'done');
@@ -142,6 +143,20 @@ BEGIN
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
 	RETURN c_id;
 END $$ LANGUAGE plpgsql;
+
+-- Add replicas to partitions of table 'relation' until we reach replevel
+-- replicas for each one. Note that it is pointless to set replevel to more than
+-- number of active workers - 1. Replica deletions is not implemented yet.
+CREATE FUNCTION set_replevel(relation text, replevel int) RETURNS int AS $$
+DECLARE
+	c_id int;
+BEGIN
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'set_replevel')
+										   RETURNING id INTO c_id;
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, replevel);
+	RETURN c_id;
+END $$ LANGUAGE plpgsql STRICT;
 
 -- Internal functions
 
