@@ -24,10 +24,10 @@ $$;
 
 -- available commands
 CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_part', 'create_replica');
+						 'move_part', 'create_replica', 'rebalance');
 -- command status
 CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
-								'success');
+								'success', 'done');
 
 CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
@@ -82,17 +82,22 @@ $$ LANGUAGE plpgsql;
 -- Shard table with hash partitions. Params as in pathman, except for relation
 -- (master doesn't know oid of the table)
 CREATE FUNCTION create_hash_partitions(
-	node_id int, expr text, relation text, partitions_count int)
-	RETURNS void AS $$
+	node_id int, relation text, expr text, partitions_count int,
+	rebalance bool DEFAULT true)
+	RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'create_hash_partitions')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, expr);
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, expr);
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, partitions_count);
+	IF rebalance THEN
+		PERFORM shardman.rebalance(relation);
+	END IF;
+	RETURN c_id;
 END
 $$ LANGUAGE plpgsql;
 
@@ -124,6 +129,17 @@ BEGIN
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
+	RETURN c_id;
+END $$ LANGUAGE plpgsql;
+
+-- Evenly distribute partitions of table 'relation' across all nodes.
+CREATE FUNCTION rebalance(relation text) RETURNS int AS $$
+DECLARE
+	c_id int;
+BEGIN
+	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'rebalance')
+										   RETURNING id INTO c_id;
+	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
 	RETURN c_id;
 END $$ LANGUAGE plpgsql;
 

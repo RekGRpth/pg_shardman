@@ -71,9 +71,9 @@ function run_demo()
     psql -c "select shardman.add_node('port=5436');"
 
     psql -p 5433 -c "drop table if exists pt_0;" # drop replica
-    psql -c "select shardman.create_hash_partitions(2, 'pt', 'id', 2);"
+    psql -c "select shardman.create_hash_partitions(2, 'pt', 'id', 6);"
 
-    psql -c "select shardman.create_replica('pt_0', 3);"
-    psql -c "select shardman.create_replica('pt_0', 5);"
-    psql -c "select shardman.move_part('pt_0', 4, 3);"
+    # psql -c "select shardman.create_replica('pt_0', 3);"
+    # psql -c "select shardman.create_replica('pt_0', 5);"
+    # psql -c "select shardman.move_part('pt_0', 4, 3);"
 }

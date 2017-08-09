@@ -1,8 +1,9 @@
 /* -------------------------------------------------------------------------
  *
- * shardmaster.c
- *		Background worker accepting sharding tasks for execution and common
- *		routines.
+ * pg_shardman.c
+ *		This module contains background worker accepting sharding tasks for
+ *		execution, membership commands implementation and common routines for
+ *		quering the metadata.
  *
  * -------------------------------------------------------------------------
  */
@@ -205,6 +206,8 @@ shardmaster_main(Datum main_arg)
 				move_part(cmd);
 			else if (strcmp(cmd->cmd_type, "create_replica") == 0)
 				create_replica(cmd);
+			else if (strcmp(cmd->cmd_type, "rebalance") == 0)
+				rebalance(cmd);
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
 		}
@@ -741,6 +744,42 @@ get_worker_node_connstr(int32 node_id)
 }
 
 /*
+ * Get array with all active worker nodes ids. Memory is palloced, size is
+ * returned in 'num_workers'
+ */
+int32 *
+get_workers(uint64 *num_workers)
+{
+	char *sql = "select id from shardman.nodes where worker_status = 'active'";
+	bool isnull;
+	int32 *workers;
+	TupleDesc rowdesc;
+	MemoryContext spicxt;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	uint64 i;
+
+	SPI_PROLOG;
+
+	if (SPI_execute(sql, true, 0) < 0)
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+	rowdesc = SPI_tuptable->tupdesc;
+
+	*num_workers = SPI_processed;
+	/* We need to allocate in our ctxt, not spi's */
+	spicxt = MemoryContextSwitchTo(oldcxt);
+	workers = palloc(sizeof(int32) * (*num_workers));
+	MemoryContextSwitchTo(spicxt);
+	for (i = 0; i < *num_workers; i++)
+	{
+		workers[i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+												 rowdesc, 1, &isnull));
+	}
+
+	SPI_EPILOG;
+	return workers;
+}
+
+/*
  * Get node id on which given primary is stored. SHMN_INVALID_NODE_ID is
  * returned if there is no such primary.
  */
@@ -916,4 +955,45 @@ get_partition_relation(const char *part_name)
 
 	SPI_EPILOG;
 	return res;
+}
+
+/*
+ * Get array with all partitions of given relation. Memory is palloced, size
+ * is returned in 'numparts'.
+ */
+Partition *
+get_parts(const char *relation, uint64 *num_parts)
+{
+	char *sql;
+	bool isnull;
+	Partition *parts;
+	TupleDesc rowdesc;
+	MemoryContext spicxt;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	uint64 i;
+
+	SPI_PROLOG;
+	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
+		"select part_name, owner from shardman.partitions where relation = '%s';",
+		relation);
+
+	if (SPI_execute(sql, true, 0) < 0)
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+	rowdesc = SPI_tuptable->tupdesc;
+
+	*num_parts = SPI_processed;
+	/* We need to allocate in our ctxt, not spi's */
+	spicxt = MemoryContextSwitchTo(oldcxt);
+	parts = palloc(sizeof(Partition) * (*num_parts));
+	for (i = 0; i < *num_parts; i++)
+	{
+		HeapTuple tuple = SPI_tuptable->vals[i];
+		parts[i].part_name = SPI_getvalue(tuple, rowdesc, 1);
+		parts[i].owner = DatumGetInt32(SPI_getbinval(tuple, rowdesc, 2,
+													 &isnull));
+	}
+	MemoryContextSwitchTo(spicxt);
+
+	SPI_EPILOG;
+	return parts;
 }

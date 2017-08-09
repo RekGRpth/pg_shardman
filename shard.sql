@@ -375,11 +375,11 @@ BEGIN
 											owner = me INTO my_part;
 	IF my_part.part_name IS NOT NULL THEN -- we are holding the part
 		IF my_part.prv IS NULL THEN
-			RAISE DEBUG '[SHARDMAN %] we are holding primary for part %s, not updating fdw server for it',
+			RAISE DEBUG '[SHARDMAN %] we are holding primary for part %, not updating fdw server for it',
 			me, part.part_name;
 			RETURN;
 		ELSE
-			RAISE DEBUG '[SHARDMAN %] we are holding replica for part %s, updating fdw server for it',
+			RAISE DEBUG '[SHARDMAN %] we are holding replica for part %, updating fdw server for it',
 			me, part.part_name;
 		END IF;
 	END IF;

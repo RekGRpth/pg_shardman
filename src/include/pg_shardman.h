@@ -39,6 +39,12 @@ typedef struct Cmd
 	char **opts; /* array of n options, opts[n] is NULL */
 } Cmd;
 
+typedef struct Partition
+{
+	char *part_name;
+	int32 owner;
+} Partition;
+
 extern void _PG_init(void);
 extern void shardmaster_main(Datum main_arg);
 extern void check_for_sigterm(void);
@@ -46,10 +52,12 @@ extern uint64 void_spi(char *sql);
 extern void update_cmd_status(int64 id, const char *new_status);
 extern void cmd_canceled(Cmd *cmd);
 extern char *get_worker_node_connstr(int32 node_id);
+extern int32 *get_workers(uint64 *num_workers);
 extern int32 get_primary_owner(const char *part_name);
 extern int32 get_reptail_owner(const char *part_name);
 extern int32 get_next_node(const char *part_name, int32 node_id);
 extern int32 get_prev_node(const char *part_name, int32 node_id, bool *part_exists);
 extern char *get_partition_relation(const char *part_name);
+extern Partition *get_parts(const char *relation, uint64 *num_parts);
 
 #endif							/* PG_SHARDMAN_H */

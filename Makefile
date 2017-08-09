@@ -6,7 +6,7 @@ DATA_built = $(EXTENSION)--$(EXTVERSION).sql
 
 
 MODULE_big = pg_shardman
-OBJS = src/pg_shardman.o src/udf.o src/shard.o src/timeutils.o \
+OBJS = src/pg_shardman.o src/udf.o src/shard.o src/copypart.o src/timeutils.o \
        src/shardman_hooks.o
 
 PG_CPPFLAGS += -Isrc/include
