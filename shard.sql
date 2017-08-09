@@ -632,7 +632,7 @@ CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 ------------------------------------------------------------
 
 -- Drop (locally) all partitions of given table, if they exist
-CREATE OR REPLACE FUNCTION drop_parts(relation text, partitions_count int)
+CREATE FUNCTION drop_parts(relation text, partitions_count int)
 	RETURNS void as $$
 DECLARE
 	r record;

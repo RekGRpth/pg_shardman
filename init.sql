@@ -59,24 +59,26 @@ CREATE TABLE cmd_opts (
 -- Interface functions
 
 -- Add a node. Its state will be reset, all shardman data lost.
-CREATE FUNCTION add_node(connstring text) RETURNS void AS $$
+CREATE FUNCTION add_node(connstring text) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'add_node')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, connstring);
+	RETURN c_id;
 END
 $$ LANGUAGE plpgsql;
 
 -- Remove node. Its state will be reset, all shardman data lost.
-CREATE FUNCTION rm_node(node_id int) RETURNS void AS $$
+CREATE FUNCTION rm_node(node_id int) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'rm_node')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
+	RETURN c_id;
 END
 $$ LANGUAGE plpgsql;
 

@@ -152,7 +152,7 @@ _PG_init()
 		shardmaster_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
 		shardmaster_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-		shardmaster_worker.bgw_restart_time = 10;
+		shardmaster_worker.bgw_restart_time = shardman_cmd_retry_naptime;
 		/* shardmaster_worker.bgw_restart_time = BGW_NEVER_RESTART; */
 		sprintf(shardmaster_worker.bgw_library_name, "pg_shardman");
 		sprintf(shardmaster_worker.bgw_function_name, "shardmaster_main");
@@ -401,14 +401,13 @@ pg_shardman_installed_local(void)
 	if (get_extension_oid("pg_shardman", true) == InvalidOid)
 	{
 		installed = false;
-		shmn_elog(WARNING, "pg_shardman library is preloaded, but extenstion"
-				  " is not created");
+		shmn_elog(WARNING, "pg_shardman library is preloaded on shardlord, but"
+				  " extenstion is not created");
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	/* shardmaster won't run without extension */
-	/* TODO: unregister bgw? */
 	if (!installed)
 		proc_exit(1);
 }

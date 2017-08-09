@@ -1,1 +1,4 @@
-# worker-specific part
+# At least number of shards with 'prev' replica + reserve for initial tablesync.
+max_logical_replication_workers = 50
+# At least max_logical_replication_workers + 1
+max_worker_processes = 60
