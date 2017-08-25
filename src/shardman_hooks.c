@@ -15,7 +15,7 @@
 emit_log_hook_type log_hook_next;
 
 /*
- * Add [SHNODE x] where x is node id to each log message, if '%z' is in
+ * Add [SHARDMAN x] where x is node id to each log message, if '%z' is in
  * log_line_prefix. Seems like there is no way to hook something into
  * prefix iself without touching core code.
  * TODO: In some, probably most interesting cases this hook is not called :(
@@ -34,7 +34,7 @@ shardman_log_hook(ErrorData *edata)
 	{
 		oldcontext = MemoryContextSwitchTo(edata->assoc_context);
 
-		edata->message = psprintf("[SHNODE %d] %s",
+		edata->message = psprintf("[SHARDMAN %d] %s",
 								  shardman_my_node_id, edata->message);
 
 		MemoryContextSwitchTo(oldcontext);

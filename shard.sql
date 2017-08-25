@@ -188,8 +188,8 @@ DECLARE
 	src_next_lname text;
 BEGIN
 	ASSERT NEW.owner != OLD.owner, 'part_moved handles only moved parts';
-	RAISE DEBUG '[SHARDMAN] part_moved trigger called for part %, owner % -> %',
-		NEW.part_name, OLD.owner, NEW.owner;
+	RAISE DEBUG '[SHARDMAN %] part_moved trigger called for part %, owner % -> %',
+		me, NEW.part_name, OLD.owner, NEW.owner;
 	ASSERT NEW.nxt = OLD.nxt OR (NEW.nxt IS NULL AND OLD.nxt IS NULL),
 		'both part and replica must not be moved in one update';
 	ASSERT NEW.prv = OLD.prv OR (NEW.prv IS NULL AND OLD.prv IS NULL),
@@ -222,6 +222,8 @@ BEGIN
 		EXECUTE format('DROP TABLE IF EXISTS %I', NEW.part_name);
 
 	ELSEIF me = NEW.owner THEN -- dst node
+		RAISE DEBUG '[SHARDMAN %] part_moved trigger on dst node',
+			me;
 		-- Drop subscription used for copy
 		PERFORM shardman.eliminate_sub(cp_logname);
 		-- If primary part was moved, replace moved table with foreign one

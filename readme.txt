@@ -11,8 +11,9 @@ First, some terminology:
 'cluster' -- the whole system of shardlord and workers, or cluster in PostgreSQL
   sense, this should be clear from the context.
 
-For quick setup, see scripts in bin/directory. Setup is configured in file
-common.sh. shardman_init.sh performs initdb for shardlord & workers, deploys
+For quick setup, see scripts in bin/ directory. Setup is configured in file
+setup.sh which needs to be placed in the same directory; see setup.sh.example
+for example. shardman_init.sh performs initdb for shardlord & workers, deploys
 example configs and creates extension; shardman_start.sh reinstalls extension,
 which is useful for development.
 
@@ -147,7 +148,8 @@ Move shard 'part_name' from node 'dest' to node 'src'. If src is NULL, primary
 shard is moved. Cmd fails if there is already replica of this shard on 'dest'.
 
 create_replica(part_name text, dest int)
-Create replica of shard 'part_name' on node 'dest'. Cmd fails if there is already replica of this shard on 'dest'.
+Create replica of shard 'part_name' on node 'dest'. Cmd fails if there is already
+replica of this shard on 'dest'.
 
 rebalance(relation text)
 Evenly distribute partitions of table 'relation' across all nodes. Currently
@@ -169,6 +171,7 @@ creation -- one for each time random chooses node with already existing replica.
 Sharded tables dropping, as well as replica deletion is not implemented yet.
 
 Limitations:
+* We are bound to Linux since we use epoll, select should be added.
 * We can't switch shardlord for now.
 * The shardlord itself can't be worker node for now.
 * ALTER TABLE for sharded tables is not supported.
