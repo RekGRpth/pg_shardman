@@ -1,9 +1,10 @@
 comment = 'Postgresql sharding via pg_pathman, postgres_fdw, LR and others'
 # CREATE EXTENSION will run extname--version.sql file
 default_version = '0.0.1'
-# TODO: make it relocatable; for that, we need
+# TODO: make ext relocatable at least during installation. For that, we need to
 # * learn the scheme when connecting from another node
-# * somehow avoid @extschema@ at init sql at all
+# * add @extschema@ to search path where needed, e.g. in all trigger funcs
+# * Prepend schema name to all shardman funcs calls from C code
 relocatable = false
 schema = shardman
 requires = 'pg_pathman, postgres_fdw'
