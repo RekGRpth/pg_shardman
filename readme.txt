@@ -1,15 +1,14 @@
 First, some terminology:
 'shardlord' or 'lord' is postgres instance and background process (bgw) spinning
-  on it which manages sharding. In some places it is still called 'shardmaster'
-  or 'master'.
+  on it which manages sharding.
 'worker nodes' or 'workers' are other nodes with data.
 'sharded table' is table managed by shardman.
 'shard' or 'partition' is any table containing part of sharded table.
 'primary' is main partition of sharded table, i.e. the only writable
   partition.
 'replica' is secondary partition of sharded table, i.e. read-only partition.
-'cluster' -- the whole system of shardlord and workers, or cluster in PostgreSQL
-  sense, this should be clear from the context.
+'cluster' -- either the whole system of shardlord and workers, or cluster in
+  traditional PostgreSQL sense, this should be clear from the context.
 
 For quick setup, see scripts in bin/ directory. Setup is configured in file
 setup.sh which needs to be placed in the same directory; see setup.sh.example

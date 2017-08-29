@@ -49,9 +49,9 @@ CREATE TRIGGER new_table_worker_side AFTER INSERT ON shardman.tables
 	FOR EACH ROW EXECUTE PROCEDURE new_table_worker_side();
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.tables ENABLE REPLICA TRIGGER new_table_worker_side;
--- On master side, insert partitions.
+-- On lord side, insert partitions.
 -- All of them are primary and have no prev or nxt.
-CREATE FUNCTION new_table_master_side() RETURNS TRIGGER AS $$
+CREATE FUNCTION new_table_lord_side() RETURNS TRIGGER AS $$
 BEGIN
 	INSERT INTO shardman.partitions
 	SELECT part_name, NEW.initial_node AS owner, NULL, NULL, NEW.relation AS relation
@@ -61,8 +61,8 @@ BEGIN
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
-CREATE TRIGGER new_table_master_side AFTER INSERT ON shardman.tables
-	FOR EACH ROW EXECUTE PROCEDURE new_table_master_side();
+CREATE TRIGGER new_table_lord_side AFTER INSERT ON shardman.tables
+	FOR EACH ROW EXECUTE PROCEDURE new_table_lord_side();
 
 ------------------------------------------------------------
 -- Partitions

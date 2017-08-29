@@ -22,9 +22,9 @@ extern volatile sig_atomic_t got_sigterm;
 extern volatile sig_atomic_t got_sigusr1;
 
 /* GUC variables */
-extern bool shardman_master;
-extern char *shardman_master_dbname;
-extern char *shardman_master_connstring;
+extern bool shardman_shardlord;
+extern char *shardman_shardlord_dbname;
+extern char *shardman_shardlord_connstring;
 extern int shardman_cmd_retry_naptime;
 extern int shardman_poll_interval;
 
@@ -52,7 +52,7 @@ typedef struct RepCount
 } RepCount;
 
 extern void _PG_init(void);
-extern void shardmaster_main(Datum main_arg);
+extern void shardlord_main(Datum main_arg);
 extern void check_for_sigterm(void);
 extern uint64 void_spi(char *sql);
 extern void update_cmd_status(int64 id, const char *new_status);

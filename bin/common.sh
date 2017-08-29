@@ -13,13 +13,13 @@ function start_nodes()
 	port="${worker_ports[i]}"
 	pg_ctl -o "-p $port" -D $datadir  -l $logfile start
     done
-    pg_ctl -o "-p $master_port" -D $master_datadir -l $logfile start
+    pg_ctl -o "-p $lord_port" -D $lord_datadir -l $logfile start
 }
 
 function stop_nodes()
 {
     echo "Stopping nodes"
-    for datadir in $master_datadir "${worker_datadirs[@]}"; do
+    for datadir in $lord_datadir "${worker_datadirs[@]}"; do
 	pg_ctl -D $datadir stop || true
     done
 }
@@ -32,5 +32,5 @@ function restart_nodes()
 	port="${worker_ports[i]}"
 	pg_ctl -o "-p $port" -D $datadir -l $logfile restart
     done
-    pg_ctl -o "-p $master_port" -D $master_datadir -l $logfile restart
+    pg_ctl -o "-p $lord_port" -D $lord_datadir -l $logfile restart
 }

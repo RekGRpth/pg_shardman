@@ -1,5 +1,5 @@
-shardman.master = on # this instance is shardlor?
-shardman.master_dbname = ars # lord's dbname
-shardman.master_connstring = 'port=5432' # lord's connstring
+shardman.shardlord = on # this instance is shardlord?
+shardman.shardlord_dbname = ars # shardlord's dbname
+shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
 shardman.cmd_retry_naptime = 500 # sleep milliseconds after failure
 shardman.poll_interval = 500 # long operations poll frequency

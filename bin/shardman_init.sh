@@ -16,21 +16,21 @@ make install
 > $logfile
 
 stop_nodes
-for datadir in $master_datadir "${worker_datadirs[@]}"; do
+for datadir in $lord_datadir "${worker_datadirs[@]}"; do
     rm -rf "$datadir"
     mkdir -p "$datadir"
     initdb -D "$datadir"
 done
 
-cat postgresql.conf.common.template >> ${master_datadir}/postgresql.conf
-cat postgresql.conf.lord.template >> ${master_datadir}/postgresql.conf
+cat postgresql.conf.common.template >> ${lord_datadir}/postgresql.conf
+cat postgresql.conf.lord.template >> ${lord_datadir}/postgresql.conf
 for worker_datadir in "${worker_datadirs[@]}"; do
     cat postgresql.conf.common.template >> ${worker_datadir}/postgresql.conf
     cat postgresql.conf.worker.template >> ${worker_datadir}/postgresql.conf
 done
 
 start_nodes
-for port in $master_port "${worker_ports[@]}"; do
+for port in $lord_port "${worker_ports[@]}"; do
     createdb -p $port `whoami`
     psql -p $port -c "create extension pg_shardman cascade;"
 done

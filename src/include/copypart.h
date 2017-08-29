@@ -31,8 +31,7 @@ typedef enum
 } ExecTaskRes;
 
 /*
- *  Current step of 1 master partition move. See comments to corresponding
- *  funcs, e.g. start_tablesync.
+ *  Current step of 1 partition move.
  */
 typedef enum
 {

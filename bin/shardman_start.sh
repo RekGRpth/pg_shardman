@@ -8,8 +8,8 @@ cd "${script_dir}/.."
 > $logfile
 
 restart_nodes # make sure nodes run
-# first workers, then master
-for port in "${worker_ports[@]}" $master_port; do
+# first workers, then lord
+for port in "${worker_ports[@]}" $lord_port; do
     psql -p $port -c "drop extension if exists pg_shardman cascade;"
 done
 
@@ -17,11 +17,11 @@ make clean
 make install
 
 restart_nodes
-for port in $master_port "${worker_ports[@]}"; do
+for port in $lord_port "${worker_ports[@]}"; do
     psql -p $port -c "create extension pg_shardman cascade;"
 done
 
-# to restart master bgw
+# to restart lord bgw
 restart_nodes
 
 run_demo

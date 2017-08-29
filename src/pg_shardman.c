@@ -39,8 +39,8 @@ PG_MODULE_MAGIC;
 static Cmd *next_cmd(void);
 static PGconn *listen_cmd_log_inserts(void);
 static void wait_notify(void);
-static void shardmaster_sigterm(SIGNAL_ARGS);
-static void shardmaster_sigusr1(SIGNAL_ARGS);
+static void shardlord_sigterm(SIGNAL_ARGS);
+static void shardlord_sigusr1(SIGNAL_ARGS);
 static void pg_shardman_installed_local(void);
 
 static void add_node(Cmd *cmd);
@@ -54,9 +54,9 @@ volatile sig_atomic_t got_sigterm = false;
 volatile sig_atomic_t got_sigusr1 = false;
 
 /* GUC variables */
-bool shardman_master;
-char *shardman_master_dbname;
-char *shardman_master_connstring;
+bool shardman_shardlord;
+char *shardman_shardlord_dbname;
+char *shardman_shardlord_connstring;
 int shardman_cmd_retry_naptime;
 int shardman_poll_interval;
 
@@ -74,7 +74,7 @@ int32 shardman_my_node_id = -1;
 void
 _PG_init()
 {
-	BackgroundWorker shardmaster_worker;
+	BackgroundWorker shardlord_bgw;
 	char *desc;
 
 	if (!process_shared_preload_libraries_in_progress)
@@ -87,21 +87,21 @@ _PG_init()
 	log_hook_next = emit_log_hook;
 	emit_log_hook = shardman_log_hook;
 
-	DefineCustomBoolVariable("shardman.master",
-							 "This node is the master?",
+	DefineCustomBoolVariable("shardman.shardlord",
+							 "This node is the shardlord?",
 							 NULL,
-							 &shardman_master,
+							 &shardman_shardlord,
 							 false,
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
-		"shardman.master_dbname",
-		"Active only if shardman.master is on. Name of the database with"
-		" on master node, shardmaster bgw will connect to it",
+		"shardman.shardlord_dbname",
+		"Active only if shardman.shardlord is on. Name of the database"
+		" on shardlord node, shardlord bgw will connect to it",
 		NULL,
-		&shardman_master_dbname,
+		&shardman_shardlord_dbname,
 		"postgres",
 		PGC_POSTMASTER,
 		0,
@@ -109,11 +109,11 @@ _PG_init()
 		);
 
 	DefineCustomStringVariable(
-		"shardman.master_connstring",
-		"Active only if shardman.master is on. Connstring to reach master from"
+		"shardman.shardlord_connstring",
+		"Active only if shardman.shardlord is on. Connstring to reach shardlord from"
 		"worker nodes to set up logical replication",
 		NULL,
-		&shardman_master_connstring,
+		&shardman_shardlord_connstring,
 		"",
 		PGC_POSTMASTER,
 		0,
@@ -145,44 +145,44 @@ _PG_init()
 							0,
 							NULL, NULL, NULL);
 
-	if (shardman_master)
+	if (shardman_shardlord)
 	{
-		/* register shardmaster */
-		sprintf(shardmaster_worker.bgw_name, "shardmaster");
-		shardmaster_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		/* register shardlord */
+		sprintf(shardlord_bgw.bgw_name, "shardlord");
+		shardlord_bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
-		shardmaster_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-		shardmaster_worker.bgw_restart_time = shardman_cmd_retry_naptime;
-		/* shardmaster_worker.bgw_restart_time = BGW_NEVER_RESTART; */
-		sprintf(shardmaster_worker.bgw_library_name, "pg_shardman");
-		sprintf(shardmaster_worker.bgw_function_name, "shardmaster_main");
-		shardmaster_worker.bgw_notify_pid = 0;
-		RegisterBackgroundWorker(&shardmaster_worker);
+		shardlord_bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		shardlord_bgw.bgw_restart_time = shardman_cmd_retry_naptime;
+		/* shardlord_bgw.bgw_restart_time = BGW_NEVER_RESTART; */
+		sprintf(shardlord_bgw.bgw_library_name, "pg_shardman");
+		sprintf(shardlord_bgw.bgw_function_name, "shardlord_main");
+		shardlord_bgw.bgw_notify_pid = 0;
+		RegisterBackgroundWorker(&shardlord_bgw);
 	}
-	/* TODO: clean up publications if we were master before */
+	/* TODO: clean up publications if we were shardlord before */
 }
 
 /*
- * shardmaster bgw starts here
+ * shardlord bgw starts here
  */
 void
-shardmaster_main(Datum main_arg)
+shardlord_main(Datum main_arg)
 {
 	Cmd *cmd;
-	shmn_elog(LOG, "Shardmaster started");
+	shmn_elog(LOG, "Shardlord started");
 
 	/* Connect to the database to use SPI*/
-	BackgroundWorkerInitializeConnection(shardman_master_dbname, NULL);
+	BackgroundWorkerInitializeConnection(shardman_shardlord_dbname, NULL);
 	/* sanity check */
 	pg_shardman_installed_local();
 
 	/* Establish signal handlers before unblocking signals. */
-	pqsignal(SIGTERM, shardmaster_sigterm);
-	pqsignal(SIGUSR1, shardmaster_sigusr1);
+	pqsignal(SIGTERM, shardlord_sigterm);
+	pqsignal(SIGUSR1, shardlord_sigusr1);
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
-	void_spi("select shardman.master_boot();");
+	void_spi("select shardman.lord_boot();");
 	conn = listen_cmd_log_inserts();
 
 	/* main loop */
@@ -246,7 +246,7 @@ listen_cmd_log_inserts(void)
 	char *connstr;
 	PGresult   *res;
 
-	connstr = psprintf("dbname = %s", shardman_master_dbname);
+	connstr = psprintf("dbname = %s", shardman_shardlord_dbname);
 	conn = PQconnectdb(connstr);
 	pfree(connstr);
 	/* Check to see that the backend connection was successfully made */
@@ -407,7 +407,7 @@ pg_shardman_installed_local(void)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	/* shardmaster won't run without extension */
+	/* shardlord won't run without extension */
 	if (!installed)
 		proc_exit(1);
 }
@@ -417,7 +417,7 @@ pg_shardman_installed_local(void)
  *		Set a flag to let the main loop to terminate.
  */
 void
-shardmaster_sigterm(SIGNAL_ARGS)
+shardlord_sigterm(SIGNAL_ARGS)
 {
 	got_sigterm = true;
 }
@@ -427,7 +427,7 @@ shardmaster_sigterm(SIGNAL_ARGS)
  *		Set a flag to let the main loop to terminate.
  */
 void
-shardmaster_sigusr1(SIGNAL_ARGS)
+shardlord_sigusr1(SIGNAL_ARGS)
 {
 	got_sigusr1 = true;
 }
@@ -440,7 +440,7 @@ check_for_sigterm(void)
 {
 	if (got_sigterm)
 	{
-		shmn_elog(LOG, "Shardmaster received SIGTERM, exiting");
+		shmn_elog(LOG, "Shardlord received SIGTERM, exiting");
 		if (conn != NULL)
 			PQfinish(conn);
 		proc_exit(0);
@@ -566,7 +566,7 @@ add_node(Cmd *cmd)
 			"publication shardman_meta_pub with (create_slot = false,"
 			"slot_name = 'shardman_meta_sub_%d');"
 			"select shardman.set_node_id(%d);",
-			shardman_master_connstring, node_id, node_id);
+			shardman_shardlord_connstring, node_id, node_id);
 		res = PQexec(conn, sql);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
@@ -640,7 +640,7 @@ static bool
 node_in_cluster(int id)
 {
 	char *sql = psprintf(
-		"select id from shardman.nodes where id = %d and (master OR"
+		"select id from shardman.nodes where id = %d and (shardlord OR"
 		" worker_status != 'add_in_progress');",
 		id);
 	bool res;

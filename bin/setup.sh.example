@@ -3,8 +3,8 @@ pathmanpath=~/postgres/pg_pathman
 install_pathman=false
 logfile=$HOME/tmp/tmp/tmp.log
 
-master_datadir=~/postgres/data1
-master_port=5432
+lord_datadir=~/postgres/data1
+lord_port=5432
 
 # declare -a worker_datadirs=()
 # declare -a worker_ports=()

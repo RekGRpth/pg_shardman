@@ -91,7 +91,7 @@ create_hash_partitions(Cmd *cmd)
 		}
 		create_table_sql = PQgetvalue(res, 0, 0);
 
-		/* TODO: if master fails at this moment (which is extremely unlikely
+		/* TODO: if lord fails at this moment (which is extremely unlikely
 		 * though), after restart it will try to partition table again and
 		 * fail. We should check if the table is already partitioned and don't
 		 * do that again, except for, probably, the case when it was

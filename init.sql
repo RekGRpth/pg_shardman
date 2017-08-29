@@ -36,8 +36,8 @@ CREATE TABLE cmd_log (
 	status cmd_status DEFAULT 'waiting' NOT NULL
 );
 
--- Notify shardman master bgw about new commands
-CREATE FUNCTION notify_shardmaster() RETURNS trigger AS $$
+-- Notify shardlord bgw about new commands
+CREATE FUNCTION notify_shardlord() RETURNS trigger AS $$
 BEGIN
 	NOTIFY shardman_cmd_log_update;
 	RETURN NULL;
@@ -45,7 +45,7 @@ END
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER cmd_log_inserts
 	AFTER INSERT ON cmd_log
-	FOR EACH STATEMENT EXECUTE PROCEDURE notify_shardmaster();
+	FOR EACH STATEMENT EXECUTE PROCEDURE notify_shardlord();
 
 -- probably better to keep opts in an array field, but working with arrays from
 -- libpq is not very handy
@@ -83,7 +83,7 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Shard table with hash partitions. Params as in pathman, except for relation
--- (master doesn't know oid of the table)
+-- (lord doesn't know oid of the table)
 CREATE FUNCTION create_hash_partitions(
 	node_id int, relation text, expr text, partitions_count int,
 	rebalance bool DEFAULT true)
@@ -162,39 +162,39 @@ END $$ LANGUAGE plpgsql STRICT;
 
 -- Internal functions
 
--- Called on shardmaster bgw start. Add itself to nodes table, set id, create
+-- Called on shardlord bgw start. Add itself to nodes table, set id, create
 -- publication.
-CREATE FUNCTION master_boot() RETURNS void AS $$
+CREATE FUNCTION lord_boot() RETURNS void AS $$
 DECLARE
-	-- If we have never booted as a master before, we have a work to do
-	init_master bool DEFAULT false;
-	master_connstring text;
-	master_id int;
+	-- If we have never booted as a lord before, we have a work to do
+	init_lord bool DEFAULT false;
+	lord_connstring text;
+	lord_id int;
 BEGIN
-	raise INFO 'Booting master';
+	raise INFO 'Booting lord';
 	PERFORM shardman.create_meta_pub();
 
-	master_id := shardman.my_id();
-	IF master_id IS NULL THEN
-		SELECT pg_settings.setting into master_connstring from pg_settings
-			WHERE NAME = 'shardman.master_connstring';
+	lord_id := shardman.my_id();
+	IF lord_id IS NULL THEN
+		SELECT pg_settings.setting INTO lord_connstring FROM pg_settings
+			WHERE NAME = 'shardman.shardlord_connstring';
 		EXECUTE format(
 			'INSERT INTO @extschema@.nodes VALUES (DEFAULT, %L, NULL, false, true)
-			RETURNING id', master_connstring) INTO master_id;
-		PERFORM shardman.set_node_id(master_id);
-		init_master := true;
+			RETURNING id', lord_connstring) INTO lord_id;
+		PERFORM shardman.set_node_id(lord_id);
+		init_lord := true;
 	ELSE
-		EXECUTE 'SELECT NOT (SELECT master FROM shardman.nodes WHERE id = $1)'
-			INTO init_master USING master_id;
-		EXECUTE 'UPDATE shardman.nodes SET master = true WHERE id = $1' USING master_id;
+		EXECUTE 'SELECT NOT (SELECT lord FROM shardman.nodes WHERE id = $1)'
+			INTO init_lord USING lord_id;
+		EXECUTE 'UPDATE shardman.nodes SET lord = true WHERE id = $1' USING lord_id;
 	END IF;
-	IF init_master THEN
+	IF init_lord THEN
 		-- TODO: set up lr channels
 	END IF;
 END $$ LANGUAGE plpgsql;
 
 -- These tables will be replicated to worker nodes, notifying them about changes.
--- Called on master.
+-- Called on lord.
 CREATE FUNCTION create_meta_pub() RETURNS void AS $$
 BEGIN
 	IF NOT EXISTS (SELECT * FROM pg_publication WHERE pubname = 'shardman_meta_pub') THEN
