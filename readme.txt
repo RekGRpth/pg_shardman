@@ -91,17 +91,17 @@ Remove node from the cluster. Its shardman state will be reset. We don't delete
 tables with data and foreign tables though.
 
 You can see all cluster nodes at any time by examining shardman.nodes table:
--- active is the normal mode, others needed only for proper node add and removal
+-- active is the normal mode, removed means node removed, others needed only
+-- for proper node add and removal
 CREATE TYPE worker_node_status AS ENUM (
 	'active', 'add_in_progress', 'rm_in_progress', 'removed');
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
 	connstring text NOT NULL UNIQUE,
-	worker_status worker_node_status,
 	-- While currently we don't support lord and worker roles on one node,
-	-- potentially node can be either worker, lord or both, so we need 2 bits.
-	-- One bool with NULL might be fine, but it seems a bit counter-intuitive.
-	worker bool NOT NULL DEFAULT true,
+	-- potentially node can be either worker, lord or both.
+	worker_status worker_node_status, -- NULL if this node is not a worker
+	-- is this node shardlord?
 	lord bool NOT NULL DEFAULT false,
 	-- cmd by which node was added
 	added_by bigint REFERENCES shardman.cmd_log(id)

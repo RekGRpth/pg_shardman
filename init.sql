@@ -179,14 +179,15 @@ BEGIN
 		SELECT pg_settings.setting INTO lord_connstring FROM pg_settings
 			WHERE NAME = 'shardman.shardlord_connstring';
 		EXECUTE format(
-			'INSERT INTO @extschema@.nodes VALUES (DEFAULT, %L, NULL, false, true)
+			'INSERT INTO shardman.nodes VALUES (DEFAULT, %L, NULL, true)
 			RETURNING id', lord_connstring) INTO lord_id;
 		PERFORM shardman.set_node_id(lord_id);
 		init_lord := true;
 	ELSE
-		EXECUTE 'SELECT NOT (SELECT lord FROM shardman.nodes WHERE id = $1)'
+		EXECUTE 'SELECT NOT (SELECT shardlord FROM shardman.nodes WHERE id = $1)'
 			INTO init_lord USING lord_id;
-		EXECUTE 'UPDATE shardman.nodes SET lord = true WHERE id = $1' USING lord_id;
+		EXECUTE 'UPDATE shardman.nodes SET shardlord = true WHERE id = $1'
+			USING lord_id;
 	END IF;
 	IF init_lord THEN
 		-- TODO: set up lr channels

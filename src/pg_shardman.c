@@ -634,14 +634,14 @@ insert_node(const char *connstr, int64 cmd_id)
 }
 
 /*
- * Returns true, if node 'id' is in cluster and not in add_in_progress state
+ * Returns true, if node 'id' is active node in cluster or rm in progress
  */
 static bool
 node_in_cluster(int id)
 {
 	char *sql = psprintf(
-		"select id from shardman.nodes where id = %d and (shardlord OR"
-		" worker_status != 'add_in_progress');",
+		"select id from shardman.nodes where id = %d and (shardlord or"
+		" worker_status = 'active' or worker_status = 'rm_in_progress');",
 		id);
 	bool res;
 
@@ -695,7 +695,7 @@ rm_node(Cmd *cmd)
 	 * fixed.
 	 */
 	sql = psprintf(
-		"select shardman.drop_repslot('shardman_meta_sub_%d');"
+		"select shardman.drop_repslot('shardman_meta_sub_%d', true);"
 		"update shardman.nodes set worker_status = 'removed' where id = %d;"
 		"update shardman.cmd_log set status = 'success' where id = %ld;",
 		node_id, node_id, cmd->id);
@@ -708,14 +708,14 @@ rm_node(Cmd *cmd)
 
 /*
  * Get connstr of worker node with id node_id. Memory is palloc'ed.
- * NULL is returned, if there is no such node.
+ * NULL is returned, if there is no such worker.
  */
 char *
 get_worker_node_connstr(int32 node_id)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 	char *sql = psprintf("select connstring from shardman.nodes where id = %d"
-						 " and worker", node_id);
+						 " and worker_status is not null", node_id);
 	char *res;
 
 	SPI_PROLOG;

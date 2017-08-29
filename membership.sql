@@ -6,23 +6,25 @@
  * ------------------------------------------------------------------------
  */
 
--- active is the normal mode, others needed only for proper node add and removal
+-- active is the normal mode, removed means node removed, others needed only
+-- for proper node add and removal
 CREATE TYPE worker_node_status AS ENUM (
 	'active', 'add_in_progress', 'rm_in_progress', 'removed');
 
 -- list of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
-	connstring text NOT NULL UNIQUE,
-	worker_status worker_node_status,
+	connstring text NOT NULL,
 	-- While currently we don't support lord and worker roles on one node,
-	-- potentially node can be either worker, lord or both, so we need 2 bits.
-	-- One bool with NULL might be fine, but it seems a bit counter-intuitive.
-	worker bool NOT NULL DEFAULT true,
-	lord bool NOT NULL DEFAULT false,
+	-- potentially node can be either worker, lord or both.
+	worker_status worker_node_status, -- NULL if this node is not a worker
+	-- is this node shardlord?
+	shardlord bool NOT NULL DEFAULT false,
 	-- cmd by which node was added
 	added_by bigint REFERENCES shardman.cmd_log(id)
 );
+CREATE UNIQUE INDEX unique_node_connstr ON shardman.nodes (connstring)
+	WHERE (worker_status = 'active' OR shardlord);
 
 -- Lord is removing us, so reset our state, removing all subscriptions. A bit
 -- tricky part: we can't DROP SUBSCRIPTION here, because that would mean
@@ -88,7 +90,7 @@ BEGIN
 	  	INTO n_id;
 	IF n_id IS NULL THEN
 		INSERT INTO shardman.nodes
-			VALUES (DEFAULT, connstring, 'add_in_progress', true, false, cmd_id)
+			VALUES (DEFAULT, connstring, 'add_in_progress', false, cmd_id)
 			RETURNING id INTO n_id;
 	END IF;
 	RETURN n_id;
@@ -110,7 +112,8 @@ END $$ LANGUAGE plpgsql;
 -- one.
 CREATE FUNCTION get_worker_node_connstr(node_id int) RETURNS text AS $$
 DECLARE
-	connstr text := connstring FROM shardman.nodes WHERE id = node_id AND worker;
+	connstr text := connstring FROM shardman.nodes WHERE id = node_id AND
+				worker_status IS NOT NULL;
 BEGIN
 	IF connstr IS NULL THEN
 		RAISE EXCEPTION 'Worker node with id % not found', node_id;
