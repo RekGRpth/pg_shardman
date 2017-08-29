@@ -19,8 +19,9 @@ which is useful for development.
 Both shardlord and workers require extension built and installed. We depend
 on pg_pathman extension so it must be installed too.
 PostgreSQL location for building is derived from pg_config, you can also specify
-path to it in PG_CONFIG var. The whole process is of building and copying files
-to PG server is just:
+path to it in PG_CONFIG var. PostgreSQL 10 (master branch as of writing this)
+is required. The whole process is of building and copying files to PG server
+is just:
 
 git clone
 cd pg_shardman
