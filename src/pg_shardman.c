@@ -21,6 +21,7 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 
+#include "utils/memutils.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
 #include "executor/spi.h"
@@ -169,8 +170,10 @@ void
 shardlord_main(Datum main_arg)
 {
 	Cmd *cmd;
-	shmn_elog(LOG, "Shardlord started");
+	MemoryContext old_ctx;
+	MemoryContext cmd_ctx;
 
+	shmn_elog(LOG, "Shardlord started");
 	/* Connect to the database to use SPI*/
 	BackgroundWorkerInitializeConnection(shardman_shardlord_dbname, NULL);
 	/* sanity check */
@@ -185,10 +188,13 @@ shardlord_main(Datum main_arg)
 	void_spi("select shardman.lord_boot();");
 	conn = listen_cmd_log_inserts();
 
+	cmd_ctx = AllocSetContextCreate(CurrentMemoryContext,
+									"Shardman per-cmd context",
+									ALLOCSET_DEFAULT_SIZES);
 	/* main loop */
 	while (1948)
 	{
-		/* TODO: new mem ctxt for every command */
+		old_ctx = MemoryContextSwitchTo(cmd_ctx);
 		while ((cmd = next_cmd()) != NULL)
 		{
 			update_cmd_status(cmd->id, "in progress");
@@ -212,11 +218,12 @@ shardlord_main(Datum main_arg)
 				set_replevel(cmd);
 			else
 				shmn_elog(FATAL, "Unknown cmd type %s", cmd->cmd_type);
+			MemoryContextReset(cmd_ctx);
 		}
+		MemoryContextSwitchTo(old_ctx);
 		wait_notify();
 		check_for_sigterm();
 	}
-
 }
 
 /*

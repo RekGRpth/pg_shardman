@@ -385,6 +385,15 @@ static void finalize_cp_state(CopyPartState *cps)
 		reset_pqconn(&cps->src_conn);
 	if (cps->dst_conn != NULL)
 		reset_pqconn(&cps->dst_conn);
+	if (cps->type == COPYPARTTASK_MOVE_PRIMARY ||
+		cps->type == COPYPARTTASK_MOVE_REPLICA)
+	{
+		MovePartState *mps = (MovePartState *) cps;
+		if (mps->prev_conn != NULL)
+			reset_pqconn(&mps->prev_conn);
+		if (mps->next_conn != NULL)
+			reset_pqconn(&mps->next_conn);
+	}
 }
 
 /*
@@ -480,10 +489,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 		}
 	}
 
-	/*
-	 * Free list. This not necessary though, we are finishing cmd and
-	 * everything will be freed soon.
-	 */
+	/* Free timeout_states list */
 	slist_foreach_modify(iter, &timeout_states)
 	{
 		CopyPartStateNode *cps_node =
@@ -491,7 +497,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 		slist_delete_current(&iter);
 		pfree(cps_node);
 	}
-	/* But this is important, as libpq manages memory on its own */
+	/* libpq manages memory on its own */
 	for (i = 0; i < ntasks; i++)
 		finalize_cp_state(tasks[i]);
 	close(epfd);
