@@ -20,8 +20,7 @@ Both shardlord and workers require extension built and installed. We depend
 on pg_pathman extension so it must be installed too.
 PostgreSQL location for building is derived from pg_config, you can also specify
 path to it in PG_CONFIG var. PostgreSQL 10 (master branch as of writing this)
-is required. The whole process is of building and copying files to PG server
-is just:
+is required. The whole process is of building and copying files to PG server is just:
 
 git clone
 cd pg_shardman
@@ -35,7 +34,7 @@ create extension pg_shardman cascade;
 Have a look at postgresql.conf.common.template and postgresql.conf.lord.template
 example configuration files. The former contains all shardman's and important
 PostgreSQL GUCs for either shardlord and workers, the latter for shardlord only
--- in particular, shardman.master defines whether the instance is shardlord or
+-- in particular, shardman.shardlord defines whether the instance is shardlord or
 not.
 
 Immediately after starting the server with shardman library preloaded, but
@@ -99,11 +98,11 @@ CREATE TABLE nodes (
 	id serial PRIMARY KEY,
 	connstring text NOT NULL UNIQUE,
 	worker_status worker_node_status,
-	-- While currently we don't support master and worker roles on one node,
-	-- potentially node can be either worker, master or both, so we need 2 bits.
+	-- While currently we don't support lord and worker roles on one node,
+	-- potentially node can be either worker, lord or both, so we need 2 bits.
 	-- One bool with NULL might be fine, but it seems a bit counter-intuitive.
 	worker bool NOT NULL DEFAULT true,
-	master bool NOT NULL DEFAULT false,
+	lord bool NOT NULL DEFAULT false,
 	-- cmd by which node was added
 	added_by bigint REFERENCES shardman.cmd_log(id)
 );
