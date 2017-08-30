@@ -220,7 +220,6 @@ BEGIN
 		END IF;
 		-- Drop old table anyway;
 		EXECUTE format('DROP TABLE IF EXISTS %I', NEW.part_name);
-
 	ELSEIF me = NEW.owner THEN -- dst node
 		RAISE DEBUG '[SHARDMAN %] part_moved trigger on dst node',
 			me;

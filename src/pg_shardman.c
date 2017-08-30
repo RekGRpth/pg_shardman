@@ -431,13 +431,15 @@ shardlord_sigterm(SIGNAL_ARGS)
 
 /*
  * Signal handler for SIGUSR1
- *		Set a flag to let the main loop to terminate.
+ *		Set a flag to let cancel a command
  */
 void
 shardlord_sigusr1(SIGNAL_ARGS)
 {
 	got_sigusr1 = true;
 }
+
+bool signal_pending(void) { return got_sigterm || got_sigusr1; }
 
 /*
  * Cleanup and exit in case of SIGTERM
@@ -488,7 +490,7 @@ add_node(Cmd *cmd)
 
 	shmn_elog(INFO, "Adding node %s", connstr);
 	/* Try to execute command indefinitely until it succeeded or canceled */
-	while (!got_sigusr1 && !got_sigterm)
+	while (1948)
 	{
 		conn = PQconnectdb(connstr);
 		if (PQstatus(conn) != CONNECTION_OK)
@@ -610,10 +612,8 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 		shmn_elog(LOG, "Attempt to execute add_node failed, sleeping and retrying");
 		/* TODO: sleep using waitlatch? */
 		pg_usleep(shardman_cmd_retry_naptime * 1000L);
+		SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd);
 	}
-	check_for_sigterm();
-
-	cmd_canceled(cmd);
 }
 
 /* See sql func */

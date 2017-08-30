@@ -71,7 +71,7 @@ create_hash_partitions(Cmd *cmd)
 		relation, connstr);
 
 	/* Try to execute command indefinitely until it succeeded or canceled */
-	while (!got_sigusr1 && !got_sigterm)
+	while (1948)
 	{
 		conn = PQconnectdb(connstr);
 		if (PQstatus(conn) != CONNECTION_OK)
@@ -127,22 +127,15 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 				  " sleeping and retrying");
 		/* TODO: sleep using waitlatch? */
 		pg_usleep(shardman_cmd_retry_naptime * 1000L);
+		SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd);
 	}
-	check_for_sigterm();
-
-	cmd_canceled(cmd);
 }
 
 /* Update status of cmd consisting of single task after exec_tasks finishes */
 void
 cmd_single_task_exec_finished(Cmd *cmd, CopyPartState *cps)
 {
-	check_for_sigterm();
-	if (got_sigusr1)
-	{
-		cmd_canceled(cmd);
-		return;
-	}
+	SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd);
 
 	Assert(cps->res != TASK_IN_PROGRESS);
 	if (cps->res == TASK_FAILED)
@@ -235,12 +228,7 @@ rebalance(Cmd *cmd)
 	}
 
 	exec_tasks(tasks, num_parts);
-	check_for_sigterm();
-	if (got_sigusr1)
-	{
-		cmd_canceled(cmd);
-		return;
-	}
+	SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd);
 
 	shmn_elog(INFO, "Relation %s rebalanced:", relation);
 	update_cmd_status(cmd->id, "done");
@@ -307,12 +295,7 @@ set_replevel(Cmd *cmd)
 			break;
 
 		exec_tasks(tasks, ntasks);
-		check_for_sigterm();
-		if (got_sigusr1)
-		{
-			cmd_canceled(cmd);
-			return;
-		}
+		SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd);
 
 		pfree(repcounts);
 		for (i = 0; i < ntasks; i++)

@@ -440,7 +440,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 	if ((epfd = epoll_create1(0)) == -1)
 		shmn_elog(FATAL, "epoll_create1 failed");
 
-	while (unfinished_tasks > 0 && !got_sigusr1 && !got_sigterm)
+	while (unfinished_tasks > 0 && !signal_pending())
 	{
 		timeout = calc_timeout(&timeout_states);
 		e = epoll_wait(epfd, evlist, MAX_EVENTS, timeout);
