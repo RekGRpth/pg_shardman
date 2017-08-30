@@ -312,7 +312,7 @@ BEGIN
 	END LOOP;
 	IF shardman.my_id() IS NOT NULL THEN
 		-- otherwise we will hang
-		SET LOCAL synchronous_commit TO local;
+		SET LOCAL synchronous_commit TO LOCAL;
 		-- TODO: remove only shardman's standbys
 		PERFORM shardman.set_sync_standbys('');
 	END IF;

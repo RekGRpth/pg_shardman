@@ -473,6 +473,7 @@ cmd_canceled(Cmd *cmd)
  * - recreating repslot
  * - recreating subscription
  * - setting node id on the node itself
+ * - waiting for initial tablesync
  * - marking node as active and cmd as success
  * We do all this stuff to make all actions are idempodent to be able to retry
  * them in case of any failure.
@@ -487,6 +488,7 @@ add_node(Cmd *cmd)
 	bool pg_shardman_installed;
 	int32 node_id;
 	char *sql;
+	bool tablesync_done = false;
 
 	shmn_elog(INFO, "Adding node %s", connstr);
 	/* Try to execute command indefinitely until it succeeded or canceled */
@@ -577,15 +579,63 @@ add_node(Cmd *cmd)
 			"select shardman.set_node_id(%d);",
 			shardman_shardlord_connstring, node_id, node_id);
 		res = PQexec(conn, sql);
+		pfree(sql);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
 			shmn_elog(NOTICE, "Failed to create subscription and set node id, %s",
 					  PQerrorMessage(conn));
 			goto attempt_failed;
 		}
-
 		PQclear(res);
-		PQfinish(conn);
+
+		/*
+		 * Wait until initial tablesync is completed. This is necessary as
+		 * e.g. we might miss UPDATE statements on partitions table, triggers
+		 * on newly added node won't fire and metadata would be inconsistent.
+		 */
+		sql =
+			"select srrelid, srsubstate from pg_subscription_rel srel join"
+			" pg_subscription s on srel.srsubid = s.oid where"
+			" subname = 'shardman_meta_sub';";
+		while (!tablesync_done)
+		{
+			int i;
+
+			res = PQexec(conn, sql);
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			{
+				shmn_elog(NOTICE, "Adding node %s: failed to learn sub status, %s ",
+						  connstr, PQerrorMessage(conn));
+				goto attempt_failed;
+			}
+
+			tablesync_done = true;
+			for (i = 0; i < PQntuples(res); i++)
+			{
+				char *subrelid = PQgetvalue(res, i, 0);
+				char subrelstate = PQgetvalue(res, i, 1)[0];
+				if (subrelstate != 'r')
+				{
+					tablesync_done = false;
+					shmn_elog(DEBUG1,
+							  "adding node %s: init sync is not yet finished"
+							  " for rel %s, its state is %c",
+							  connstr, subrelid, subrelstate);
+					pg_usleep(shardman_poll_interval * 1000L);
+					SHMN_CHECK_FOR_INTERRUPTS();
+					if (got_sigusr1)
+					{
+						reset_pqconn_and_res(&conn, res);
+						cmd_canceled(cmd);
+						return;
+					}
+					break;
+				}
+			}
+			PQclear(res);
+		}
+
+		reset_pqconn(&conn);
 
 		/*
 		 * Mark add_node cmd as success and node as active, we must do that in
@@ -604,11 +654,7 @@ add_node(Cmd *cmd)
 		return;
 
 attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
-		if (res != NULL)
-			PQclear(res);
-		if (conn != NULL)
-			PQfinish(conn);
-
+		reset_pqconn_and_res(&conn, res);
 		shmn_elog(LOG, "Attempt to execute add_node failed, sleeping and retrying");
 		/* TODO: sleep using waitlatch? */
 		pg_usleep(shardman_cmd_retry_naptime * 1000L);
@@ -711,7 +757,21 @@ rm_node(Cmd *cmd)
 	elog(INFO, "Node %d successfully removed", node_id);
 }
 
-
+/*
+ * Finish pq connection and set ptr to NULL. You must be sure that the
+ * connection exists!
+ */
+void
+reset_pqconn(PGconn **conn) { PQfinish(*conn); *conn = NULL; }
+/*
+ * Same, but also clear res. You must be sure that both connection and res
+ * exist.
+ */
+void
+reset_pqconn_and_res(PGconn **conn, PGresult *res)
+{
+	PQclear(res); reset_pqconn(conn);
+}
 
 /*
  * Get connstr of worker node with id node_id. Memory is palloc'ed.

@@ -4,6 +4,7 @@
 #include <signal.h>
 
 #include "miscadmin.h"
+#include "libpq-fe.h"
 
 #define shmn_elog(level,fmt,...) elog(level, "[SHARDMAN] " fmt, ## __VA_ARGS__)
 
@@ -34,7 +35,8 @@ do { \
 } while (0)
 /*
  * Additionally check for SIGUSR1; if it has arrived, mark cmd as canceled and
- * return from current function.
+ * return from current function. Used to save typing void funcs where we don't
+ * need to do anything before 'return'.
  */
 #define SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd) \
 do { \
@@ -81,6 +83,8 @@ extern void shardlord_main(Datum main_arg);
 extern bool signal_pending(void);
 extern void check_for_sigterm(void);
 extern void cmd_canceled(Cmd *cmd);
+extern void reset_pqconn(PGconn **conn);
+extern void reset_pqconn_and_res(PGconn **conn, PGresult *res);
 extern uint64 void_spi(char *sql);
 extern void update_cmd_status(int64 id, const char *new_status);
 extern char *get_worker_node_connstr(int32 node_id);

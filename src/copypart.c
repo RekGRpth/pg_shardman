@@ -128,8 +128,6 @@ static int cp_finalize(CopyPartState *cpts);
 static int ensure_pqconn_cp(CopyPartState *cpts, int nodes);
 static int ensure_pqconn(PGconn **conn, const char *connstr,
 								CopyPartState *cps);
-static void reset_pqconn(PGconn **conn);
-static void reset_pqconn_and_res(PGconn **conn, PGresult *res);
 static void configure_retry(CopyPartState *cpts, int millis);
 static struct timespec timespec_now_plus_millis(int millis);
 struct timespec timespec_now(void);
@@ -1064,20 +1062,6 @@ ensure_pqconn(PGconn **conn, const char *connstr,
 	}
 	return 0;
 }
-
-/*
- * Finish pq connection and set ptr to NULL. You must be sure that the
- * connection exists!
- */
-void
-reset_pqconn(PGconn **conn) { PQfinish(*conn); *conn = NULL; }
-/* Same, but also clear res. You must be sure it exists */
-void
-reset_pqconn_and_res(PGconn **conn, PGresult *res)
-{
-	PQclear(res); reset_pqconn(conn);
-}
-
 
 /*
  * Configure cps so that main loop wakes us again after given retry millis.
