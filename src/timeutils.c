@@ -42,12 +42,14 @@ timespec_add_millis(struct timespec t, long millis)
 }
 
 /*
- * Get t1 - t2 difference in milliseconds. Not reliable if time_t is unsigned
+ * Get t1 - t2 difference in milliseconds. Not reliable if time_t is unsigned.
+ * The result is rounded up.
  */
 int
 timespec_diff_millis(struct timespec t1, struct timespec t2)
 {
 	int sec_diff = t1.tv_sec - t2.tv_sec;
 	long nsec_diff = t1.tv_nsec - t2.tv_nsec;
-	return sec_diff * 1000 + nsec_diff / MILLION;
+	/* We add (MILLION - 1) to get the division result rounded up */
+	return sec_diff * 1000 + (nsec_diff + (MILLION - 1)) / MILLION;
 }

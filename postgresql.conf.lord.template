@@ -2,4 +2,4 @@ shardman.shardlord = on # this instance is shardlord?
 shardman.shardlord_dbname = ars # shardlord's dbname
 shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
 shardman.cmd_retry_naptime = 500 # sleep milliseconds after failure
-shardman.poll_interval = 500 # long operations poll frequency
+shardman.poll_interval = 500 # long operations poll frequency in milliseconds

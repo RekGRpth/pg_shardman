@@ -465,7 +465,7 @@ exec_tasks(CopyPartState **tasks, int ntasks)
 				switch (cps->exec_res)
 				{
 					case TASK_WAKEMEUP:
-						/* We need to wake this task again, to keep it in
+						/* We need to wake this task again, so keep it in
 						 * in the list and just continue */
 						continue;
 
@@ -523,7 +523,7 @@ calc_timeout(slist_head *timeout_states)
 		CopyPartState *cps = cps_node->cps;
 
 		/* If waketm is not set, what this node does in this list? */
-		Assert(cps->waketm.tv_nsec != 0);
+		Assert(!(cps->waketm.tv_sec == 0 && cps->waketm.tv_nsec == 0));
 		if (!waketm_set || timespeccmp(cps->waketm, waketm) < 0)
 		{
 			shmn_elog(DEBUG5, "Waketm updated, old %d s, new %d s",
@@ -599,7 +599,7 @@ exec_task(CopyPartState *cps)
 }
 
 /*
- * One iteration of move primary task execution.
+ * One iteration of move partition task execution.
  *
  * Maximum 4 nodes are actively involved here: src, dst, previous replica (or
  * primary) and next replica. The whole task workflow:
