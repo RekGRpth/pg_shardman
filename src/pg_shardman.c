@@ -197,10 +197,12 @@ shardlord_main(Datum main_arg)
 		old_ctx = MemoryContextSwitchTo(cmd_ctx);
 		while ((cmd = next_cmd()) != NULL)
 		{
+			char **opts;
+
 			update_cmd_status(cmd->id, "in progress");
 			shmn_elog(DEBUG1, "Working on command %ld, %s, opts are",
 				 cmd->id, cmd->cmd_type);
-			for (char **opts = cmd->opts; *opts; opts++)
+			for (opts = cmd->opts; *opts; opts++)
 				shmn_elog(DEBUG1, "%s", *opts);
 			if (strcmp(cmd->cmd_type, "add_node") == 0)
 				add_node(cmd);
