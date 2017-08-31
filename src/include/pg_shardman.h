@@ -1,3 +1,11 @@
+/* -------------------------------------------------------------------------
+ *
+ * Primary pg_shardman include file.
+ *
+ * Copyright (c) 2017, Postgres Professional
+ *
+ * -------------------------------------------------------------------------
+ */
 #ifndef PG_SHARDMAN_H
 #define PG_SHARDMAN_H
 

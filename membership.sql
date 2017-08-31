@@ -3,6 +3,8 @@
  * init.sql
  *		Handling nodes addition and removal.
  *
+ * Copyright (c) 2017, Postgres Professional
+ *
  * ------------------------------------------------------------------------
  */
 

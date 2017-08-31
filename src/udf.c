@@ -3,6 +3,8 @@
  * udf.c
  *		SQL functions.
  *
+ * Copyright (c) 2017, Postgres Professional
+ *
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"

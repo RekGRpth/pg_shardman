@@ -1,3 +1,11 @@
+/* -------------------------------------------------------------------------
+ *
+ * Sharding commands declarations.
+ *
+ * Copyright (c) 2017, Postgres Professional
+ *
+ * -------------------------------------------------------------------------
+ */
 #ifndef SHARD_H
 #define SHARD_H
 

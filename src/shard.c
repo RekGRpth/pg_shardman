@@ -3,6 +3,8 @@
  * shard.c
  *		Implementation of sharding commands.
  *
+ * Copyright (c) 2017, Postgres Professional
+ *
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"

@@ -3,6 +3,8 @@
  * copypart.c
  *		Implementation of sharding commands involving partition copy.
  *
+ * Copyright (c) 2017, Postgres Professional
+ *
  * Partitions moving/copying is implemented via LR: we start initial tablesync,
  * wait it for finish, then make src read-only and wait until dst will get
  * current src's lsn.

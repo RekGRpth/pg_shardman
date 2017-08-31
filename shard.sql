@@ -3,6 +3,8 @@
  * shard.sql
  *		Tables & partitions metadata definitions, triggers and utility funcs.
  *
+ * Copyright (c) 2017, Postgres Professional
+ *
  * ------------------------------------------------------------------------
  */
 

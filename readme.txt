@@ -1,3 +1,6 @@
+pg_shardman: PostgreSQL sharding built on pg_pathman, postgres_fdw and logical
+  replication.
+
 First, some terminology:
 'shardlord' or 'lord' is postgres instance and background process (bgw) spinning
   on it which manages sharding.
@@ -20,7 +23,7 @@ Both shardlord and workers require extension built and installed. We depend
 on pg_pathman extension so it must be installed too.
 PostgreSQL location for building is derived from pg_config, you can also specify
 path to it in PG_CONFIG var. PostgreSQL 10 (master branch as of writing this)
-is required. The whole process is of building and copying files to PG server is just:
+is required. The whole process of building and copying files to PG server is just:
 
 git clone
 cd pg_shardman

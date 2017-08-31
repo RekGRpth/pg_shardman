@@ -1,3 +1,12 @@
+/* ------------------------------------------------------------------------
+ *
+ * hooks.h
+ *		 Sharding commands involving partition copy prototypes.
+ *
+ * Copyright (c) 2017, Postgres Professional
+ *
+ * ------------------------------------------------------------------------
+ */
 #ifndef COPYPART_H
 #define COPYPART_H
 

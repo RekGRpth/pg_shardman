@@ -3,6 +3,8 @@
  * hooks.c
  *		shardman hooks
  *
+ * Copyright (c) 2017, Postgres Professional
+ *
  * ------------------------------------------------------------------------
  */
 

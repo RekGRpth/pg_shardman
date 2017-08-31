@@ -3,6 +3,8 @@
  * init.sql
  *   Commands infrastructure, interface funcs, common utility funcs.
  *
+ * Copyright (c) 2017, Postgres Professional
+ *
  * ------------------------------------------------------------------------
  */
 

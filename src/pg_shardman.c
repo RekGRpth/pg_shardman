@@ -3,7 +3,9 @@
  * pg_shardman.c
  *		This module contains background worker accepting sharding tasks for
  *		execution, membership commands implementation and common routines for
- *		quering the metadata.
+ *		querying the metadata.
+ *
+ * Copyright (c) 2017, Postgres Professional
  *
  * -------------------------------------------------------------------------
  */
