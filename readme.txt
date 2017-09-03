@@ -22,8 +22,9 @@ which is useful for development.
 Both shardlord and workers require extension built and installed. We depend
 on pg_pathman extension so it must be installed too.
 PostgreSQL location for building is derived from pg_config, you can also specify
-path to it in PG_CONFIG var. PostgreSQL 10 (master branch as of writing this)
-is required. The whole process of building and copying files to PG server is just:
+path to it in PG_CONFIG var. PostgreSQL 10 (REL_10_STABLE branch as of writing
+this) is required. Extension links with libpq, so if you The whole process of
+building and copying files to PG server is just:
 
 git clone
 cd pg_shardman
@@ -85,9 +86,9 @@ that's easy to change.
 Let's get to the actual commands.
 
 add_node(connstring text)
-Add node with given connstring to the cluster. Node is assigned unique id. If
-node previously contained shardman state from old cluster (not one managed by
-current shardlord), this state will be lost.
+Add node with given libpq connstring to the cluster. Node is assigned unique
+id. If node previously contained shardman state from old cluster (not one
+managed by current shardlord), this state will be lost.
 
 rm_node(node_id int)
 Remove node from the cluster. Its shardman state will be reset. We don't delete
@@ -163,14 +164,19 @@ warnings about failed moves during execution. After completion cmd status is
 
 set_replevel(relation text, replevel int)
 Add replicas to shards of sharded table 'relation' until we reach replevel
-replicas for each one. Replica deletions is not implemented yet. Note that it is
-pointless to set replevel to more than number of active workers - 1 since we
+replicas for each one, i.e. until each shard has 'replevel' read-only replicas.
+replevel 0 has no effect. Replica deletions is not implemented yet. Note that it
+is pointless to set replevel more than number of active workers - 1 since we
 don't forbid several replicas on one node. Nodes for replicas are choosen
 randomly. As in 'rebalance', we are fully oblivious about current shards
-distribution, so you will see a bunch of warnings about failing replica
-creation -- one for each time random chooses node with already existing replica.
+distribution, so you will see a bunch of warnings about failing replica creation
+-- one for each time random had chosen node with already existing replica.
 
 Sharded tables dropping, as well as replica deletion is not implemented yet.
+
+Note on permissions: since creating subscription requires superuser priviliges,
+connections strings provided to add_node, as well as shardlord_connstring GUC
+must be of superuser ones. This might be relaxed in the future.
 
 Limitations:
 * We are bound to Linux since we use epoll, select should be added.
