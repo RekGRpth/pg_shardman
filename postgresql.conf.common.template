@@ -21,3 +21,12 @@ max_replication_slots = 100
 # max_replication_slots. On workers, this must be at least max number of shards
 # on the table which have 'next' replica.
 max_wal_senders = 50
+
+
+# performance-related settings
+synchronous_commit = off
+shared_buffers = 512MB
+effective_cache_size = 512MB
+work_mem = 4MB
+max_connections = 1000
+max_wal_size = 5GB
