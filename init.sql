@@ -268,8 +268,10 @@ CREATE FUNCTION eliminate_sub(subname name, drop_sub bool DEFAULT true)
 DECLARE
 	sub_exists bool;
 BEGIN
-	EXECUTE format('SELECT count(*) > 0 FROM pg_subscription WHERE subname
-				   = %L', subname) INTO sub_exists;
+	RAISE DEBUG '[SHARDMAN %] eliminating sub %, drop_sub %',
+		shardman.my_id(), subname, drop_sub;
+	EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname
+				   = %L)', subname) INTO sub_exists;
 	IF sub_exists THEN
 		EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', subname);
 		EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', subname);
