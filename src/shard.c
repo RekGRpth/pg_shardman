@@ -287,9 +287,12 @@ set_replevel(Cmd *cmd)
 			if (rc.count < replevel)
 			{
 				CreateReplicaState *crs = palloc0(sizeof(CreateReplicaState));
-				init_cr_state(crs, rc.part_name, workers[rand() % num_workers]);
+				int32 dst_node = workers[rand() % num_workers];
+				init_cr_state(crs, rc.part_name, dst_node);
 				tasks[ntasks] = (CopyPartState *) crs;
 				ntasks++;
+				shmn_elog(DEBUG1, "Adding replica for shard %s on node %d",
+						  rc.part_name, dst_node);
 			}
 		}
 

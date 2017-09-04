@@ -381,18 +381,22 @@ init_cp_state(CopyPartState *cps)
  */
 static void finalize_cp_state(CopyPartState *cps)
 {
-	if (cps->src_conn != NULL)
-		reset_pqconn(&cps->src_conn);
-	if (cps->dst_conn != NULL)
-		reset_pqconn(&cps->dst_conn);
-	if (cps->type == COPYPARTTASK_MOVE_PRIMARY ||
-		cps->type == COPYPARTTASK_MOVE_REPLICA)
+	/* Failed tasks never open pq connections */
+	if (cps->res != TASK_FAILED)
 	{
-		MovePartState *mps = (MovePartState *) cps;
-		if (mps->prev_conn != NULL)
-			reset_pqconn(&mps->prev_conn);
-		if (mps->next_conn != NULL)
-			reset_pqconn(&mps->next_conn);
+		if (cps->src_conn != NULL)
+			reset_pqconn(&cps->src_conn);
+		if (cps->dst_conn != NULL)
+			reset_pqconn(&cps->dst_conn);
+		if (cps->type == COPYPARTTASK_MOVE_PRIMARY ||
+			cps->type == COPYPARTTASK_MOVE_REPLICA)
+		{
+			MovePartState *mps = (MovePartState *) cps;
+			if (mps->prev_conn != NULL)
+				reset_pqconn(&mps->prev_conn);
+			if (mps->next_conn != NULL)
+				reset_pqconn(&mps->next_conn);
+		}
 	}
 }
 
