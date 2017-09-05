@@ -12,10 +12,18 @@
 #include <signal.h>
 
 #include "miscadmin.h"
+#include "storage/lwlock.h"
 #include "libpq-fe.h"
 
-#define shmn_elog(level,fmt,...) elog(level, "[SHARDMAN] " fmt, ## __VA_ARGS__)
+/*
+ * By convention, we prefix shardman-related messages with [SHMN].
+ * Unfortunately, currently it is impossible to have variadic polymorhic
+ * functions accepting args with different types in plpgsql, so in sql funcs
+ * we just type it manually.
+ */
+#define shmn_elog(level,fmt,...) elog(level, "[SHMN] " fmt, ## __VA_ARGS__)
 
+/* Commonly used SPI stuff */
 #define SPI_PROLOG do { \
 	StartTransactionCommand(); \
 	SPI_connect(); \
@@ -63,7 +71,16 @@ extern char *shardman_shardlord_connstring;
 extern int shardman_cmd_retry_naptime;
 extern int shardman_poll_interval;
 
-extern int32 shardman_my_node_id;
+/*
+ * State in shared memory. We hold exclusive lock while modifying this, and
+ * shard lock while reading.
+ */
+typedef struct ShmnSharedState
+{
+	int32 my_id;
+	LWLock *lock;
+} ShmnSharedState;
+extern ShmnSharedState *snss;
 #define SHMN_INVALID_NODE_ID -1
 
 typedef struct Cmd
@@ -87,6 +104,9 @@ typedef struct RepCount
 } RepCount;
 
 extern void _PG_init(void);
+extern void _PG_fini(void);
+extern int32 my_id(void);
+extern void set_my_id(int32 new_id);
 extern void shardlord_main(Datum main_arg);
 extern bool signal_pending(void);
 extern void check_for_sigterm(void);

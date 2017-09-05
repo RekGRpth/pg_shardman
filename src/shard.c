@@ -232,7 +232,7 @@ rebalance(Cmd *cmd)
 	exec_tasks(tasks, num_parts);
 	SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd);
 
-	shmn_elog(INFO, "Relation %s rebalanced:", relation);
+	shmn_elog(INFO, "Relation %s rebalanced", relation);
 	update_cmd_status(cmd->id, "done");
 }
 

@@ -68,8 +68,10 @@ int shardman_poll_interval;
  * cleanup after receiving SIGTERM.
  */
 static PGconn *conn = NULL;
-/* This node id. */
 int32 shardman_my_node_id = -1;
+/* Link to shared memory state */
+ShmnSharedState *snss = NULL;
+
 
 /*
  * Entrypoint of the module. Define variables and register background worker.
@@ -86,9 +88,19 @@ _PG_init()
 						errhint("Add pg_shardman to shared_preload_libraries.")));
 	}
 
+	/*
+	 * Request additional shared resources.  (These are no-ops if we're not in
+	 * the postmaster process.)  We'll allocate or attach to the shared
+	 * resources in shardman_shmem_startup().
+	 */
+	RequestAddinShmemSpace(sizeof(ShmnSharedState));
+	RequestNamedLWLockTranche("pg_shardman", 1);
+
 	/* remember & set hooks */
-	log_hook_next = emit_log_hook;
-	emit_log_hook = shardman_log_hook;
+	old_log_hook = emit_log_hook;
+	emit_log_hook = shardman_log;
+	old_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = shardman_shmem_startup;
 
 	DefineCustomBoolVariable("shardman.shardlord",
 							 "This node is the shardlord?",
@@ -163,6 +175,42 @@ _PG_init()
 		RegisterBackgroundWorker(&shardlord_bgw);
 	}
 	/* TODO: clean up publications if we were shardlord before */
+}
+
+/*
+ * Module unload callback
+ */
+void
+_PG_fini(void)
+{
+	/* Uninstall hooks. */
+	emit_log_hook = old_log_hook;
+	shmem_startup_hook = old_shmem_startup_hook;
+}
+
+/* Get this node id stored in shmem */
+int32
+my_id(void)
+{
+	int32 id;
+
+	/* If MyProc is NULL, shmem is not yet inited or we are bootstrapping */
+	if (MyProc == NULL)
+		return SHMN_INVALID_NODE_ID;
+
+	LWLockAcquire(snss->lock, LW_SHARED);
+	id = snss->my_id;
+	LWLockRelease(snss->lock);
+	return id;
+}
+
+/* Get this node id stored in shmem */
+void
+set_my_id(int32 new_id)
+{
+	LWLockAcquire(snss->lock, LW_EXCLUSIVE);
+	snss->my_id = new_id;
+	LWLockRelease(snss->lock);
 }
 
 /*
@@ -412,8 +460,8 @@ pg_shardman_installed_local(void)
 	if (get_extension_oid("pg_shardman", true) == InvalidOid)
 	{
 		installed = false;
-		shmn_elog(WARNING, "pg_shardman library is preloaded on shardlord, but"
-				  " extenstion is not created");
+		shmn_elog(WARNING,
+				  "Terminating shardlord: pg_shardman lib is preloaded, but ext is not created");
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();

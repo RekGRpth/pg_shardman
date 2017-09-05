@@ -95,8 +95,8 @@ CREATE TABLE partitions (
 -- it.
 CREATE FUNCTION new_primary() RETURNS TRIGGER AS $$
 BEGIN
-	RAISE DEBUG '[SHARDMAN] new_primary trigger called on node % for part %, owner %',
-		shardman.my_id(), NEW.part_name, NEW.owner;
+	RAISE DEBUG '[SHMN] new_primary trigger called for part %, owner %',
+		NEW.part_name, NEW.owner;
 	IF NEW.owner != shardman.my_id() THEN
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
@@ -190,8 +190,8 @@ DECLARE
 	src_next_lname text;
 BEGIN
 	ASSERT NEW.owner != OLD.owner, 'part_moved handles only moved parts';
-	RAISE DEBUG '[SHARDMAN %] part_moved trigger called for part %, owner % -> %',
-		me, NEW.part_name, OLD.owner, NEW.owner;
+	RAISE DEBUG '[SHMN] part_moved trigger called for part %, owner % -> %',
+		NEW.part_name, OLD.owner, NEW.owner;
 	ASSERT NEW.nxt = OLD.nxt OR (NEW.nxt IS NULL AND OLD.nxt IS NULL),
 		'both part and replica must not be moved in one update';
 	ASSERT NEW.prv = OLD.prv OR (NEW.prv IS NULL AND OLD.prv IS NULL),
@@ -223,8 +223,7 @@ BEGIN
 		-- Drop old table anyway;
 		EXECUTE format('DROP TABLE IF EXISTS %I', NEW.part_name);
 	ELSEIF me = NEW.owner THEN -- dst node
-		RAISE DEBUG '[SHARDMAN %] part_moved trigger on dst node',
-			me;
+		RAISE DEBUG '[SHMN] part_moved trigger on dst node';
 		-- Drop subscription used for copy
 		PERFORM shardman.eliminate_sub(cp_logname);
 		-- If primary part was moved, replace moved table with foreign one
@@ -371,19 +370,17 @@ DECLARE
 	me int := shardman.my_id();
 	my_part shardman.partitions;
 BEGIN
-	RAISE DEBUG '[SHARDMAN %] update_fdw_server called for part %, owner %',
-		shardman.my_id(), part.part_name, part.owner;
+	RAISE DEBUG '[SHMN] update_fdw_server called for part %, owner %',
+		part.part_name, part.owner;
 
 	SELECT * FROM shardman.partitions WHERE part_name = part.part_name AND
 											owner = me INTO my_part;
 	IF my_part.part_name IS NOT NULL THEN -- we are holding the part
 		IF my_part.prv IS NULL THEN
-			RAISE DEBUG '[SHARDMAN %] we are holding primary for part %, not updating fdw server for it',
-			me, part.part_name;
+			RAISE DEBUG '[SHMN] we are holding primary for part %, not updating fdw server for it', part.part_name;
 			RETURN;
 		ELSE
-			RAISE DEBUG '[SHARDMAN %] we are holding replica for part %, updating fdw server for it',
-			me, part.part_name;
+			RAISE DEBUG '[SHMN] we are holding replica for part %, updating fdw server for it', part.part_name;
 		END IF;
 	END IF;
 
@@ -446,8 +443,7 @@ BEGIN
 	-- and dangerous: what if table was created and dropped before this
 	-- change reached us? We might also use it with local table (create
 	-- foreign server pointing to it, etc), but that's just ugly.
-	RAISE DEBUG '[SHARDMAN] my id: %, creating ft %',
-		shardman.my_id(), part.part_name;
+	RAISE DEBUG '[SHMN] creating ft %', part.part_name;
 	EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I OPTIONS (table_name %L)',
 				   fdw_part_name,
 				   (SELECT
@@ -551,7 +547,7 @@ END
 $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION go_away() RETURNS TRIGGER AS $$
 BEGIN
-	RAISE EXCEPTION 'The "%" table is read only.', TG_TABLE_NAME
+	RAISE EXCEPTION '[SHMN] The "%" table is read only.', TG_TABLE_NAME
 		USING HINT = 'Probably table copy is in progress';
 END;
 $$ LANGUAGE plpgsql;
@@ -567,7 +563,8 @@ END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION readonly_replica_on(relation regclass)
 	RETURNS void AS $$
 BEGIN
-	RAISE DEBUG '[SHARDMAN] table % made read-only for all but apply workers', relation;
+	RAISE DEBUG '[SHMN] table % made read-only for all but apply workers',
+		relation;
 	PERFORM shardman.readonly_replica_off(relation);
 	PERFORM shardman.create_modification_triggers(
 		relation, 'shardman_readonly_replica', 'shardman.ror_go_away()');
@@ -580,7 +577,7 @@ END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION ror_go_away() RETURNS TRIGGER AS $$
 BEGIN
 	IF NOT shardman.inside_apply_worker() THEN
-		RAISE EXCEPTION 'The "%" table is read only for non-apply workers', TG_TABLE_NAME
+		RAISE EXCEPTION '[SHMN] The "%" table is read only for non-apply workers', TG_TABLE_NAME
 		USING HINT =
 		'If you see this, most probably node with primary part has failed and' ||
 		' you need to promote replica. Promotion is not yet implemented, sorry :(';
@@ -685,7 +682,7 @@ DECLARE
 	newval text := shardman.ensure_sync_standby_c(standby);
 BEGIN
 	IF newval IS NOT NULL THEN
-		RAISE DEBUG '[SHARDMAN] Adding standby %, new value is %', standby, newval;
+		RAISE DEBUG '[SHMN] Adding standby %, new value is %', standby, newval;
 		PERFORM shardman.set_sync_standbys(newval);
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
@@ -699,7 +696,7 @@ DECLARE
 	newval text := shardman.remove_sync_standby_c(standby);
 BEGIN
 	IF newval IS NOT NULL THEN
-		RAISE DEBUG '[SHARDMAN] Removing standby %, new value is %', standby, newval;
+		RAISE DEBUG '[SHMN] Removing standby %, new value is %', standby, newval;
 		PERFORM shardman.set_sync_standbys(newval);
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
@@ -710,7 +707,7 @@ CREATE FUNCTION set_sync_standbys(standby text) RETURNS void AS $$
 BEGIN
 	PERFORM pg_reload_conf();
 	PERFORM shardman.set_sync_standbys_c(standby);
-	RAISE DEBUG '[SHARDMAN] sync_standbys set to %', standby;
+	RAISE DEBUG '[SHMN] sync_standbys set to %', standby;
 END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION set_sync_standbys_c(standby text) RETURNS void
 	AS 'pg_shardman' LANGUAGE C STRICT;

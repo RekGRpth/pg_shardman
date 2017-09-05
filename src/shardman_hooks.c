@@ -10,35 +10,64 @@
 
 #include "postgres.h"
 #include "utils/elog.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "storage/proc.h"
 
 #include "pg_shardman.h"
 #include "shardman_hooks.h"
 
-emit_log_hook_type log_hook_next;
+emit_log_hook_type old_log_hook;
+shmem_startup_hook_type old_shmem_startup_hook;
 
 /*
- * Add [SHARDMAN x] where x is node id to each log message, if '%z' is in
+ * Add [SHND x] where x is node id to each log message, if '%z' is in
  * log_line_prefix. Seems like there is no way to hook something into
  * prefix iself without touching core code.
- * TODO: In some, probably most interesting cases this hook is not called :(
  */
 void
-shardman_log_hook(ErrorData *edata)
+shardman_log(ErrorData *edata)
 {
 	MemoryContext oldcontext;
+	int32 id;
 
 	/* Invoke original hook if needed */
-	if (log_hook_next != NULL)
-		log_hook_next(edata);
+	if (old_log_hook != NULL)
+		old_log_hook(edata);
 
-	if (strstr(Log_line_prefix, "%z") != NULL &&
-		shardman_my_node_id != SHMN_INVALID_NODE_ID)
+	id = my_id();
+	if (id != SHMN_INVALID_NODE_ID && strstr(Log_line_prefix, "%z") != NULL)
 	{
 		oldcontext = MemoryContextSwitchTo(edata->assoc_context);
 
-		edata->message = psprintf("[SHARDMAN %d] %s",
-								  shardman_my_node_id, edata->message);
+		edata->message = psprintf("[SHND %d] %s", id, edata->message);
 
 		MemoryContextSwitchTo(oldcontext);
 	}
+}
+
+/*
+ * shmem_startup hook: allocate or attach to shared memory,
+ */
+void
+shardman_shmem_startup(void)
+{
+	bool found;
+
+	if (old_shmem_startup_hook)
+		old_shmem_startup_hook();
+
+	/*
+	 * Create or attach to the shared memory state, including hash table
+	 */
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	snss = ShmemInitStruct("pg_shardman", sizeof(ShmnSharedState), &found);
+	if (!found)
+	{
+		/* First time through ... */
+		MemSet(snss, 0, sizeof(snss)); /* snss is not ready yet */
+		snss->my_id = SHMN_INVALID_NODE_ID;
+		snss->lock = &(GetNamedLWLockTranche("pg_shardman"))->lock;
+	}
+	LWLockRelease(AddinShmemInitLock);
 }

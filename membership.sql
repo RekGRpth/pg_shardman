@@ -36,7 +36,7 @@ CREATE UNIQUE INDEX unique_node_connstr ON shardman.nodes (connstring)
 CREATE FUNCTION rm_node_worker_side() RETURNS TRIGGER AS $$
 BEGIN
 	IF OLD.id = (SELECT shardman.my_id()) THEN
-		RAISE DEBUG '[SHARDMAN] rm_node_worker_side called';
+		RAISE DEBUG '[SHMN] rm_node_worker_side called';
 		PERFORM shardman.pg_shardman_cleanup(false);
 	END IF;
 	RETURN NULL;
@@ -105,7 +105,7 @@ DECLARE
 	connstr text := connstring FROM shardman.nodes WHERE id = shardman.my_id();
 BEGIN
 	IF connstr IS NULL THEN
-		RAISE EXCEPTION 'Node not in cluster, can''t get its connstring';
+		RAISE EXCEPTION '[SHMN] Node not in cluster, can''t get its connstring';
 	END IF;
 	RETURN connstr;
 END $$ LANGUAGE plpgsql;
@@ -118,7 +118,7 @@ DECLARE
 				worker_status IS NOT NULL;
 BEGIN
 	IF connstr IS NULL THEN
-		RAISE EXCEPTION 'Worker node with id % not found', node_id;
+		RAISE EXCEPTION '[SHMN] Worker node with id % not found', node_id;
 	END IF;
 	RETURN connstr;
 END $$ LANGUAGE plpgsql STRICT;

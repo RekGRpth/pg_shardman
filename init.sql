@@ -18,8 +18,7 @@ BEGIN
 -- Yes, malicious user might have another extension containing 'pg_shardman'...
 -- Probably better just call no-op func from the library
 	IF strpos(current_setting('shared_preload_libraries'), 'pg_shardman') = 0 THEN
-		RAISE EXCEPTION 'pg_shardman must be loaded via shared_preload_libraries. Refusing to
-						proceed.';
+		RAISE EXCEPTION 'pg_shardman must be loaded via shared_preload_libraries. Refusing to proceed.';
 	END IF;
 END
 $$;
@@ -173,7 +172,7 @@ DECLARE
 	lord_connstring text;
 	lord_id int;
 BEGIN
-	raise INFO 'Booting lord';
+	RAISE INFO '[SHMN] Booting lord';
 	PERFORM shardman.create_meta_pub();
 
 	lord_id := shardman.my_id();
@@ -232,12 +231,12 @@ CREATE FUNCTION drop_repslot(slot_name text, with_fire bool DEFAULT false)
 DECLARE
 	slot_exists bool;
 BEGIN
-	RAISE DEBUG '[SHARDMAN] Dropping repslot %', slot_name;
+	RAISE DEBUG '[SHMN] Dropping repslot %', slot_name;
 	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
 				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
 		IF with_fire THEN -- kill walsender twice
-			RAISE DEBUG '[SHARDMAN] Killing repslot % with fire', slot_name;
+			RAISE DEBUG '[SHMN] Killing repslot % with fire', slot_name;
 			PERFORM shardman.terminate_repslot_walsender(slot_name);
 			PERFORM pg_sleep(1);
 			PERFORM shardman.terminate_repslot_walsender(slot_name);
@@ -268,8 +267,7 @@ CREATE FUNCTION eliminate_sub(subname name, drop_sub bool DEFAULT true)
 DECLARE
 	sub_exists bool;
 BEGIN
-	RAISE DEBUG '[SHARDMAN %] eliminating sub %, drop_sub %',
-		shardman.my_id(), subname, drop_sub;
+	RAISE DEBUG '[SHMN] eliminating sub %, drop_sub %', subname, drop_sub;
 	EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname
 				   = %L)', subname) INTO sub_exists;
 	IF sub_exists THEN
@@ -300,7 +298,7 @@ DECLARE
 	sub record;
 	rs record;
 BEGIN
-	RAISE DEBUG '[SHARDMAN %] pg_shardman is dropping, cleaning up', shardman.my_id();
+	RAISE DEBUG '[SHMN] pg_shardman is dropping, cleaning up';
 
 	FOR pub IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'shardman_%' LOOP
 		EXECUTE format('DROP PUBLICATION %I', pub.pubname);

@@ -275,20 +275,20 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 }
 
 /*
- * Set and reset node id stored in C variable
+ * Set and reset node id stored in shmem.
  */
 PG_FUNCTION_INFO_V1(set_node_id_c);
 Datum
 set_node_id_c(PG_FUNCTION_ARGS)
 {
-	shardman_my_node_id = PG_GETARG_INT32(0);
+	set_my_id(PG_GETARG_INT32(0));
 	PG_RETURN_VOID();
 }
 PG_FUNCTION_INFO_V1(reset_node_id_c);
 Datum
 reset_node_id_c(PG_FUNCTION_ARGS)
 {
-	shardman_my_node_id = SHMN_INVALID_NODE_ID;
+	set_my_id(SHMN_INVALID_NODE_ID);
 	PG_RETURN_VOID();
 }
 
