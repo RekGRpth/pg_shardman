@@ -1,5 +1,7 @@
 shardman.shardlord = on # this instance is shardlord?
 shardman.shardlord_dbname = ars # shardlord's dbname
 shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
-shardman.cmd_retry_naptime = 500 # sleep milliseconds after failure
+# Sleep milliseconds after any failure during cmd execution. Also, we restart
+# shardlord bgw itself after this period of time if it has failed.
+shardman.cmd_retry_naptime = 500
 shardman.poll_interval = 500 # long operations poll frequency in milliseconds
