@@ -23,6 +23,7 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 
+#include "catalog/pg_subscription_rel.h"
 #include "utils/memutils.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
@@ -549,8 +550,9 @@ add_node(Cmd *cmd)
 		conn = PQconnectdb(connstr);
 		if (PQstatus(conn) != CONNECTION_OK)
 		{
-			shmn_elog(NOTICE, "Connection to add_node node failed: %s",
-				 PQerrorMessage(conn));
+			shmn_elog(NOTICE,
+					  "add_node %s: connection to add_node node failed: %s",
+					  connstr, PQerrorMessage(conn));
 			goto attempt_failed;
 		}
 
@@ -560,8 +562,9 @@ add_node(Cmd *cmd)
 					 " where name = 'pg_shardman';");
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			shmn_elog(NOTICE, "Failed to check whether pg_shardman is installed on"
-				 " node to add: %s", PQerrorMessage(conn));
+			shmn_elog(NOTICE,
+					  "add_node %s: failed to check whether pg_shardman is installed, %s",
+					  connstr, PQerrorMessage(conn));
 			goto attempt_failed;
 		}
 		pg_shardman_installed = PQntuples(res) == 1 && !PQgetisnull(res, 0, 0);
@@ -574,7 +577,8 @@ add_node(Cmd *cmd)
 			res = PQexec(conn, "select shardman.my_id();");
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			{
-				shmn_elog(NOTICE, "Failed to get node id, %s", PQerrorMessage(conn));
+				shmn_elog(NOTICE, "add_node %s: failed to get node id, %s",
+						  connstr, PQerrorMessage(conn));
 				goto attempt_failed;
 			}
 
@@ -611,8 +615,8 @@ add_node(Cmd *cmd)
 					 " create extension pg_shardman;");
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
-			shmn_elog(NOTICE, "Failed to reinstall pg_shardman, %s",
-					  PQerrorMessage(conn));
+			shmn_elog(NOTICE, "add_node %s: failed to reinstall pg_shardman, %s",
+					  connstr, PQerrorMessage(conn));
 			goto attempt_failed;
 		}
 		PQclear(res);
@@ -634,8 +638,8 @@ add_node(Cmd *cmd)
 		pfree(sql);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			shmn_elog(NOTICE, "Failed to create subscription and set node id, %s",
-					  PQerrorMessage(conn));
+			shmn_elog(NOTICE, "add_node %s: failed to create subscription and set node id, %s",
+					  connstr, PQerrorMessage(conn));
 			goto attempt_failed;
 		}
 		PQclear(res);
@@ -645,10 +649,7 @@ add_node(Cmd *cmd)
 		 * e.g. we might miss UPDATE statements on partitions table, triggers
 		 * on newly added node won't fire and metadata would be inconsistent.
 		 */
-		sql =
-			"select srrelid, srsubstate from pg_subscription_rel srel join"
-			" pg_subscription s on srel.srsubid = s.oid where"
-			" subname = 'shardman_meta_sub';";
+		sql = GET_SUBSTATE_SQL("shardman_meta_sub");
 		while (!tablesync_done)
 		{
 			int i;
@@ -656,7 +657,7 @@ add_node(Cmd *cmd)
 			res = PQexec(conn, sql);
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			{
-				shmn_elog(NOTICE, "Adding node %s: failed to learn sub status, %s ",
+				shmn_elog(NOTICE, "add_node %s: failed to learn sub status, %s ",
 						  connstr, PQerrorMessage(conn));
 				goto attempt_failed;
 			}
@@ -664,13 +665,13 @@ add_node(Cmd *cmd)
 			tablesync_done = true;
 			for (i = 0; i < PQntuples(res); i++)
 			{
-				char *subrelid = PQgetvalue(res, i, 0);
-				char subrelstate = PQgetvalue(res, i, 1)[0];
-				if (subrelstate != 'r')
+				char subrelstate = PQgetvalue(res, i, 0)[0];
+				char *subrelid = PQgetvalue(res, i, 1);
+				if (subrelstate != SUBREL_STATE_READY)
 				{
 					tablesync_done = false;
 					shmn_elog(DEBUG1,
-							  "adding node %s: init sync is not yet finished"
+							  "add_node %s: init sync is not yet finished"
 							  " for rel %s, its state is %c",
 							  connstr, subrelid, subrelstate);
 					pg_usleep(shardman_poll_interval * 1000L);
@@ -823,6 +824,15 @@ void
 reset_pqconn_and_res(PGconn **conn, PGresult *res)
 {
 	PQclear(res); reset_pqconn(conn);
+}
+
+/*
+ * SQL to retrieve per-relation status of subscription with given name.
+ */
+char *
+get_substate_sql(const char *subname)
+{
+	return psprintf(GET_SUBSTATE_SQL("%s"), subname);
 }
 
 /*

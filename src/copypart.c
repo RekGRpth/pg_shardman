@@ -88,7 +88,9 @@
  */
 #include "postgres.h"
 #include "libpq-fe.h"
+#include "access/xlog.h"
 #include "access/xlogdefs.h"
+#include "catalog/pg_subscription_rel.h"
 #include "utils/pg_lsn.h"
 #include "utils/builtins.h"
 #include "lib/ilist.h"
@@ -125,12 +127,16 @@ static void exec_create_replica(CreateReplicaState *cps);
 static int mp_rebuild_lr(MovePartState *cps);
 static int cr_rebuild_lr(CreateReplicaState *cps);
 static int cp_start_tablesync(CopyPartState *cpts);
+static int check_sub_sync(const char *subname, PGconn **conn,
+						  XLogRecPtr ref_lsn, const char *log_pref);
 static int cp_start_finalsync(CopyPartState *cpts);
 static int cp_finalize(CopyPartState *cpts);
 static int ensure_pqconn_cp(CopyPartState *cpts, int nodes);
 static int ensure_pqconn(PGconn **conn, const char *connstr,
 								CopyPartState *cps);
 static void configure_retry(CopyPartState *cpts, int millis);
+static char *received_lsn_sql(const char *subname);
+static XLogRecPtr pg_lsn_in_c(const char *lsn);
 static struct timespec timespec_now_plus_millis(int millis);
 struct timespec timespec_now(void);
 
@@ -297,7 +303,7 @@ init_cp_state(CopyPartState *cps)
 	Assert(cps->dst_node != 0);
 	Assert(cps->part_name != NULL);
 
-	/* Check that table with such name is not already exists on dst node */
+	/* Check that table with such name does not already exist on dst node */
 	sql = psprintf(
 		"select owner from shardman.partitions where part_name = '%s' and owner = %d",
 		cps->part_name, cps->dst_node);
@@ -359,18 +365,11 @@ init_cp_state(CopyPartState *cps)
 		cps->part_name, cps->relation,
 		cps->logname,
 		cps->logname, cps->src_connstr, cps->logname, cps->logname);
-	cps->substate_sql = psprintf(
-		"select srsubstate from pg_subscription_rel srel join pg_subscription"
-		" s on srel.srsubid = s.oid where subname = '%s';",
-		cps->logname
-		);
+	cps->substate_sql = get_substate_sql(cps->logname);
 	cps->readonly_sql = psprintf(
 		"select shardman.readonly_table_on('%s')", cps->part_name
 		);
-	cps->received_lsn_sql = psprintf(
-		"select received_lsn from pg_stat_subscription where subname = '%s'",
-		cps->logname
-		);
+	cps->received_lsn_sql = received_lsn_sql(cps->logname);
 
 	cps->curstep = COPYPART_START_TABLESYNC;
 	cps->res = TASK_IN_PROGRESS;
@@ -816,7 +815,7 @@ cr_rebuild_lr(CreateReplicaState *crs)
  *   i.e. when received_lsn is equal to remembered lsn on src. This is harder
  *   to replace with notify, but we can try that too.
  * - Done. After successfull execution, we are left with two copies of the
- *   table with src one locked for writes and with LR channel configured
+ *   table with src locked for writes and with LR channel configured
  *   between them. TODO: drop channel here, because we don't reuse it anyway.
  *   Currently we drop the channel in metadata update triggers.
  */
@@ -849,9 +848,34 @@ int
 cp_start_tablesync(CopyPartState *cps)
 {
 	PGresult *res;
+	XLogRecPtr lord_lsn = GetXLogWriteRecPtr();
 
 	if (ensure_pqconn_cp(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
+
+	/*
+	 * Make sure that meta sub is up-to-date on src and dst. If not, subtle
+	 * bugs may arise: imagine we move part from x to y, and then immediately
+	 * create replica on x from y back again. During repl creation we delete
+	 * old real partition on x before meta row about part move reaches x. When
+	 * it finally arrives, we try to replace real partition with fdw one, but
+	 * the former was dropped.
+	 *
+	 * We get current lsn and verify that lsn of src and dst is as big as
+	 * ours. Obviously, during this check other backends might increase lsn,
+	 * but we rely on fact that shardlord itself is single-threaded, so
+	 * external changes are not interesting.
+	 */
+	if (check_sub_sync("shardman_meta_sub", &cps->src_conn, lord_lsn,
+					   "meta sub") == -1)
+	{
+		goto fail;
+	}
+	if (check_sub_sync("shardman_meta_sub", &cps->dst_conn, lord_lsn,
+					   "meta sub") == -1)
+	{
+		goto fail;
+	}
 
 	res = PQexec(cps->dst_conn, cps->dst_drop_sub_sql);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
@@ -859,8 +883,7 @@ cp_start_tablesync(CopyPartState *cps)
 		shmn_elog(NOTICE, "Failed to drop sub on dst: %s",
 				  PQerrorMessage(cps->dst_conn));
 		reset_pqconn_and_res(&cps->dst_conn, res);
-		configure_retry(cps, shardman_cmd_retry_naptime);
-		return -1;
+		goto fail;
 	}
 	PQclear(res);
 	shmn_elog(DEBUG1, "cp %s: sub on dst dropped, if any", cps->part_name);
@@ -871,8 +894,7 @@ cp_start_tablesync(CopyPartState *cps)
 		shmn_elog(NOTICE, "Failed to create pub and repslot on src: %s",
 				  PQerrorMessage(cps->src_conn));
 		reset_pqconn_and_res(&cps->src_conn, res);
-		configure_retry(cps, shardman_cmd_retry_naptime);
-		return -1;
+		goto fail;
 	}
 	PQclear(res);
 	shmn_elog(DEBUG1, "cp %s: pub and rs recreated on src", cps->part_name);
@@ -883,14 +905,55 @@ cp_start_tablesync(CopyPartState *cps)
 		shmn_elog(NOTICE, "Failed to recreate table & sub on dst: %s",
 				  PQerrorMessage(cps->dst_conn));
 		reset_pqconn_and_res(&cps->dst_conn, res);
-		configure_retry(cps, shardman_cmd_retry_naptime);
-		return -1;
+		goto fail;
 	}
 	PQclear(res);
 	shmn_elog(DEBUG1, "cp %s: table & sub created on dst, tablesync started",
 			  cps->part_name);
 
 	cps->curstep = COPYPART_START_FINALSYNC;
+	return 0;
+
+fail:
+	configure_retry(cps, shardman_cmd_retry_naptime);
+	return -1;
+}
+
+/*
+ * Ask node via given PGconn about last received lsn for given sub and compare
+ * it to given ref_lsn. If node's lsn lags behind or libpq failed, return -1,
+ * otherwise 0. Log messages are prefixed with log_pref. Subscription must
+ * exist.
+ */
+int
+check_sub_sync(const char *subname, PGconn **conn, XLogRecPtr ref_lsn,
+			   const char *log_pref)
+{
+	PGresult *res;
+	char *received_lsn_str;
+	XLogRecPtr received_lsn;
+	char *sql = received_lsn_sql(subname);
+
+	res = PQexec(*conn, sql);
+	pfree(sql);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(LOG, "%s: failed to learn sub lsn on src: %s",
+				  log_pref, PQerrorMessage(*conn));
+		reset_pqconn_and_res(conn, res);
+		return -1;
+	}
+	Assert(PQntuples(res) == 1);
+	received_lsn_str = PQgetvalue(res, 0, 0);
+	shmn_elog(DEBUG1, "%s: received_lsn is %s", log_pref, received_lsn_str);
+	received_lsn = pg_lsn_in_c(received_lsn_str);
+	PQclear(res);
+	if (received_lsn < ref_lsn)
+	{
+		shmn_elog(DEBUG1, "%s: sub is not yet synced, received_lsn is %lu, "
+				  " but we wait for %lu", log_pref, received_lsn, ref_lsn);
+		return -1;
+	}
 	return 0;
 }
 
@@ -905,7 +968,6 @@ int
 cp_start_finalsync(CopyPartState *cps)
 {
 	PGresult *res;
-	int ntups;
 	char substate;
 	char *sync_point;
 
@@ -921,20 +983,9 @@ cp_start_finalsync(CopyPartState *cps)
 		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
-	ntups = PQntuples(res);
-	if (ntups != 1)
-	{
-		shmn_elog(WARNING, "cp %s: num of subrels != 1", cps->part_name);
-		/*
-		 * Since several or 0 subrels is absolutely wrong situtation, we start
-		 * from the beginning.
-		 */
-		cps->curstep =	COPYPART_START_TABLESYNC;
-		configure_retry(cps, shardman_cmd_retry_naptime);
-		return -1;
-	}
+	Assert(PQntuples(res) == 1);
 	substate = PQgetvalue(res, 0, 0)[0];
-	if (substate != 'r')
+	if (substate != SUBREL_STATE_READY)
 	{
 		shmn_elog(DEBUG1, "cp %s: init sync is not yet finished, its state"
 				  " is %c", cps->part_name, substate);
@@ -976,41 +1027,18 @@ cp_start_finalsync(CopyPartState *cps)
 }
 
 /*
- * Wait until final sync is done and update metadata. Returns -1 if anything
- * goes wrong and 0 otherwise.
+ * Check that final sync is done and update curstep. Returns -1 if anything
+ * goes wrong or sync is not finished and 0 otherwise.
  */
 int
 cp_finalize(CopyPartState *cps)
 {
-
-	PGresult *res;
-	XLogRecPtr received_lsn;
-	char *received_lsn_str;
-
 	if (ensure_pqconn_cp(cps, ENSURE_PQCONN_DST) == -1)
 		return -1;
 
-	res = PQexec(cps->dst_conn, cps->received_lsn_sql);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	if (check_sub_sync(cps->logname, &cps->dst_conn, cps->sync_point,
+					   cps->part_name) == -1)
 	{
-		shmn_elog(NOTICE, "Failed to learn received_lsn on dst: %s",
-				  PQerrorMessage(cps->dst_conn));
-		reset_pqconn_and_res(&cps->dst_conn, res);
-		configure_retry(cps, shardman_cmd_retry_naptime);
-		return -1;
-	}
-	received_lsn_str = PQgetvalue(res, 0, 0);
-	shmn_elog(DEBUG1, "cp %s: received_lsn is %s", cps->part_name,
-			  received_lsn_str);
-	received_lsn = DatumGetLSN(DirectFunctionCall1Coll(
-								   pg_lsn_in, InvalidOid,
-								   CStringGetDatum(received_lsn_str)));
-	PQclear(res);
-	if (received_lsn < cps->sync_point)
-	{
-		shmn_elog(DEBUG1, "cp %s: final sync is not yet finished,"
-				  "received_lsn is %lu, but we wait for %lu",
-				  cps->part_name, received_lsn, cps->sync_point);
 		configure_retry(cps, shardman_poll_interval);
 		return -1;
 	}
@@ -1078,6 +1106,26 @@ void configure_retry(CopyPartState *cps, int millis)
 			  cps->part_name, millis);
 	cps->waketm = timespec_now_plus_millis(millis);
 	cps->exec_res = TASK_WAKEMEUP;
+}
+
+/*
+ * SQL to get last received lsn for given subscription
+ */
+char *
+received_lsn_sql(const char *subname)
+{
+	return psprintf("select received_lsn from pg_stat_subscription"
+					" where subname = '%s';", subname);
+}
+
+/*
+ * Convert C string lsn in standard form to binary format.
+ */
+XLogRecPtr
+pg_lsn_in_c(const char *lsn)
+{
+	return DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid,
+						   CStringGetDatum(lsn)));
 }
 
 /*

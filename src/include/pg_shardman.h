@@ -51,8 +51,8 @@ do { \
 } while (0)
 /*
  * Additionally check for SIGUSR1; if it has arrived, mark cmd as canceled and
- * return from current function. Used to save typing void funcs where we don't
- * need to do anything before 'return'.
+ * return from current function. Used to save typing in void funcs where we
+ * don't need to do anything before 'return'.
  */
 #define SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd) \
 do { \
@@ -111,6 +111,10 @@ extern void shardlord_main(Datum main_arg);
 extern bool signal_pending(void);
 extern void check_for_sigterm(void);
 extern void cmd_canceled(Cmd *cmd);
+#define GET_SUBSTATE_SQL(subname) \
+	"select srsubstate, srrelid from pg_subscription_rel srel join" \
+	" pg_subscription s on srel.srsubid = s.oid where subname = '" subname "';"
+extern char *get_substate_sql(const char *subname);
 extern void reset_pqconn(PGconn **conn);
 extern void reset_pqconn_and_res(PGconn **conn, PGresult *res);
 extern uint64 void_spi(char *sql);
