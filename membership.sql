@@ -99,15 +99,11 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Get local node connstr. Throws an error, if node is not in cluster
+-- Get local node connstr. Returns NULL if node is not in cluster and never was
+-- in one.
 CREATE FUNCTION my_connstr() RETURNS text AS $$
-DECLARE
-	connstr text := connstring FROM shardman.nodes WHERE id = shardman.my_id();
 BEGIN
-	IF connstr IS NULL THEN
-		RAISE EXCEPTION '[SHMN] Node not in cluster, can''t get its connstring';
-	END IF;
-	RETURN connstr;
+	RETURN connstring FROM shardman.nodes WHERE id = shardman.my_id();
 END $$ LANGUAGE plpgsql;
 
 -- Get connstr of worker node with id node_id. ERROR is raised if there isn't

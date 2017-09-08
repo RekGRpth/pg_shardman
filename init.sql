@@ -316,7 +316,10 @@ BEGIN
 		-- otherwise we will hang
 		SET LOCAL synchronous_commit TO LOCAL;
 		-- TODO: remove only shardman's standbys
-		PERFORM shardman.set_sync_standbys('');
+		-- If we never were in the cluster, we didn't touch sync_standby_names
+		IF shardman.my_connstr() != NULL THEN
+			PERFORM shardman.set_sync_standbys('');
+		END IF;
 	END IF;
 
 	PERFORM shardman.reset_node_id();
