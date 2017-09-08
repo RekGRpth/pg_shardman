@@ -90,6 +90,9 @@ Add node with given libpq connstring to the cluster. Node is assigned unique
 id. If node previously contained shardman state from old cluster (not one
 managed by current shardlord), this state will be lost.
 
+my_id()
+Get this node's id.
+
 rm_node(node_id int)
 Remove node from the cluster. Its shardman state will be reset. We don't delete
 tables with data and foreign tables though.
@@ -178,7 +181,13 @@ Note on permissions: since creating subscription requires superuser priviliges,
 connections strings provided to add_node, as well as shardlord_connstring GUC
 must be of superuser ones. This might be relaxed in the future.
 
+About transactions: in short, currently they are none of them. Local changes are
+handled by PostgreSQL as usual -- so if you queries touch only only node, you
+are safe, but distributed transaction are not yet implemented.
+
 Limitations:
+* You can't currently use synchronous replication (sync_standby_names) with
+  pg_shardman.
 * We are bound to Linux since we use epoll, select should be added.
 * We can't switch shardlord for now.
 * The shardlord itself can't be worker node for now.
