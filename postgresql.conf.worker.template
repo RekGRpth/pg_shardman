@@ -2,3 +2,5 @@
 max_logical_replication_workers = 50
 # At least max_logical_replication_workers + 1
 max_worker_processes = 60
+# Logical worker dies if it hadn't receive anything new during wal_receiver_timeout
+wal_receiver_timeout = 60s

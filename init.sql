@@ -312,14 +312,12 @@ BEGIN
 		WHERE slot_name LIKE 'shardman_%' AND slot_type = 'logical' LOOP
 		PERFORM shardman.drop_repslot(rs.slot_name, true);
 	END LOOP;
-	IF shardman.my_id() IS NOT NULL THEN
-		-- otherwise we will hang
-		SET LOCAL synchronous_commit TO LOCAL;
 		-- TODO: remove only shardman's standbys
 		-- If we never were in the cluster, we didn't touch sync_standby_names
-		IF shardman.my_connstr() != NULL THEN
-			PERFORM shardman.set_sync_standbys('');
-		END IF;
+	IF shardman.my_connstr() IS NOT NULL THEN
+		-- otherwise we will hang
+		SET LOCAL synchronous_commit TO LOCAL;
+		PERFORM shardman.set_sync_standbys('');
 	END IF;
 
 	PERFORM shardman.reset_node_id();

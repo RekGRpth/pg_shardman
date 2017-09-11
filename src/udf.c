@@ -411,17 +411,18 @@ set_sync_standbys_c(PG_FUNCTION_ARGS)
 	char *standbys = quote_literal_cstr(text_to_cstring(PG_GETARG_TEXT_PP(0)));
 	char *cmd = psprintf("alter system set synchronous_standby_names to %s",
 						 standbys);
-	char *my_id_sql = "select shardman.my_connstr();";
+	char *my_connstr_sql = "select shardman.my_connstr();";
 	char *connstr;
 	PGconn *conn = NULL;
 	PGresult *res = NULL;
 
 	SPI_connect();
-	if (SPI_execute(my_id_sql, true, 0) < 0 || SPI_processed != 1)
-		elog(FATAL, "Stmt failed: %s", my_id_sql);
+	if (SPI_execute(my_connstr_sql, true, 0) < 0 || SPI_processed != 1)
+		elog(FATAL, "Stmt failed: %s", my_connstr_sql);
 	connstr = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 
 	conn = PQconnectdb(connstr);
+	SPI_finish(); /* Can't do earlier since connstr is allocated there */
 	if (PQstatus(conn) != CONNECTION_OK)
 	{
 		PQfinish(conn);
@@ -438,6 +439,5 @@ set_sync_standbys_c(PG_FUNCTION_ARGS)
 
 	PQclear(res);
 	PQfinish(conn);
-	SPI_finish(); /* Can't do earlier since connstr is allocated there */
 	PG_RETURN_VOID();
 }
