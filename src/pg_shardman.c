@@ -168,8 +168,9 @@ _PG_init()
 		shardlord_bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
 		shardlord_bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-		shardlord_bgw.bgw_restart_time = shardman_cmd_retry_naptime;
-		/* shardlord_bgw.bgw_restart_time = BGW_NEVER_RESTART; */
+		/* + 999 to round up */
+		shardlord_bgw.bgw_restart_time =
+			(shardman_cmd_retry_naptime + 999) / 1000L;
 		sprintf(shardlord_bgw.bgw_library_name, "pg_shardman");
 		sprintf(shardlord_bgw.bgw_function_name, "shardlord_main");
 		shardlord_bgw.bgw_notify_pid = 0;
