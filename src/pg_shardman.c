@@ -461,7 +461,7 @@ pg_shardman_installed_local(void)
 	if (get_extension_oid("pg_shardman", true) == InvalidOid)
 	{
 		installed = false;
-		shmn_elog(WARNING,
+		shmn_elog(INFO,
 				  "Terminating shardlord: pg_shardman lib is preloaded, but ext is not created");
 	}
 	PopActiveSnapshot();

@@ -41,17 +41,7 @@ PostgreSQL GUCs for either shardlord and workers, the latter for shardlord only
 -- in particular, shardman.shardlord defines whether the instance is shardlord or
 not.
 
-Immediately after starting the server with shardman library preloaded, but
-before creating extension you will receive on shardlord warning like
-
-WARNING: pg_shardman library is preloaded on shardlord, but extenstion is not
-  created
-
-This is normal as we have here kind of circular dependency: it is pointless to
-create extension without the library, and library also uses SQL objects, so
-shardlord won't start without installed extension.
-
-Currently extension scheme is fixed, it is, who would have though, 'shardman'.
+Currently extension scheme is fixed, it is, who would have thought, 'shardman'.
 
 Now you can issue commands to the shardlord. All shardman commands (cmds) you
 issue return immediately because they technically just submit the cmd to the
