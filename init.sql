@@ -72,13 +72,16 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Remove node. Its state will be reset, all shardman data lost.
-CREATE FUNCTION rm_node(node_id int) RETURNS int AS $$
+CREATE FUNCTION rm_node(node_id int, force bool default false) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
 	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'rm_node')
 										   RETURNING id INTO c_id;
 	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
+	IF force THEN
+	    INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, 'force');
+	END IF;
 	RETURN c_id;
 END
 $$ LANGUAGE plpgsql;

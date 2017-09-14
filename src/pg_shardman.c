@@ -760,6 +760,16 @@ node_in_cluster(int id)
 	return res;
 }
 
+static void
+rm_partition(int node_id, char const* part_name)
+{
+	char* sql;
+	sql = psprintf("delete from shardman.partitions where owner=%d and part_name='%s'",
+				   node_id, part_name);
+	void_spi(sql);
+	pfree(sql);
+}
+
 /*
  * Remove node, losing all data on it. We
  * - ensure that there is active node with given id in the cluster
@@ -774,6 +784,43 @@ rm_node(Cmd *cmd)
 {
 	int32 node_id = atoi(cmd->opts[0]);
 	char *sql;
+	char **opts;
+	bool force = false;
+	int i, e;
+
+	for (opts = cmd->opts; *opts; opts++)
+	{
+		if (strcmp(*opts, "force") == 0)
+		{
+			force = true;
+			break;
+		}
+	}
+
+	SPI_PROLOG;
+	sql = psprintf("select part_name from shardman.partitions where owner=%d", node_id);
+	e = SPI_execute(sql, true, 0);
+	if (e < 0)
+		shmn_elog(FATAL, "Stmt failed: %s", sql);
+	pfree(sql);
+	if (SPI_processed > 0)
+	{
+		TupleDesc rowdesc = SPI_tuptable->tupdesc;
+		if (!force)
+		{
+
+			ereport(ERROR, (errmsg("Can not remove node with existed partitions"),
+							errhint("Add \"force\" option to remove node with existed partitions.")));
+		}
+		/* Remove partitions belonging to this node */
+		for (i = 0; i < SPI_processed; i++)
+		{
+			HeapTuple tuple = SPI_tuptable->vals[i];
+			char const* partition = SPI_getvalue(tuple, rowdesc, 1);
+			rm_partition(node_id, partition);
+		}
+	}
+	SPI_EPILOG;
 
 	elog(INFO, "Removing node %d ", node_id);
 	if (!node_in_cluster(node_id))
