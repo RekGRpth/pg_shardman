@@ -305,12 +305,17 @@ BEGIN
 		-- Drop sub for old channel src -> next
 		PERFORM shardman.eliminate_sub(src_next_lname);
 		PERFORM update shardman.partitions set prv=OLD.prv where owner=me and part_name=OLD.part_name;
-	END IF;
+		-- This replica is promoted to primary node, so drop trigger disabling writes to the table
+		PERFORM readonly_replica_off(part_name);
+		-- and replace FDW with local partition
+	    PERFORM shardman.replace_usual_part_with_foreign(new_primary);
+ 	END IF;
 
 	-- If primary was moved 
 	IF OLD.prv IS NULL THEN
 	   -- And update fdw almost everywhere
 	   PERFORM shardman.update_fdw_server(new_primary);
+	   PERFORM shardman.replace_foreign_part_with_usual(NEW);
 	END IF;
 
 	RETURN NULL;
