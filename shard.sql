@@ -251,6 +251,89 @@ CREATE TRIGGER part_moved AFTER UPDATE ON shardman.partitions
 -- fire trigger only on worker nodes
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER part_moved;
 
+
+-- Partition removed: drop old LR channels.
+CREATE FUNCTION part_removed() RETURNS TRIGGER AS $$
+DECLARE
+	me int := shardman.my_id();
+	prev_src_lname text;
+	src_next_lname text;
+	new_primary partitions;
+	drop_slot_delay int := 2000; -- two seconds
+BEGIN
+	RAISE DEBUG '[SHMN] part_removed trigger called for part %, owner %',
+		OLD.part_name, OLD.owner;
+
+	ASSERT (OLD.prv IS NULL OR OLD.nxt IS NULL), 'We currently do not support redundancy level > 2';
+
+	IF OLD.prv IS NOT NULL THEN
+		prev_src_lname := shardman.get_data_lname(OLD.part_name, OLD.prv, OLD.owner);
+	ELSE
+	    -- Primaty is moved
+	    select * from shardman.partitions where owner=OLD.nxt and part_name=OLD.part_name into new_primary;
+	END IF;
+	IF OLD.nxt IS NOT NULL THEN
+		src_next_lname := shardman.get_data_lname(OLD.part_name, OLD.owner, OLD.nxt);
+	END IF;
+
+
+	IF me = OLD.owner THEN -- src node
+		-- If primary part was moved, replace on src node its partition with
+		-- foreign one
+		IF OLD.prv IS NULL THEN
+			PERFORM shardman.replace_usual_part_with_foreign(new_primary);
+		ELSE
+			-- On the other hand, if prev replica existed, drop sub for old
+			-- channel prev -> src
+			PERFORM shardman.eliminate_sub(prev_src_lname);
+		END IF;
+		IF OLD.nxt IS NOT NULL THEN
+			-- If next replica existed, drop pub for old channel src -> next
+ 		    -- Wait sometime to let other node first remove subscription
+		    PERFORM pg_sleep(drop_slot_delay);
+			PERFORM shardman.drop_repslot_and_pub(src_next_lname);
+			PERFORM shardman.remove_sync_standby(src_next_lname);
+		END IF;
+		-- Drop old table anyway
+		EXECUTE format('DROP TABLE IF EXISTS %I', OLD.part_name);
+	ELSEIF me = OLD.prv THEN -- node with prev replica
+		-- Wait sometime to let other node first remove subscription
+		PERFORM pg_sleep(drop_slot_delay);
+		-- Drop pub for old channel prev -> src
+		PERFORM shardman.drop_repslot_and_pub(prev_src_lname);
+		PERFORM shardman.remove_sync_standby(prev_src_lname);
+		-- Update L2-list (TODO: change replication model from chain to star)
+		PERFORM update shardman.partitions set nxt=OLD.nxt where owner=me and part_name=OLD.part_name;
+	ELSEIF me = OLD.nxt THEN -- node with next replica
+		-- Drop sub for old channel src -> next
+		PERFORM shardman.eliminate_sub(src_next_lname);
+		-- Update L2-list (TODO: change replication model from chain to star)
+		PERFORM update shardman.partitions set prv=OLD.prv where owner=me and part_name=OLD.part_name;
+	    -- This replica is promoted to primary node, so drop trigger disabling writes to the table
+		PERFORM readonly_replica_off(part_name);
+		-- Replace FDW with local partition
+	    PERFORM shardman.replace_foreign_part_with_usual(new_primary);
+ 	END IF;
+
+	-- If primary was moved 
+	IF OLD.prv IS NULL THEN
+	   -- then update fdw almost everywhere
+	   PERFORM shardman.update_fdw_server(new_primary);
+	END IF;
+
+	RETURN NULL;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER part_removed AFTER REMOVE ON shardman.partitions
+	FOR EACH ROW
+	EXECUTE PROCEDURE part_removed();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER part_removed;
+
+
+
+
 -- Executed on newtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_drop_cp_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
