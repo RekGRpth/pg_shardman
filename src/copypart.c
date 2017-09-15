@@ -842,7 +842,7 @@ exec_cp(CopyPartState *cps)
 
 /*
  * Set up logical replication between src and dst. If anything goes wrong,
- * it configures cps properly and returns -1, otherwise 0.
+ * configure cps properly and return -1, otherwise 0.
  */
 int
 cp_start_tablesync(CopyPartState *cps)
@@ -859,7 +859,8 @@ cp_start_tablesync(CopyPartState *cps)
 	 * create replica on x from y back again. During repl creation we delete
 	 * old real partition on x before meta row about part move reaches x. When
 	 * it finally arrives, we try to replace real partition with fdw one, but
-	 * the former was dropped.
+	 * the former was dropped. Interesting that I could reproduce only with
+	 * synchronous_commit set to off.
 	 *
 	 * We get current lsn and verify that lsn of src and dst is as big as
 	 * ours. Obviously, during this check other backends might increase lsn,
@@ -943,7 +944,14 @@ check_sub_sync(const char *subname, PGconn **conn, XLogRecPtr ref_lsn,
 		reset_pqconn_and_res(conn, res);
 		return -1;
 	}
-	Assert(PQntuples(res) == 1);
+	/* FIXME: this should never be true, but sometimes it is. */
+	if (PQntuples(res) != 1)
+	{
+		shmn_elog(LOG, "learning sub %s lsn returned %d rows, query %s",
+				  subname, PQntuples(res), sql);
+		PQclear(res);
+		return -1;
+	}
 	received_lsn_str = PQgetvalue(res, 0, 0);
 	shmn_elog(DEBUG1, "%s: received_lsn is %s", log_pref, received_lsn_str);
 	received_lsn = pg_lsn_in_c(received_lsn_str);
@@ -970,6 +978,7 @@ cp_start_finalsync(CopyPartState *cps)
 	PGresult *res;
 	char substate;
 	char *sync_point;
+	int ntup;
 
 	if (ensure_pqconn_cp(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
@@ -983,12 +992,22 @@ cp_start_finalsync(CopyPartState *cps)
 		configure_retry(cps, shardman_cmd_retry_naptime);
 		return -1;
 	}
-	Assert(PQntuples(res) == 1);
+	ntup = PQntuples(res);
+	/* FIXME: this should never be true, but sometimes it is. */
+	if (ntup != 1)
+	{
+		shmn_elog(NOTICE, "cp %s: learning sub status on dst returned %d rows, query %s",
+				  cps->logname, ntup, cps->substate_sql);
+		PQclear(res);
+		configure_retry(cps, shardman_cmd_retry_naptime);
+		return -1;
+	}
 	substate = PQgetvalue(res, 0, 0)[0];
 	if (substate != SUBREL_STATE_READY)
 	{
 		shmn_elog(DEBUG1, "cp %s: init sync is not yet finished, its state"
 				  " is %c", cps->part_name, substate);
+		PQclear(res);
 		configure_retry(cps, shardman_poll_interval);
 		return -1;
 	}

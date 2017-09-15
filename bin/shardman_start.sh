@@ -21,9 +21,4 @@ for port in $lord_port "${worker_ports[@]}"; do
     psql -p $port -c "create extension pg_shardman cascade;"
 done
 
-# to restart lord bgw
-restart_nodes
-
 run_demo
-
-# psql

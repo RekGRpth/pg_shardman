@@ -182,7 +182,9 @@ BEGIN
 		EXECUTE format(
 			'INSERT INTO shardman.nodes VALUES (DEFAULT, %L, NULL, true)
 			RETURNING id', lord_connstring) INTO lord_id;
-		PERFORM shardman.set_node_id(lord_id);
+		PERFORM shardman.set_my_id(lord_id);
+		PERFORM shardman.alter_system_c('shardman.my_id', lord_id::text);
+		PERFORM pg_reload_conf();
 		init_lord := true;
 	ELSE
 		EXECUTE 'SELECT NOT (SELECT shardlord FROM shardman.nodes WHERE id = $1)'
@@ -219,27 +221,32 @@ $$ LANGUAGE plpgsql;
 -- About 'hard' option: we can't just drop replication slots because
 -- pg_drop_replication_slot will bail out with ERROR if connection is active.
 -- Therefore the caller must either ensure that the connection is dead (e.g.
--- drop subscription on far end) or pass 'true' to 'with_fire' option, which does
--- the following dirty hack. It kills twice active walsender with 1 second
--- interval. After the first kill, replica will immediately try to reconnect,
--- so the connection resurrects instantly. However, if we kill it second time,
--- replica won't try to reconnect until wal_retrieve_retry_interval after its
--- first reaction passes, which is 5 secs by default. Of course, this is not
--- reliable and should be redesigned.
+-- drop subscription on far end) or pass 'true' to 'with_fire' option, which
+-- does the following dirty hack. It kills several times active walsender with 1
+-- second interval. After the first kill, replica will immediately try to
+-- reconnect, so the connection resurrects instantly. However, if we kill it
+-- second time, replica won't try to reconnect until wal_retrieve_retry_interval
+-- after its first reaction passes, which is 5 secs by default. Of course, this
+-- is not reliable and should be redesigned.
 CREATE FUNCTION drop_repslot(slot_name text, with_fire bool DEFAULT false)
 	RETURNS void AS $$
 DECLARE
 	slot_exists bool;
+	kill_ws_times int := 2;
 BEGIN
 	RAISE DEBUG '[SHMN] Dropping repslot %', slot_name;
 	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
 				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
-		IF with_fire THEN -- kill walsender twice
+		IF with_fire THEN -- kill walsender several times
 			RAISE DEBUG '[SHMN] Killing repslot % with fire', slot_name;
-			PERFORM shardman.terminate_repslot_walsender(slot_name);
-			PERFORM pg_sleep(1);
-			PERFORM shardman.terminate_repslot_walsender(slot_name);
+			FOR i IN 1..kill_ws_times LOOP
+				RAISE DEBUG '[SHMN] Killing walsender for slot %', slot_name;
+				PERFORM shardman.terminate_repslot_walsender(slot_name);
+				IF i != kill_ws_times THEN
+					PERFORM pg_sleep(1);
+				END IF;
+			END LOOP;
 		END IF;
 		EXECUTE format('SELECT pg_drop_replication_slot(%L)', slot_name);
 	END IF;
@@ -320,7 +327,7 @@ BEGIN
 		PERFORM shardman.set_sync_standbys('');
 	END IF;
 
-	PERFORM shardman.reset_node_id();
+	PERFORM shardman.reset_my_id();
 END;
 $$ LANGUAGE plpgsql;
 CREATE FUNCTION pg_shardman_cleanup_c() RETURNS event_trigger
@@ -328,3 +335,6 @@ CREATE FUNCTION pg_shardman_cleanup_c() RETURNS event_trigger
 CREATE EVENT TRIGGER cleanup_lr_trigger ON ddl_command_start
 	WHEN TAG IN ('DROP EXTENSION')
 	EXECUTE PROCEDURE pg_shardman_cleanup_c();
+
+CREATE FUNCTION alter_system_c(opt text, val text) RETURNS void
+	AS 'pg_shardman' LANGUAGE C STRICT;

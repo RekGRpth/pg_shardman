@@ -277,16 +277,16 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 /*
  * Set and reset node id stored in shmem.
  */
-PG_FUNCTION_INFO_V1(set_node_id_c);
+PG_FUNCTION_INFO_V1(set_my_id_c);
 Datum
-set_node_id_c(PG_FUNCTION_ARGS)
+set_my_id_c(PG_FUNCTION_ARGS)
 {
 	set_my_id(PG_GETARG_INT32(0));
 	PG_RETURN_VOID();
 }
-PG_FUNCTION_INFO_V1(reset_node_id_c);
+PG_FUNCTION_INFO_V1(reset_my_id_c);
 Datum
-reset_node_id_c(PG_FUNCTION_ARGS)
+reset_my_id_c(PG_FUNCTION_ARGS)
 {
 	set_my_id(SHMN_INVALID_NODE_ID);
 	PG_RETURN_VOID();
@@ -399,19 +399,19 @@ remove_sync_standby_c(PG_FUNCTION_ARGS)
 }
 
 /*
- * Execute ALTER SYSTEM SET synchronous_standby_names TO 'arg'. We can't do
- * that from usual function, because ALTER SYSTEM cannon be executed within
- * transaction, so we resort to another exquisite hack: we connect to
- * ourselves via libpq and perform the job.
+ * Execute ALTER SYSTEM SET 'arg0' TO 'arg1'. We can't do that from usual
+ * function, because ALTER SYSTEM cannon be executed within transaction, so we
+ * resort to another exquisite hack: we connect to ourselves via libpq and
+ * perform the job.
  */
-PG_FUNCTION_INFO_V1(set_sync_standbys_c);
+PG_FUNCTION_INFO_V1(alter_system_c);
 Datum
-set_sync_standbys_c(PG_FUNCTION_ARGS)
+alter_system_c(PG_FUNCTION_ARGS)
 {
-	char *standbys = quote_literal_cstr(text_to_cstring(PG_GETARG_TEXT_PP(0)));
-	char *cmd = psprintf("alter system set synchronous_standby_names to %s",
-						 standbys);
-	char *my_connstr_sql = "select shardman.my_connstr();";
+	char *opt = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *val = quote_literal_cstr(text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	char *cmd = psprintf("alter system set %s to %s", opt, val);
+	char *my_connstr_sql = "select shardman.my_connstr_strict();";
 	char *connstr;
 	PGconn *conn = NULL;
 	PGresult *res = NULL;
@@ -434,7 +434,7 @@ set_sync_standbys_c(PG_FUNCTION_ARGS)
 	{
 		PQclear(res);
 		PQfinish(conn);
-		elog(ERROR, "setting sync standby namesfailed");
+		elog(ERROR, "setting %s to %s failed", opt, val);
 	}
 
 	PQclear(res);

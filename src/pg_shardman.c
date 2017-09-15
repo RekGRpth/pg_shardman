@@ -45,7 +45,7 @@ static PGconn *listen_cmd_log_inserts(void);
 static void wait_notify(void);
 static void shardlord_sigterm(SIGNAL_ARGS);
 static void shardlord_sigusr1(SIGNAL_ARGS);
-static void pg_shardman_installed_local(void);
+static bool pg_shardman_installed_local(void);
 
 static void add_node(Cmd *cmd);
 static int insert_node(const char *connstr, int64 cmd_id);
@@ -63,6 +63,7 @@ char *shardman_shardlord_dbname;
 char *shardman_shardlord_connstring;
 int shardman_cmd_retry_naptime;
 int shardman_poll_interval;
+int shardman_my_id;
 
 /* Just global vars. */
 /* Connection to local server for LISTEN notifications. Is is global for easy
@@ -70,9 +71,6 @@ int shardman_poll_interval;
  */
 static PGconn *conn = NULL;
 int32 shardman_my_node_id = -1;
-/* Link to shared memory state */
-ShmnSharedState *snss = NULL;
-
 
 /*
  * Entrypoint of the module. Define variables and register background worker.
@@ -89,19 +87,9 @@ _PG_init()
 						errhint("Add pg_shardman to shared_preload_libraries.")));
 	}
 
-	/*
-	 * Request additional shared resources.  (These are no-ops if we're not in
-	 * the postmaster process.)  We'll allocate or attach to the shared
-	 * resources in shardman_shmem_startup().
-	 */
-	RequestAddinShmemSpace(sizeof(ShmnSharedState));
-	RequestNamedLWLockTranche("pg_shardman", 1);
-
 	/* remember & set hooks */
 	old_log_hook = emit_log_hook;
 	emit_log_hook = shardman_log;
-	old_shmem_startup_hook = shmem_startup_hook;
-	shmem_startup_hook = shardman_shmem_startup;
 
 	DefineCustomBoolVariable("shardman.shardlord",
 							 "This node is the shardlord?",
@@ -118,7 +106,7 @@ _PG_init()
 		" on shardlord node, shardlord bgw will connect to it",
 		NULL,
 		&shardman_shardlord_dbname,
-		"postgres",
+		NULL,
 		PGC_POSTMASTER,
 		0,
 		NULL, NULL, NULL
@@ -161,6 +149,34 @@ _PG_init()
 							0,
 							NULL, NULL, NULL);
 
+	/*
+	 * This GUC is used to include node id in log messages. It is set with
+	 * alter system, user should never do that. This is ugly, but
+	 * - id must be known by all backends
+	 * - we must have easy way to update it
+	 * - it must be presistent, and we must reread it on server startup
+	 * GUC is ugly, because it is stored in conf file, may be reset by user,
+	 * global (it is harder to support multiple databases) and alter system
+	 * cannot be executed in transaction.
+	 * Another idea we considered was to store it in shmem. However, there
+	 * seems to be no easy way to execute something (read id from disk and
+	 * set it in shmem) on server start. This could be accomplished with
+	 * separate bgw, but that's much more code. Besides, we must know in which
+	 * database shardman lies to connect to db from bgw, and it seems like
+	 * there isn't much space for that but in GUC itself (or any other global
+	 * text file), so why bother with that?
+	 */
+	DefineCustomIntVariable("shardman.my_id",
+							"node id to be included in logs",
+							NULL,
+							&shardman_my_id,
+							SHMN_INVALID_NODE_ID,
+							SHMN_INVALID_NODE_ID,
+							INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
 	if (shardman_shardlord)
 	{
 		/* register shardlord */
@@ -180,39 +196,14 @@ _PG_init()
 }
 
 /*
- * Module unload callback
+ * Module unload callback. Currently Postgres never unloads shlibs, but who
+ * knows the future...
  */
 void
 _PG_fini(void)
 {
 	/* Uninstall hooks. */
 	emit_log_hook = old_log_hook;
-	shmem_startup_hook = old_shmem_startup_hook;
-}
-
-/* Get this node id stored in shmem */
-int32
-my_id(void)
-{
-	int32 id;
-
-	/* If MyProc is NULL, shmem is not yet inited or we are bootstrapping */
-	if (MyProc == NULL)
-		return SHMN_INVALID_NODE_ID;
-
-	LWLockAcquire(snss->lock, LW_SHARED);
-	id = snss->my_id;
-	LWLockRelease(snss->lock);
-	return id;
-}
-
-/* Get this node id stored in shmem */
-void
-set_my_id(int32 new_id)
-{
-	LWLockAcquire(snss->lock, LW_EXCLUSIVE);
-	snss->my_id = new_id;
-	LWLockRelease(snss->lock);
 }
 
 /*
@@ -226,10 +217,18 @@ shardlord_main(Datum main_arg)
 	MemoryContext cmd_ctx;
 
 	shmn_elog(LOG, "Shardlord started");
+	if (shardman_shardlord_dbname == NULL)
+		shmn_elog(FATAL, "shardlord_dbname is not specified");
 	/* Connect to the database to use SPI*/
 	BackgroundWorkerInitializeConnection(shardman_shardlord_dbname, NULL);
 	/* sanity check */
-	pg_shardman_installed_local();
+	if (!pg_shardman_installed_local())
+	{
+		/* shardlord won't run without extension */
+		shmn_elog(INFO,
+				  "Terminating shardlord: pg_shardman lib is preloaded, but ext is not created");
+		proc_exit(1);
+	}
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGTERM, shardlord_sigterm);
@@ -449,10 +448,10 @@ update_cmd_status(int64 id, const char *new_status)
 }
 
 /*
- * Verify that extension is installed locally. We must be connected to db at
+ * Check that extension is installed locally. We must be connected to db at
  * this point
  */
-void
+bool
 pg_shardman_installed_local(void)
 {
 	bool installed = true;
@@ -460,17 +459,11 @@ pg_shardman_installed_local(void)
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (get_extension_oid("pg_shardman", true) == InvalidOid)
-	{
 		installed = false;
-		shmn_elog(INFO,
-				  "Terminating shardlord: pg_shardman lib is preloaded, but ext is not created");
-	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	/* shardlord won't run without extension */
-	if (!installed)
-		proc_exit(1);
+	return installed;
 }
 
 /*
@@ -631,15 +624,34 @@ add_node(Cmd *cmd)
 		/* Create subscription and set node id on itself */
 		sql = psprintf(
 			"create subscription shardman_meta_sub connection '%s'"
-			"publication shardman_meta_pub with (create_slot = false,"
-			"slot_name = 'shardman_meta_sub_%d');"
-			"select shardman.set_node_id(%d);",
+			" publication shardman_meta_pub with (create_slot = false,"
+			" slot_name = 'shardman_meta_sub_%d');"
+			" select shardman.set_my_id(%d);",
 			shardman_shardlord_connstring, node_id, node_id);
 		res = PQexec(conn, sql);
 		pfree(sql);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
 			shmn_elog(NOTICE, "add_node %s: failed to create subscription and set node id, %s",
+					  connstr, PQerrorMessage(conn));
+			goto attempt_failed;
+		}
+		/* Alter system can't be executed in one multi-command string */
+		PQclear(res);
+		sql = psprintf("alter system set shardman.my_id to %d;", node_id);
+		res = PQexec(conn, sql);
+		pfree(sql);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			shmn_elog(NOTICE, "add_node %s: failed to set my_id guc, %s",
+					  connstr, PQerrorMessage(conn));
+			goto attempt_failed;
+		}
+		PQclear(res);
+		res = PQexec(conn, "select pg_reload_conf();");
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			shmn_elog(NOTICE, "add_node %s: failed to reload conf, %s",
 					  connstr, PQerrorMessage(conn));
 			goto attempt_failed;
 		}

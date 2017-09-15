@@ -706,8 +706,6 @@ CREATE FUNCTION remove_sync_standby_c(standby text) RETURNS text
 CREATE FUNCTION set_sync_standbys(standby text) RETURNS void AS $$
 BEGIN
 	PERFORM pg_reload_conf();
-	PERFORM shardman.set_sync_standbys_c(standby);
+	PERFORM shardman.alter_system_c('synchronous_standby_names', standby);
 	RAISE DEBUG '[SHMN] sync_standbys set to %', standby;
 END $$ LANGUAGE plpgsql STRICT;
-CREATE FUNCTION set_sync_standbys_c(standby text) RETURNS void
-	AS 'pg_shardman' LANGUAGE C STRICT;

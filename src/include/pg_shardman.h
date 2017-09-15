@@ -64,24 +64,15 @@ do { \
 	} \
 } while(0)
 
+#define SHMN_INVALID_NODE_ID -1
+
 /* GUC variables */
 extern bool shardman_shardlord;
 extern char *shardman_shardlord_dbname;
 extern char *shardman_shardlord_connstring;
 extern int shardman_cmd_retry_naptime;
 extern int shardman_poll_interval;
-
-/*
- * State in shared memory. We hold exclusive lock while modifying this, and
- * shard lock while reading.
- */
-typedef struct ShmnSharedState
-{
-	int32 my_id;
-	LWLock *lock;
-} ShmnSharedState;
-extern ShmnSharedState *snss;
-#define SHMN_INVALID_NODE_ID -1
+extern int shardman_my_id;
 
 typedef struct Cmd
 {
@@ -105,8 +96,6 @@ typedef struct RepCount
 
 extern void _PG_init(void);
 extern void _PG_fini(void);
-extern int32 my_id(void);
-extern void set_my_id(int32 new_id);
 extern void shardlord_main(Datum main_arg);
 extern bool signal_pending(void);
 extern void check_for_sigterm(void);

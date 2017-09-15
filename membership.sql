@@ -54,29 +54,29 @@ CREATE TABLE local_meta (
 	k text NOT NULL, -- key
 	v text -- value
 );
-INSERT INTO shardman.local_meta VALUES ('node_id', NULL);
+INSERT INTO shardman.local_meta VALUES ('my_id', NULL);
 
 -- Get local node id. NULL means node is not in the cluster yet.
 CREATE FUNCTION my_id() RETURNS int AS $$
-	SELECT v::int FROM shardman.local_meta WHERE k = 'node_id';
+	SELECT v::int FROM shardman.local_meta WHERE k = 'my_id';
 $$ LANGUAGE sql;
 
 -- Exclude node from the cluster
-CREATE FUNCTION reset_node_id() RETURNS void AS $$
+CREATE FUNCTION reset_my_id() RETURNS void AS $$
 BEGIN
-	UPDATE shardman.local_meta SET v = NULL WHERE k = 'node_id';
-	PERFORM shardman.reset_node_id_c();
+	UPDATE shardman.local_meta SET v = NULL WHERE k = 'my_id';
+	PERFORM shardman.reset_my_id_c();
 END $$ LANGUAGE plpgsql STRICT;
-CREATE FUNCTION reset_node_id_c() RETURNS void
+CREATE FUNCTION reset_my_id_c() RETURNS void
 	AS 'pg_shardman' LANGUAGE C;
 
 -- Set local node id.
-CREATE FUNCTION set_node_id(node_id int) RETURNS void AS $$
+CREATE FUNCTION set_my_id(my_id int) RETURNS void AS $$
 BEGIN
-	UPDATE shardman.local_meta SET v = node_id WHERE k = 'node_id';
-	PERFORM shardman.set_node_id_c(node_id);
+	UPDATE shardman.local_meta SET v = my_id WHERE k = 'my_id';
+	PERFORM shardman.set_my_id_c(my_id);
 END $$ LANGUAGE plpgsql STRICT;
-CREATE FUNCTION set_node_id_c(node_id int) RETURNS void
+CREATE FUNCTION set_my_id_c(my_id int) RETURNS void
 	AS 'pg_shardman' LANGUAGE C;
 
 -- If for cmd cmd_id we haven't yet inserted new node, do that; mark it as
@@ -99,12 +99,23 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Get local node connstr. Returns NULL if node is not in cluster and never was
--- in one.
+-- Get local node connstr regardless of its state. Returns NULL if node is not
+-- in cluster and never was in one.
 CREATE FUNCTION my_connstr() RETURNS text AS $$
 BEGIN
 	RETURN connstring FROM shardman.nodes WHERE id = shardman.my_id();
 END $$ LANGUAGE plpgsql;
+-- Same, but throw ERROR there is no connstring
+CREATE FUNCTION my_connstr_strict() RETURNS text AS $$
+DECLARE
+	connstr text := shardman.my_connstr();
+BEGIN
+	IF connstr IS NULL THEN
+		RAISE EXCEPTION '[SHMN] Node id % is not in cluster', shardman.my_id();
+	END IF;
+	RETURN connstr;
+END $$ LANGUAGE plpgsql;
+
 
 -- Get connstr of worker node with id node_id. ERROR is raised if there isn't
 -- one.

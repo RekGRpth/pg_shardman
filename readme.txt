@@ -13,11 +13,11 @@ First, some terminology:
 'cluster' -- either the whole system of shardlord and workers, or cluster in
   traditional PostgreSQL sense, this should be clear from the context.
 
-For quick setup, see scripts in bin/ directory. Setup is configured in file
-setup.sh which needs to be placed in the same directory; see setup.sh.example
-for example. shardman_init.sh performs initdb for shardlord & workers, deploys
-example configs and creates extension; shardman_start.sh reinstalls extension,
-which is useful for development.
+For quick example setup, see scripts in bin/ directory. Setup is configured in
+file setup.sh which needs to be placed in the same directory; see
+setup.sh.example for example. shardman_init.sh performs initdb for shardlord &
+workers, deploys example configs and creates extension; shardman_start.sh
+reinstalls extension, which is useful for development.
 
 Both shardlord and workers require extension built and installed. We depend
 on pg_pathman extension so it must be installed too.
@@ -168,8 +168,9 @@ distribution, so you will see a bunch of warnings about failing replica creation
 Sharded tables dropping, as well as replica deletion is not implemented yet.
 
 Note on permissions: since creating subscription requires superuser priviliges,
-connections strings provided to add_node, as well as shardlord_connstring GUC
-must be of superuser ones. This might be relaxed in the future.
+connection strings provided to add_node, as well as shardlord_connstring GUC
+must be of superuser ones. Currently, superuser must also be used to access the
+data. This will be relaxed in the future.
 
 About transactions: in short, currently they are none of them. Local changes are
 handled by PostgreSQL as usual -- so if you queries touch only only node, you

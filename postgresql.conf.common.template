@@ -1,9 +1,11 @@
 shared_preload_libraries = 'pg_pathman, pg_shardman'
 
-# print node ids in log messages
+# We support printing node ids in log messages. For that, include '%z' in
+# log_line_prefix. This feature is only supported if there is one shardman
+# installation per database cluster.
 log_line_prefix = '%m %z'
 
-log_min_messages = DEBUG3
+log_min_messages = DEBUG1
 client_min_messages = NOTICE
 log_replication_commands = on
 
@@ -21,9 +23,11 @@ max_replication_slots = 100
 # on the table which have 'next' replica.
 max_wal_senders = 50
 
+# never set this to 'off' globally while using pg_shardman if you want
+# synchronous replication between shards and its replicas.
+synchronous_commit = on
 
 # performance-related settings
-synchronous_commit = on
 shared_buffers = 512MB
 effective_cache_size = 512MB
 work_mem = 4MB
