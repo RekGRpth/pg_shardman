@@ -27,9 +27,11 @@
 #include "utils/memutils.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
+#include "utils/builtins.h"
 #include "executor/spi.h"
 #include "access/xact.h"
 #include "commands/extension.h"
+#include "commands/sequence.h"
 #include "libpq-fe.h"
 
 #include "pg_shardman.h"
@@ -48,7 +50,6 @@ static void shardlord_sigusr1(SIGNAL_ARGS);
 static bool pg_shardman_installed_local(void);
 
 static void add_node(Cmd *cmd);
-static int insert_node(const char *connstr, int64 cmd_id);
 static bool node_in_cluster(int id);
 
 static void rm_node(Cmd *cmd);
@@ -514,17 +515,16 @@ cmd_canceled(Cmd *cmd)
 
 /*
  * Adding node consists of
- * - verifying the node is not 'active' in the cluster, i.e. 'nodes' table
- * - adding node to the 'nodes' as not active, get its new id
+ * - verifying the node is not in the cluster, i.e. 'nodes' table
  * - reinstalling extenstion
  * - recreating repslot
  * - recreating subscription
  * - setting node id on the node itself
  * - waiting for initial tablesync
- * - marking node as active and cmd as success
+ * - add node to the nodes table and cmd as success
  * We do all this stuff to make all actions are idempodent to be able to retry
  * them in case of any failure.
- * TODO: node record might hang in 'add_in_progress' state, we should remove it.
+ * TODO: orphan repslot is possible if cmd canceled.
  */
 void
 add_node(Cmd *cmd)
@@ -538,6 +538,16 @@ add_node(Cmd *cmd)
 	bool tablesync_done = false;
 
 	shmn_elog(INFO, "Adding node %s", connstr);
+	/*
+	 * Generate node id beforehand to tell it to the node. This is safe since
+	 * shardlord is single-threaded.
+	 */
+	StartTransactionCommand();
+	node_id = DatumGetInt32(
+		DirectFunctionCall1Coll(
+			nextval, InvalidOid,
+			PointerGetDatum(cstring_to_text("shardman.nodes_id_seq"))));
+	CommitTransactionCommand();
 	/* Try to execute command indefinitely until it succeeded or canceled */
 	while (1948)
 	{
@@ -594,12 +604,6 @@ add_node(Cmd *cmd)
 			else
 				PQclear(res);
 		}
-
-		/*
-		 * Now add node to 'nodes' table, if we haven't done that yet, and
-		 * record that we did so for this cmd
-		 */
-		node_id = insert_node(connstr, cmd->id);
 
 		/*
 		 * reinstall the extension to reset its state, whether is was
@@ -708,9 +712,9 @@ add_node(Cmd *cmd)
 		 * one txn.
 		 */
 		sql = psprintf(
-			"update shardman.nodes set worker_status = 'active' where id = %d;"
-			"update shardman.cmd_log set status = 'success' where id = %ld;",
-			node_id, cmd->id);
+			"insert into shardman.nodes values (%d, '%s', 'active', false, %ld);"
+			" update shardman.cmd_log set status = 'success' where id = %ld;",
+			node_id, connstr, cmd->id, cmd->id);
 		void_spi(sql);
 		pfree(sql);
 
@@ -726,30 +730,6 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 		pg_usleep(shardman_cmd_retry_naptime * 1000L);
 		SHMN_CHECK_FOR_INTERRUPTS_CMD(cmd);
 	}
-}
-
-/* See sql func */
-static int
-insert_node(const char *connstr, int64 cmd_id)
-{
-	char *sql = psprintf("select shardman.insert_node('%s', %ld)",
-							 connstr, cmd_id);
-	int e;
-	int32 node_id;
-	bool isnull;
-
-	SPI_PROLOG;
-	e = SPI_exec(sql, 0);
-	pfree(sql);
-	if (e < 0)
-		/* TODO: closing connections on such failures? */
-		shmn_elog(FATAL, "Stmt failed: %s", sql);
-	node_id = DatumGetInt32(
-		SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
-					  &isnull));
-	SPI_EPILOG;
-
-	return node_id;
 }
 
 /*

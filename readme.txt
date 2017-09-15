@@ -88,10 +88,9 @@ Remove node from the cluster. Its shardman state will be reset. We don't delete
 tables with data and foreign tables though.
 
 You can see all cluster nodes at any time by examining shardman.nodes table:
--- active is the normal mode, removed means node removed, others needed only
--- for proper node add and removal
-CREATE TYPE worker_node_status AS ENUM (
-	'active', 'add_in_progress', 'rm_in_progress', 'removed');
+-- active is the normal mode, removed means node removed, rm_in_progress is
+-- needed only for proper node removal
+CREATE TYPE worker_node_status AS ENUM ('active', 'rm_in_progress', 'removed');
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
 	connstring text NOT NULL UNIQUE,

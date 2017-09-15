@@ -274,24 +274,6 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-/*
- * Set and reset node id stored in shmem.
- */
-PG_FUNCTION_INFO_V1(set_my_id_c);
-Datum
-set_my_id_c(PG_FUNCTION_ARGS)
-{
-	set_my_id(PG_GETARG_INT32(0));
-	PG_RETURN_VOID();
-}
-PG_FUNCTION_INFO_V1(reset_my_id_c);
-Datum
-reset_my_id_c(PG_FUNCTION_ARGS)
-{
-	set_my_id(SHMN_INVALID_NODE_ID);
-	PG_RETURN_VOID();
-}
-
 /* Are we a logical apply worker? */
 PG_FUNCTION_INFO_V1(inside_apply_worker);
 Datum
