@@ -486,8 +486,8 @@ BEGIN
 
 	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
 		INTO connstring;
-	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring, 'ADD ')
-	INTO server_opts, um_opts;
+	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)
+	  INTO server_opts, um_opts;
 
 	-- ALTER FOREIGN TABLE doesn't support changing server, ALTER SERVER doesn't
 	-- support dropping all params, and I don't want to recreate foreign table
@@ -582,11 +582,9 @@ END $$ LANGUAGE plpgsql;
 -- have C function which parses the opts and returns them in two parallel
 -- arrays, and this sql function joins them with quoting. TODO: of course,
 -- quote_literal_cstr exists.
--- prfx is prefix added before opt name, e.g. 'ADD ' for use in ALTER SERVER.
 -- Returns two strings: one with opts ready to pass to CREATE FOREIGN SERVER
 -- stmt, and one wih opts ready to pass to CREATE USER MAPPING.
-CREATE FUNCTION conninfo_to_postgres_fdw_opts(
-	IN connstring text, IN prfx text DEFAULT '',
+CREATE FUNCTION conninfo_to_postgres_fdw_opts(IN connstring text,
 	OUT server_opts text, OUT um_opts text) RETURNS record AS $$
 DECLARE
 	connstring_keywords text[];
@@ -608,14 +606,14 @@ BEGIN
 				um_opts := um_opts || ', ';
 			END IF;
 			um_opts_first_time_through := false;
-			um_opts := prfx || um_opts ||
+			um_opts := um_opts ||
 				format('%s %L', connstring_keywords[i], connstring_vals[i]);
 		ELSE -- server option
 			IF NOT server_opts_first_time_through THEN
 				server_opts := server_opts || ', ';
 			END IF;
 			server_opts_first_time_through := false;
-			server_opts := prfx || server_opts ||
+			server_opts := server_opts ||
 				format('%s %L', connstring_keywords[i], connstring_vals[i]);
 		END IF;
 	END LOOP;
