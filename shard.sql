@@ -252,84 +252,101 @@ CREATE TRIGGER part_moved AFTER UPDATE ON shardman.partitions
 ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER part_moved;
 
 
--- Partition removed: drop old LR channels.
+-- Partition removed: drop LR channel and promote replica if primary was
+-- removed. Since for now we support only 2 copies (1 replica), we promote
+-- replica immediately if needed. Case with several replicas is much more
+-- complex because we need to rebuild LR channels, so later we will have
+-- separate cmd promote_replica(), while part deletion will just perform
+-- cleanup. Here we do nothing if we are removing the last copy of data, the
+-- caller is responsible for tracking that.
 CREATE FUNCTION part_removed() RETURNS TRIGGER AS $$
 DECLARE
+	replica_removed bool := OLD.prv IS NOT NULL; -- replica or primary removed?
+	 -- if primary removed, is there replica that we will promote?
+	replica_exists bool := OLD.nxt IS NOT NULL;
+	prim_repl_lname text; -- channel between primary and replica
 	me int := shardman.my_id();
-	prev_src_lname text;
-	src_next_lname text;
-	new_primary partitions;
-	drop_slot_delay int := 2000; -- two seconds
+	new_primary shardman.partitions;
+	drop_slot_delay int := 2; -- two seconds
 BEGIN
 	RAISE DEBUG '[SHMN] part_removed trigger called for part %, owner %',
 		OLD.part_name, OLD.owner;
 
 	ASSERT (OLD.prv IS NULL OR OLD.nxt IS NULL), 'We currently do not support redundancy level > 2';
 
-	IF OLD.prv IS NOT NULL THEN
-		prev_src_lname := shardman.get_data_lname(OLD.part_name, OLD.prv, OLD.owner);
-	ELSE
-	    -- Primaty is moved
-	    select * from shardman.partitions where owner=OLD.nxt and part_name=OLD.part_name into new_primary;
-	END IF;
-	IF OLD.nxt IS NOT NULL THEN
-		src_next_lname := shardman.get_data_lname(OLD.part_name, OLD.owner, OLD.nxt);
-	END IF;
-
-
-	IF me = OLD.owner THEN -- src node
-		-- If primary part was moved, replace on src node its partition with
-		-- foreign one
-		IF OLD.prv IS NULL THEN
-			PERFORM shardman.replace_usual_part_with_foreign(new_primary);
-		ELSE
-			-- On the other hand, if prev replica existed, drop sub for old
-			-- channel prev -> src
-			PERFORM shardman.eliminate_sub(prev_src_lname);
+	-- get log channel name and part we will promote, if any
+	IF replica_removed THEN
+		prim_repl_lname := shardman.get_data_lname(OLD.part_name, OLD.prv, OLD.owner);
+	ELSE -- Primary is removed
+		IF replica_exists THEN -- Primary removed, and it has replica
+			prim_repl_lname := shardman.get_data_lname(OLD.part_name, OLD.owner,
+													   OLD.nxt);
+			-- This replica is new primary
+			SELECT * FROM shardman.partitions
+			 WHERE owner = OLD.nxt AND part_name= OLD.part_name INTO new_primary;
+			-- whole record nullability seems to be non-working
+			ASSERT new_primary.part_name IS NOT NULL;
 		END IF;
-		IF OLD.nxt IS NOT NULL THEN
-			-- If next replica existed, drop pub for old channel src -> next
- 		    -- Wait sometime to let other node first remove subscription
-		    PERFORM pg_sleep(drop_slot_delay);
-			PERFORM shardman.drop_repslot_and_pub(src_next_lname);
-			PERFORM shardman.remove_sync_standby(src_next_lname);
+	END IF;
+
+	IF me = OLD.owner THEN -- part dropped on us
+		IF replica_removed THEN -- replica removed on us
+			PERFORM shardman.eliminate_sub(prim_repl_lname);
+		ELSE -- primary removed on us
+			IF replica_exists IS NOT NULL THEN
+				-- If next replica existed, drop pub & rs for data channel
+ 				-- Wait sometime to let replica first remove subscription
+				PERFORM pg_sleep(drop_slot_delay);
+				PERFORM shardman.drop_repslot_and_pub(prim_repl_lname);
+				PERFORM shardman.remove_sync_standby(prim_repl_lname);
+				-- replace removed table with foreign one on promoted replica
+				PERFORM shardman.replace_usual_part_with_foreign(new_primary);
+			END IF;
 		END IF;
 		-- Drop old table anyway
 		EXECUTE format('DROP TABLE IF EXISTS %I', OLD.part_name);
-	ELSEIF me = OLD.prv THEN -- node with prev replica
+	ELSEIF me = OLD.prv THEN -- node with primary for which replica was dropped
 		-- Wait sometime to let other node first remove subscription
 		PERFORM pg_sleep(drop_slot_delay);
-		-- Drop pub for old channel prev -> src
-		PERFORM shardman.drop_repslot_and_pub(prev_src_lname);
-		PERFORM shardman.remove_sync_standby(prev_src_lname);
-		-- Update L2-list (TODO: change replication model from chain to star)
-		PERFORM update shardman.partitions set nxt=OLD.nxt where owner=me and part_name=OLD.part_name;
-	ELSEIF me = OLD.nxt THEN -- node with next replica
-		-- Drop sub for old channel src -> next
-		PERFORM shardman.eliminate_sub(src_next_lname);
-		-- Update L2-list (TODO: change replication model from chain to star)
-		PERFORM update shardman.partitions set prv=OLD.prv where owner=me and part_name=OLD.part_name;
-	    -- This replica is promoted to primary node, so drop trigger disabling writes to the table
-		PERFORM readonly_replica_off(part_name);
+		-- Drop pub & rs for data channel
+		PERFORM shardman.drop_repslot_and_pub(prim_repl_lname);
+		PERFORM shardman.remove_sync_standby(prim_repl_lname);
+	ELSEIF me = OLD.nxt THEN -- node with replica for which primary was dropped
+		-- Drop sub for data channel
+		PERFORM shardman.eliminate_sub(prim_repl_lname);
+	    -- This replica is promoted to primary node, so drop trigger disabling
+	    -- writes to the table and replace fdw with normal part
+		PERFORM shardman.readonly_replica_off(OLD.part_name);
 		-- Replace FDW with local partition
 	    PERFORM shardman.replace_foreign_part_with_usual(new_primary);
  	END IF;
 
-	-- If primary was moved 
-	IF OLD.prv IS NULL THEN
-	   -- then update fdw almost everywhere
+	IF NOT replica_removed AND shardman.me_worker() THEN
+	   -- update fdw almost everywhere
 	   PERFORM shardman.update_fdw_server(new_primary);
+	END IF;
+
+	IF shardman.me_lord() THEN
+		-- update partitions table: promote replica immediately after primary
+		-- removal or remove link to dropped replica.
+		IF replica_removed THEN
+			UPDATE shardman.partitions SET nxt = NULL WHERE owner = OLD.prv AND
+			part_name = OLD.part_name;
+		ELSE
+			UPDATE shardman.partitions SET prv = NULL
+			 WHERE owner = OLD.nxt AND part_name = OLD.part_name;
+		END IF;
 	END IF;
 
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER part_removed AFTER REMOVE ON shardman.partitions
+CREATE TRIGGER part_removed AFTER DELETE ON shardman.partitions
 	FOR EACH ROW
 	EXECUTE PROCEDURE part_removed();
--- fire trigger only on worker nodes
-ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER part_removed;
+-- fire trigger only on either shardlord and worker nodes
+ALTER TABLE shardman.partitions ENABLE ALWAYS TRIGGER part_removed;
 
 
 

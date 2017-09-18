@@ -771,6 +771,7 @@ rm_node(Cmd *cmd)
 	char **opts;
 	bool force = false;
 	int e;
+	int64 parts_on_node;
 
 	for (opts = cmd->opts; *opts; opts++)
 	{
@@ -781,28 +782,36 @@ rm_node(Cmd *cmd)
 		}
 	}
 
-	SPI_PROLOG;
 	if (force)
 	{
-		sql = psprintf("delete from shardman.partitions where owner=%d", node_id);
+		sql = psprintf("delete from shardman.partitions where owner=%d",
+					   node_id);
 		void_spi(sql);
 	}
 	else
 	{
 		bool isnull;
-		sql = psprintf("select count(*) from shardman.partitions where owner=%d", node_id);
+		sql = psprintf(
+			"select count(*) from shardman.partitions where owner=%d",
+			node_id);
+		SPI_PROLOG;
 		e = SPI_execute(sql, true, 0);
 		if (e < 0)
 			shmn_elog(FATAL, "Stmt failed: %s", sql);
 		Assert(SPI_processed == 1);
-		if (DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)) != 0)
-		{
-			ereport(ERROR, (errmsg("Can not remove node with existed partitions"),
-							errhint("Add \"force\" option to remove node with existed partitions.")));
-		}
+		parts_on_node =
+			DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 1, &isnull));
+		SPI_EPILOG;
 	}
 	pfree(sql);
-	SPI_EPILOG;
+	if (parts_on_node != 0)
+	{
+		shmn_elog(WARNING, "Can't remove node %d with existing shards. Add \"force\" option to ignore this",
+				  node_id);
+		update_cmd_status(cmd->id, "failed");
+		return;
+	}
 
 	elog(INFO, "Removing node %d ", node_id);
 	if (!node_in_cluster(node_id))

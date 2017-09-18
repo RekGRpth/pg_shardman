@@ -72,6 +72,18 @@ BEGIN
 	UPDATE shardman.local_meta SET v = my_id WHERE k = 'my_id';
 END $$ LANGUAGE plpgsql STRICT;
 
+-- This node is shardlord?
+CREATE FUNCTION me_lord() RETURNS bool AS $$
+BEGIN
+	RETURN shardlord FROM shardman.nodes WHERE id = shardman.my_id();
+END $$ LANGUAGE plpgsql STRICT;
+
+-- This node is worker node?
+CREATE FUNCTION me_worker() RETURNS bool AS $$
+BEGIN
+	RETURN worker_status = 'active' FROM shardman.nodes WHERE id = shardman.my_id();
+END $$ LANGUAGE plpgsql STRICT;
+
 -- Get local node connstr regardless of its state. Returns NULL if node is not
 -- in cluster and never was in one.
 CREATE FUNCTION my_connstr() RETURNS text AS $$

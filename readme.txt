@@ -83,9 +83,12 @@ managed by current shardlord), this state will be lost.
 my_id()
 Get this node's id.
 
-rm_node(node_id int)
-Remove node from the cluster. Its shardman state will be reset. We don't delete
-tables with data and foreign tables though.
+rm_node(node_id int, force bool default false)
+Remove node from the cluster. If 'force' is true, we don't care whether node
+contains any partitions. Otherwise we won't allow to rm node holding shards.
+shardman's stuff (pubs, subs, repslots) on deleted node will most probably be
+reset if node is alive, but that is not guaranteed. We never delete tables with
+data and foreign tables.
 
 You can see all cluster nodes at any time by examining shardman.nodes table:
 -- active is the normal mode, removed means node removed, rm_in_progress is
