@@ -272,7 +272,10 @@ BEGIN
 	RAISE DEBUG '[SHMN] part_removed trigger called for part %, owner %',
 		OLD.part_name, OLD.owner;
 
-	ASSERT (OLD.prv IS NULL OR OLD.nxt IS NULL), 'We currently do not support redundancy level > 2';
+	IF OLD.prv IS NOT NULL AND OLD.nxt IS NOT NULL THEN
+		RAISE WARNING '[SHMN] part_removed is not yet implemented for redundancy level > 2';
+		RETURN NULL;
+	END IF;
 
 	-- get log channel name and part we will promote, if any
 	IF replica_removed THEN
