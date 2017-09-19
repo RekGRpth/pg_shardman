@@ -1,7 +1,32 @@
 pg_shardman: PostgreSQL sharding built on pg_pathman, postgres_fdw and logical
   replication.
 
-First, some terminology:
+pg_shardman aims for write scalability and high availability. It allows to
+partition tables using pg_pathman and move them across nodes, balancing write
+load. You can issue queries to any node, postgres_fdw is responsible for
+redirecting them to proper node. To avoid data loss, we support replication of
+partitions via synchronous logical replication (LR), each partition can have as
+many replicas on other nodes as you like.
+
+To manage this zoo, we need one designated node which we call 'shardlord'. This
+node accepts sharding commands from the user and makes sure the whole cluster
+changes its state as desired. Shardlord rules other nodes in two ways, depending
+on what needs to be done. The first is quite straightforward, it is used for
+targeted changes on several nodes, e.g. configure LR channel between nodes --
+shardlord just connects via libpq to the nodes as a normal PostgreSQL client.
+The second is a bit more perverted, it is used for bulk update of something,
+e.g. update fdw servers after partition move. Shardlord keeps several tables
+(see below) forming cluster metadata -- which nodes are in cluster and which
+partitions they keep. It creates one async LR channel to each other node,
+replicating these tables. Nodes have triggers firing when something in these
+tables changes, and update their state accordingly.
+
+During normal operation you shoudn't care much about how shardlord
+works. However, it is useful to understand that when something goes wrong.
+
+So, some terminology:
+'commands' is what constitutes shardman interface: functions for sharding
+  management.
 'shardlord' or 'lord' is postgres instance and background process (bgw) spinning
   on it which manages sharding.
 'worker nodes' or 'workers' are other nodes with data.
@@ -23,8 +48,9 @@ Both shardlord and workers require extension built and installed. We depend
 on pg_pathman extension so it must be installed too.
 PostgreSQL location for building is derived from pg_config, you can also specify
 path to it in PG_CONFIG var. PostgreSQL 10 (REL_10_STABLE branch as of writing
-this) is required. Extension links with libpq, so if you The whole process of
-building and copying files to PG server is just:
+this) is required. Extension links with libpq, so if you install PG from
+packages, you should install libpq-dev package. The whole process of building
+and copying files to PG server is just:
 
 git clone
 cd pg_shardman
@@ -185,3 +211,5 @@ Limitations:
 * We can't switch shardlord for now.
 * The shardlord itself can't be worker node for now.
 * ALTER TABLE for sharded tables is not supported.
+* Cmd redirection is not yet implemented, sharding cmds must be issued to
+  shardlord directly.

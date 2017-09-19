@@ -12,15 +12,34 @@ log_replication_commands = on
 # We use logical replication for sending metadata from shardlord to workers
 # and for data replication.
 wal_level = logical # necessary for logical replication
-# On shardlord, this must be at least max number of workers + some reserved for
-# initial tablesync. On workers, this must be at least max number of shards on
-# the node with 'prev' replica + max number of shards on the node
-# with 'next' replica (yes, with overlapping) + some reserved for initial
-# tablesync.
+
+# On shardlord, this must be at least max number of worker nodes + some reserved
+# for initial tablesync.
+#
+# On worker node 'A', this must be at least 'mrs':
+# mrs = 1
+# for each sharded table t
+#   for each primary shard of t lying on A
+#     mrs += number of this shard replicas
+#   for each replica shard of t lying on A
+#     mrs++
+#
+# For example, imagine we have one sharded table with 10 partitions, replication
+# factor 3 (1 primary and 2 replicas for each shard), 5 nodes and distribute
+# data evenly so that each node has 6 shards. In the almost worst case, if node
+# A keeps 5 primaries and 1 replica, this node needs 1 + 5*2 + 1 = 12 repslots.
 max_replication_slots = 100
-# Similar is true for max_wal_senders: shardlord this should have this equal to
-# max_replication_slots. On workers, this must be at least max number of shards
-# on the table which have 'next' replica.
+
+# Similar is true for max_wal_senders. Shardlord should have this at equal
+# max_replication_slots.
+
+# On worker node 'A', this must be at least 'mws':
+# mws = 0
+# for each sharded table t
+#   for each primary shard of t lying on A
+#     mrs += number of this shard replicas
+#
+# So it is 5*2 = 10 walsenders in previous example.
 max_wal_senders = 50
 
 # never set this to 'off' globally while using pg_shardman if you want

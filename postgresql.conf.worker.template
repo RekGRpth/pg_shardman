@@ -1,4 +1,10 @@
-# At least number of shards with 'prev' replica + reserve for initial tablesync.
+# On worker node 'A', this must be at least 'mrs':
+# mrs = 1
+# for each sharded table t
+#   for each replica shard of t lying on A
+#     mrs++
+#
+# So it is 1 + 1 = 2 for node A from example in postgresql.conf.common.template
 max_logical_replication_workers = 50
 # At least max_logical_replication_workers + 1
 max_worker_processes = 60
