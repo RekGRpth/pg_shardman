@@ -805,7 +805,7 @@ rm_node(Cmd *cmd)
 		SPI_EPILOG;
 	}
 	pfree(sql);
-	if (parts_on_node != 0)
+	if (!force && parts_on_node != 0)
 	{
 		shmn_elog(WARNING, "Can't remove node %d with existing shards. Add \"force\" option to ignore this",
 				  node_id);
