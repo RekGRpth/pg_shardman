@@ -3,7 +3,10 @@
 from time import sleep
 
 from testgres import PostgresNode
-from testgres import get_new_node
+from testgres import get_new_node, default_username
+
+
+DBNAME = "postgres"
 
 
 class Shardlord(PostgresNode):
@@ -11,6 +14,12 @@ class Shardlord(PostgresNode):
         super(Shardlord, self).__init__(name=name, port=5432)
 
         self.nodes = []
+
+    @staticmethod
+    def _common_conn_string(port):
+        return (
+            "host=localhost port={} dbname={} user={}"
+        ).format(port, DBNAME, default_username())
 
     @staticmethod
     def _common_conf_lines():
@@ -33,13 +42,15 @@ class Shardlord(PostgresNode):
     def init(self):
         super(Shardlord, self).init()
 
+        conn_string = self._common_conn_string(self.port)
+
         config_lines = (
             "shardman.shardlord = on\n"
-            "shardman.shardlord_dbname = postgres\n"
-            "shardman.shardlord_connstring = 'dbname=postgres port={}'\n"
+            "shardman.shardlord_dbname = {}\n"
+            "shardman.shardlord_connstring = '{}'\n"
             "shardman.cmd_retry_naptime = 500\n"
             "shardman.poll_interval = 500\n"
-        ).format(self.port)
+        ).format(DBNAME, conn_string)
 
         # add common config lines
         config_lines += self._common_conf_lines()
@@ -49,7 +60,7 @@ class Shardlord(PostgresNode):
         return self
 
     def install(self):
-        self.safe_psql(dbname="postgres",
+        self.safe_psql(dbname=DBNAME,
                        query="create extension pg_shardman cascade")
 
         return self
@@ -80,14 +91,13 @@ class Shardlord(PostgresNode):
         node.init() \
             .append_conf("postgresql.conf", config_lines) \
             .start() \
-            .safe_psql(dbname="postgres",
+            .safe_psql(dbname=DBNAME,
                        query="create extension pg_shardman cascade")
 
         # finally, register this node
-        add_node_cmd = (
-            "select shardman.add_node('dbname={} port={}')"
-        ).format("postgres", node.port)
-        self.safe_psql("postgres", add_node_cmd)
+        conn_string = self._common_conn_string(node.port)
+        add_node_cmd = "select shardman.add_node('{}')".format(conn_string)
+        self.safe_psql(DBNAME, add_node_cmd)
 
         return self
 
