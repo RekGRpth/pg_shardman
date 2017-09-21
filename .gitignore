@@ -3,3 +3,6 @@
 .dir-locals.el
 pg_shardman*.sql
 bin/setup.sh
+
+*.pyc
+__pycache__
