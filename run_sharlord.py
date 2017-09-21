@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+from time import sleep
+
 from testgres import PostgresNode
 from testgres import get_new_node
 
@@ -109,6 +111,9 @@ if __name__ == "__main__":
             print("\t\t-> port %i" % node.port)
             print("\t\t-> dir  %s" % node.base_dir)
 
+        print()
+        print("Press Ctrl+C to exit")
+
         # loop until SIGINT
         while True:
-            pass
+            sleep(1)
