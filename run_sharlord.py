@@ -6,7 +6,7 @@ from testgres import get_new_node
 
 class Shardlord(PostgresNode):
     def __init__(self, name):
-        super(Shardlord, self).__init__(name=name)
+        super(Shardlord, self).__init__(name=name, port=5432)
 
         self.nodes = []
 
