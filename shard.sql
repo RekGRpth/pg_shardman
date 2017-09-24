@@ -296,7 +296,7 @@ BEGIN
 		IF replica_removed THEN -- replica removed on us
 			PERFORM shardman.eliminate_sub(prim_repl_lname);
 		ELSE -- primary removed on us
-			IF replica_exists IS NOT NULL THEN
+			IF replica_exists THEN
 				-- If next replica existed, drop pub & rs for data channel
  				-- Wait sometime to let replica first remove subscription
 				PERFORM pg_sleep(drop_slot_delay);

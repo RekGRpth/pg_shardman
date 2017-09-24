@@ -304,12 +304,9 @@ void_spi(char *sql)
 PGconn *
 listen_cmd_log_inserts(void)
 {
-	char *connstr;
 	PGresult   *res;
 
-	connstr = psprintf("dbname = %s", shardman_shardlord_dbname);
-	conn = PQconnectdb(connstr);
-	pfree(connstr);
+	conn = PQconnectdb(shardman_shardlord_connstring);
 	/* Check to see that the backend connection was successfully made */
 	if (PQstatus(conn) != CONNECTION_OK)
 		shmn_elog(FATAL, "Connection to local database failed: %s",

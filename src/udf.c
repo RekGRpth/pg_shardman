@@ -75,6 +75,9 @@ pg_shardman_cleanup_c(PG_FUNCTION_ARGS)
  * defaults, everything. Parameter is not REGCLASS because pg_dump can't
  * handle oids anyway. Connstring must be proper libpq connstring, it is feed
  * to pg_dump.
+ * TODO: actually we should have much more control on what is dumped, so we
+ * need to copy-paste parts of messy pg_dump or collect the needed data
+ * manually walking over catalogs.
  */
 PG_FUNCTION_INFO_V1(gen_create_table_sql);
 Datum
@@ -92,13 +95,18 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	char *cmd;
 	FILE *fp;
 	size_t bytes_read;
+
 	SET_VARSIZE(sql, VARHDRSZ);
 
-	/* find pg_dump location */
-	if (find_my_exec("pg_dump", pg_dump_path) != 0)
-	{
-		elog(ERROR, "Failed to find pg_dump location");
-	}
+	/* find pg_dump location querying pg_config */
+	SPI_connect();
+	if (SPI_execute("select setting from pg_config where name = 'BINDIR';",
+					true, 0) < 0)
+		elog(FATAL, "Failed to query pg_config");
+	strcpy(pg_dump_path,
+		   SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+	SPI_finish();
+	join_path_components(pg_dump_path, pg_dump_path, "pg_dump");
 
 	cmd = psprintf("%s -t '%s' --schema-only --dbname='%s' 2>&1",
 				   pg_dump_path, relation, connstring);
