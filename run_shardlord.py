@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import logging
 from time import sleep
 
 from testgres import PostgresNode
@@ -11,15 +12,15 @@ DBNAME = "postgres"
 
 class Shardlord(PostgresNode):
     def __init__(self, name):
-        super(Shardlord, self).__init__(name=name, port=5432)
+        super(Shardlord, self).__init__(name=name, port=5432, use_logging=True)
 
         self.nodes = []
 
     @staticmethod
     def _common_conn_string(port):
         return (
-            "host=localhost port={} dbname={} user={}"
-        ).format(port, DBNAME, default_username())
+            "dbname={} port={} "
+        ).format(DBNAME, port)
 
     @staticmethod
     def _common_conf_lines():
@@ -28,6 +29,7 @@ class Shardlord(PostgresNode):
 
             "log_min_messages = DEBUG1\n"
             "client_min_messages = NOTICE\n"
+            "log_line_prefix = '%m %z'\n"
             "log_replication_commands = on\n"
 
             "synchronous_commit = on\n"
@@ -84,7 +86,7 @@ class Shardlord(PostgresNode):
         config_lines += self._common_conf_lines()
 
         # create a new node
-        node = get_new_node(name)
+        node = get_new_node(name, use_logging=True)
         self.nodes.append(node)
 
         # start this node
@@ -99,16 +101,24 @@ class Shardlord(PostgresNode):
         add_node_cmd = "select shardman.add_node('{}')".format(conn_string)
         self.safe_psql(DBNAME, add_node_cmd)
 
-        return self
+        return node
 
 
 if __name__ == "__main__":
+    logfile = "/tmp/shmn.log"
+    open(logfile, 'w').close() # truncate
+    logging.basicConfig(filename=logfile, level=logging.DEBUG)
     with Shardlord("DarthVader") as lord:
         lord.init().start().install()
 
-        lord.add_node("Luke")
+        luke = lord.add_node("Luke")
         lord.add_node("ObiVan")
         lord.add_node("C3PO")
+
+        luke.safe_psql(DBNAME, "drop table if exists pt cascade;")
+        luke.safe_psql(DBNAME, "CREATE TABLE pt(id INT NOT NULL, payload REAL);")
+        luke.safe_psql(DBNAME, "INSERT INTO pt SELECT generate_series(1, 10), random();")
+        lord.safe_psql(DBNAME, "select shardman.create_hash_partitions(2, 'pt', 'id', 4, true);");
 
         print("%s:" % lord.name)
         print("\t-> port %i" % lord.port)
