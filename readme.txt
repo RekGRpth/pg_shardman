@@ -99,7 +99,8 @@ successfully and some failed.
 Currently cmd_log can be seen and commands issued only on the shardlord, but
 that's easy to change.
 
-Let's get to the actual commands.
+Let's get to the actual commands, which are implemented as functions in
+the extension's schema.
 
 add_node(connstring text)
 Add node with given libpq connstring to the cluster. Node is assigned unique
