@@ -107,6 +107,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 		   SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 	SPI_finish();
 	join_path_components(pg_dump_path, pg_dump_path, "pg_dump");
+	canonicalize_path(pg_dump_path);
 
 	cmd = psprintf("%s -t '%s' --schema-only --dbname='%s' 2>&1",
 				   pg_dump_path, relation, connstring);
