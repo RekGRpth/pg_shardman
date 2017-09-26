@@ -169,20 +169,20 @@ CREATE TABLE partitions (
 );
 
 move_part(part_name text, dest int, src int DEFAULT NULL)
-Move shard 'part_name' from node 'dest' to node 'src'. If src is NULL, primary
-shard is moved. Cmd fails if there is already replica of this shard on 'dest'.
+Move shard 'part_name' from node 'src' to node 'dest'. If src is NULL, primary
+shard is moved. Cmd fails if there is already copy of this shard on 'dest'.
+
+rebalance(relation text)
+Evenly distribute all partitions including replicas of table 'relation' across
+all nodes. Currently this is pretty dumb function, it just tries to move each
+shard once to node choosen in round-robin manner, completely ignoring current
+distribution. Since dest node can already have replica of this partition, it is
+not uncommon to see warnings about failed moves during execution. After
+completion cmd status is 'done', not 'success'.
 
 create_replica(part_name text, dest int)
 Create replica of shard 'part_name' on node 'dest'. Cmd fails if there is already
 replica of this shard on 'dest'.
-
-rebalance(relation text)
-Evenly distribute partitions of table 'relation' across all nodes. Currently
-this is pretty dumb function, it just tries to move each shard once to node
-choosen in round-robin manner, completely ignoring current distribution. Since
-dest node can already have replica of this partition, it is not uncommon to see
-warnings about failed moves during execution. After completion cmd status is
-'done', not 'success'.
 
 set_replevel(relation text, replevel int)
 Add replicas to shards of sharded table 'relation' until we reach replevel
