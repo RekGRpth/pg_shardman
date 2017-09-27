@@ -1,0 +1,17 @@
+### initdb and send configs
+
+---
+- hosts: nodes
+
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: pkill pg
+    shell: 'pkill -9 postgres || true'
+
+  - name: remove datadirs on datanodes
+    file: path={{pg_datadir}} state=absent
+
+  - name: create datadirs on datanodes
+    command: "initdb {{pg_datadir}}"

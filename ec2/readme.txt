@@ -3,7 +3,9 @@ chmod 0400 ~/.ssh/aws_rsa
 
 install python packages for ec2.py: (venv is recommended):
 python3 -m venv ~/venv/aws
-source ~/venv/aws/bin/activate
+As of writing this, python 3.5 has a nasty bug, so better use python 2:
+virtualenv -p /usr/bin/python ~/venv/aws_2.7
+source ~/venv/aws_2.7/bin/activate
 pip install boto boto3 six ansible
 
 Download and set up ec2.ini:

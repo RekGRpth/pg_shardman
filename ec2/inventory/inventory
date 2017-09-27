@@ -16,6 +16,7 @@ pg_prefix="{{ansible_env.HOME}}/pg"
 pg_src="{{pg_prefix}}/src"
 pg_dst="{{pg_prefix}}/install"
 pg_datadir="{{pg_prefix}}/data_{{pg_port}}"
+pg_logfile="{{pg_datadir}}/pg.log"
 pg_port=5432
 
 pathman_repo=https://github.com/postgrespro/pg_pathman.git
@@ -41,4 +42,4 @@ ansible_ssh_private_key_file=~/.ssh/aws_rsa
 
 # For local development
 [vagrant]
-10.42.42.10
+# 10.42.42.10

@@ -1,3 +1,5 @@
+### Build & install from sources PG, pg_pathman and pg_shardman
+
 ---
 - hosts: nodes
 
