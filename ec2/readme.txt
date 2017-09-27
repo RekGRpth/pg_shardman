@@ -13,3 +13,9 @@ regions = eu-central-1 # set region
 set aws_access_key_id = xxx
 set aws_secret_access_key = xxx
 export EC2_INI_PATH=/etc/ansible/ec2.ini
+
+Now launch some instance and check that ec2.py works:
+inventory/ec2.py --list
+
+Check that ansible works:
+ansible -i inventory/  -m ping all
