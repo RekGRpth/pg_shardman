@@ -22,11 +22,11 @@ for datadir in $lord_datadir "${worker_datadirs[@]}"; do
     initdb -D "$datadir"
 done
 
-cat postgresql.conf.common.template >> ${lord_datadir}/postgresql.conf
-cat postgresql.conf.lord.template >> ${lord_datadir}/postgresql.conf
+cat postgresql.conf.common >> ${lord_datadir}/postgresql.conf
+cat postgresql.conf.lord >> ${lord_datadir}/postgresql.conf
 for worker_datadir in "${worker_datadirs[@]}"; do
-    cat postgresql.conf.common.template >> ${worker_datadir}/postgresql.conf
-    cat postgresql.conf.worker.template >> ${worker_datadir}/postgresql.conf
+    cat postgresql.conf.common >> ${worker_datadir}/postgresql.conf
+    cat postgresql.conf.worker >> ${worker_datadir}/postgresql.conf
 done
 
 start_nodes
