@@ -1,0 +1,14 @@
+### execute psql cmd and print res
+
+---
+- hosts: nodes
+
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: psql cmd
+    command: psql -p {{ pg_port }} -c {{ cmd }}
+    register: out
+
+  - debug: var=out.stdout_lines

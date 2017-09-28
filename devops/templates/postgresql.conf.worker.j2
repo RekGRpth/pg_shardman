@@ -1,0 +1,10 @@
+{# jinja2 won't work with outside file, so I've created a bunch of symlinks #}
+{# pointing to them, oh my... #}
+{# see https://github.com/ansible/ansible/issues/7106 #}
+{% include "postgresql.conf.common" %}
+
+{% include "postgresql.conf.worker" %}
+
+{% include "postgresql.conf.devops.common" ignore missing %}
+
+{% include "postgresql.conf.devops.worker" ignore missing %}

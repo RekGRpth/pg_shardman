@@ -1,0 +1,45 @@
+### initdb and send configs
+
+---
+- hosts: nodes
+
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: pkill pg
+    shell: 'pkill -9 postgres || true'
+    tags:
+      - initdb
+
+  - name: remove datadirs on datanodes
+    file: path={{pg_datadir}} state=absent
+    tags:
+      - initdb
+
+  - name: create datadirs on datanodes
+    command: "initdb {{pg_datadir}}"
+    tags:
+      - initdb
+
+  - import_tasks: tasks/pg_ctl.yml pg_ctl_action=start
+    tags:
+      - initdb
+
+  - name: create whoami database
+    command: "createdb {{ ansible_user }}"
+    tags:
+      - initdb
+
+- import_playbook: send_config.yml
+
+- hosts: nodes
+
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: create extension pg_shardman
+    command: psql -p {{ pg_port }} -c "create extension pg_shardman cascade;"
+    tags:
+      - create_ext

@@ -46,6 +46,13 @@
     tags:
       - build_pg
 
+  - name: build and install postgres_fdw
+    shell: make clean && make -j {{makejobs}} && make install
+    args:
+      chdir: "{{pg_src}}/contrib/postgres_fdw"
+    tags:
+      - build_pg_fdw
+
   - name: clone pathman
     git: repo={{pathman_repo}}
       dest={{pathman_src}}

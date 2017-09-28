@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 
 '''
-Run ec2.py stored in .. directory and appends ec2_shardlord ec2_workers groups
-to it.
+Run ec2.py stored in .. directory and append ec2_shardlord, ec2_workers and
+ec2_init_node groups to it.
 '''
 
 import os
@@ -18,12 +18,12 @@ def ec2_elect_shardlord():
     hosts = list(ec2_inv["_meta"]["hostvars"].keys())
     # sort to choose the same shardlord each time
     hosts.sort(key = socket.inet_aton)
-    shardlord, workers = [hosts[0]], hosts[1:]
+    shardlord, workers, init_node = hosts[0:1], hosts[1:], hosts[1:2]
     ec2_inv["ec2_shardlord"] = shardlord
     ec2_inv["ec2_workers"] = workers
+    ec2_inv["ec2_init_node"] = init_node
     print json.dumps(ec2_inv, sort_keys=True, indent=2)
 
 
 if __name__ == '__main__':
-    # Run the script
     ec2_elect_shardlord()

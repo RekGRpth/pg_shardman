@@ -1,0 +1,8 @@
+### start, stop, restart all nodes. We call task here because in some places
+# it is more convenient to import task instead of whole role.
+
+---
+- hosts: nodes
+
+  tasks:
+  - import_tasks: tasks/pg_ctl.yml

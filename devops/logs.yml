@@ -1,0 +1,14 @@
+### Collect logs
+
+---
+- hosts: nodes
+
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: fetch logs
+    fetch:
+      src: "{{ pg_logfile }}"
+      dest: /tmp
+      validate_checksum: no # new logs might constantly arrive
