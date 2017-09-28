@@ -76,26 +76,20 @@ shardlord; he learns about them and starts the actual execution. At any time you
 can cancel currently executing command, just send SIGUSR1 to the shardlord. This
 is not yet implemented as a handy SQL function, but you can use cancel_cmd.sh
 script from bin/ directory. All submitted cmds return unique command id which is
-used to check the cmd status later by querying shardman.cmd_log and
-shardman.cmd_opts tables:
+used to check the cmd status later by querying shardman.cmd_log table:
 
 CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
 	cmd_type cmd NOT NULL,
+	cmd_opts TEXT[],
 	status cmd_status DEFAULT 'waiting' NOT NULL
 );
-CREATE TABLE cmd_opts (
-	id bigserial PRIMARY KEY,
-	cmd_id bigint REFERENCES cmd_log(id),
-	opt text
-);
 
-We will unite them into convenient view someday. Commands status is enum with
-mostly obvious values ('waiting', 'canceled', 'failed', 'in progress',
-'success', 'done'). You might wonder what is the difference between 'success'
-and 'done'. We set the latter when the command is not atomic itself, but
-consists of several atomic steps, some of which were probably executed
-successfully and some failed.
+Commands status is enum with mostly obvious values ('waiting', 'canceled',
+'failed', 'in progress', 'success', 'done'). You might wonder what is the
+difference between 'success' and 'done'. We set the latter when the command is
+not atomic itself, but consists of several atomic steps, some of which were
+probably executed successfully and some failed.
 
 Currently cmd_log can be seen and commands issued only on the shardlord, but
 that's easy to change.
