@@ -61,10 +61,12 @@ shared_preload_libraries, restart the server and run
 
 create extension pg_shardman cascade;
 
-Have a look at postgresql.conf.common and postgresql.conf.lord example
-configuration files. The former contains all shardman's and important PostgreSQL
-GUCs for either shardlord and workers, the latter for shardlord only -- in
-particular, shardman.shardlord defines whether the instance is shardlord or not.
+Have a look at postgresql.conf.common, postgresql.conf.lord and
+postgresql.conf.worker example configuration files. The first contains all
+shardman's and important PostgreSQL GUCs for either shardlord and workers. The
+second and the third show GUCs you should care for on shardlord and worker nodes
+accordingly. For instance, shardman.shardlord defines whether the instance is
+shardlord or not.
 
 Currently extension scheme is fixed, it is, who would have thought, 'shardman'.
 
