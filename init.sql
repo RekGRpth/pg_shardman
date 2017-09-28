@@ -34,6 +34,7 @@ CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
 CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
 	cmd_type cmd NOT NULL,
+	cmd_opts TEXT[],
 	status cmd_status DEFAULT 'waiting' NOT NULL
 );
 
@@ -48,15 +49,6 @@ CREATE TRIGGER cmd_log_inserts
 	AFTER INSERT ON cmd_log
 	FOR EACH STATEMENT EXECUTE PROCEDURE notify_shardlord();
 
--- probably better to keep opts in an array field, but working with arrays from
--- libpq is not very handy
--- opts must be inserted sequentially, we order by them by id
-CREATE TABLE cmd_opts (
-	id bigserial PRIMARY KEY,
-	cmd_id bigint REFERENCES cmd_log(id),
-	opt text
-);
-
 -- Interface functions
 
 -- Add a node. Its state will be reset, all shardman data lost.
@@ -64,9 +56,10 @@ CREATE FUNCTION add_node(connstring text) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'add_node')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, connstring);
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT, 'add_node', ARRAY[connstring])
+		RETURNING id INTO c_id;
+
 	RETURN c_id;
 END
 $$ LANGUAGE plpgsql;
@@ -76,12 +69,15 @@ CREATE FUNCTION rm_node(node_id int, force bool default false) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'rm_node')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
-	IF force THEN
-	    INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, 'force');
-	END IF;
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT,
+				'rm_node',
+				CASE force
+					WHEN true THEN ARRAY[node_id::text, 'force']
+					ELSE ARRAY[node_id::text]
+				END)
+		RETURNING id INTO c_id;
+
 	RETURN c_id;
 END
 $$ LANGUAGE plpgsql;
@@ -95,12 +91,12 @@ CREATE FUNCTION create_hash_partitions(
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'create_hash_partitions')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, node_id);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, expr);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, partitions_count);
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT,
+				'create_hash_partitions',
+				ARRAY[node_id::text, relation, expr, partitions_count::text])
+		RETURNING id INTO c_id;
+
 	IF rebalance THEN
 		PERFORM shardman.rebalance(relation);
 	END IF;
@@ -117,11 +113,10 @@ CREATE FUNCTION move_part(part_name text, dest int, src int DEFAULT NULL)
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'move_part')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, src);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT, 'move_part', ARRAY[part_name, src::text, dest::text])
+		RETURNING id INTO c_id;
+
 	RETURN c_id;
 END $$ LANGUAGE plpgsql;
 
@@ -132,10 +127,10 @@ CREATE FUNCTION create_replica(part_name text, dest int) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'create_replica')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, part_name);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, dest);
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT, 'create_replica', ARRAY[part_name, dest::text])
+		RETURNING id INTO c_id;
+
 	RETURN c_id;
 END $$ LANGUAGE plpgsql;
 
@@ -144,9 +139,10 @@ CREATE FUNCTION rebalance(relation text) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'rebalance')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT, 'rebalance', ARRAY[relation])
+		RETURNING id INTO c_id;
+
 	RETURN c_id;
 END $$ LANGUAGE plpgsql;
 
@@ -157,10 +153,10 @@ CREATE FUNCTION set_replevel(relation text, replevel int) RETURNS int AS $$
 DECLARE
 	c_id int;
 BEGIN
-	INSERT INTO @extschema@.cmd_log VALUES (DEFAULT, 'set_replevel')
-										   RETURNING id INTO c_id;
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, relation);
-	INSERT INTO @extschema@.cmd_opts VALUES (DEFAULT, c_id, replevel);
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT, 'set_replevel', ARRAY[relation, replevel::text])
+		RETURNING id INTO c_id;
+
 	RETURN c_id;
 END $$ LANGUAGE plpgsql STRICT;
 

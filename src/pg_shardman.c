@@ -367,56 +367,74 @@ wait_notify()
 Cmd *
 next_cmd(void)
 {
-	const char *sql;
-	Cmd *cmd = NULL;
-	MemoryContext oldcxt = CurrentMemoryContext;
-	int e;
+	const char	   *sql;
+	Cmd			   *cmd = NULL;
+	MemoryContext	oldcxt = CurrentMemoryContext,
+					spicxt;
+	int				e;
 
 	SPI_PROLOG;
 
-	sql = "select * from shardman.cmd_log t1 join"
-		" (select MIN(id) id from shardman.cmd_log where status = 'waiting' OR"
-		" status = 'in progress') t2 using (id);";
+	/* Get the oldest pending task (id + cmd_type) */
+	sql = "select id, cmd_type from shardman.cmd_log"
+		  " where status in ('waiting', 'in progress')"
+		  " order by id asc"
+		  " limit 1;";
 	e = SPI_execute(sql, true, 0);
 	if (e < 0)
 		shmn_elog(FATAL, "Stmt failed: %s", sql);
 
 	if (SPI_processed > 0)
 	{
-		HeapTuple tuple = SPI_tuptable->vals[0];
-		TupleDesc rowdesc = SPI_tuptable->tupdesc;
-		bool isnull;
-		uint64 i;
+		TupleDesc		rowdesc;
+		HeapTuple		tuple;
+		bool			isnull;
+		int				cmd_id_attr,
+						cmd_type_attr,
+						opt_attr;
+		uint64			i;
+
+		/* get tuple and its descriptor */
+		rowdesc = SPI_tuptable->tupdesc;
+		tuple = SPI_tuptable->vals[0];
+
+		/* get attribute numbers */
+		cmd_id_attr = SPI_fnumber(rowdesc, "id");
+		Assert(cmd_id_attr != SPI_ERROR_NOATTRIBUTE);
+		cmd_type_attr = SPI_fnumber(rowdesc, "cmd_type");
+		Assert(cmd_type_attr != SPI_ERROR_NOATTRIBUTE);
 
 		/* copy the command itself to callee context */
-		MemoryContext spicxt = MemoryContextSwitchTo(oldcxt);
-		cmd = palloc(sizeof(Cmd));
+		spicxt = MemoryContextSwitchTo(oldcxt);
+		cmd = palloc0(sizeof(Cmd));
 		cmd->id = DatumGetInt64(SPI_getbinval(tuple, rowdesc,
-											  SPI_fnumber(rowdesc, "id"),
+											  cmd_id_attr,
 											  &isnull));
-		cmd->cmd_type = SPI_getvalue(tuple, rowdesc,
-									 SPI_fnumber(rowdesc, "cmd_type"));
+		cmd->cmd_type = SPI_getvalue(tuple, rowdesc, cmd_type_attr);
 		MemoryContextSwitchTo(spicxt);
 
 		/* Now get options. sql will be freed by SPI_finish */
-		sql = psprintf("select opt from shardman.cmd_opts where"
-						   " cmd_id = %ld order by id;", cmd->id);
+		sql = psprintf("select unnest(cmd_opts) opt from shardman.cmd_log"
+					   " where id = " INT64_FORMAT, cmd->id);
 		e = SPI_execute(sql, true, 0);
 		if (e < 0)
 			shmn_elog(FATAL, "Stmt failed: %s", sql);
 
 		MemoryContextSwitchTo(oldcxt);
 		/* +1 for NULL in the end */
-		cmd->opts = palloc((SPI_processed + 1) * sizeof(char*));
+		cmd->opts = palloc0((SPI_processed + 1) * sizeof(char *));
 		for (i = 0; i < SPI_processed; i++)
 		{
-			tuple = SPI_tuptable->vals[i];
+			/* get tuple and its descriptor */
 			rowdesc = SPI_tuptable->tupdesc;
-			cmd->opts[i] = SPI_getvalue(tuple, rowdesc,
-										SPI_fnumber(rowdesc, "opt"));
-		}
-		cmd->opts[i] = NULL;
+			tuple = SPI_tuptable->vals[i];
 
+			/* get attribute numbers */
+			opt_attr = SPI_fnumber(rowdesc, "opt");
+			Assert(opt_attr != SPI_ERROR_NOATTRIBUTE);
+
+			cmd->opts[i] = SPI_getvalue(tuple, rowdesc, opt_attr);
+		}
 		MemoryContextSwitchTo(spicxt);
 	}
 
