@@ -415,20 +415,23 @@ alter_system_c(PG_FUNCTION_ARGS)
 	conn = PQconnectdb(connstr);
 	if (PQstatus(conn) != CONNECTION_OK)
 	{
-		PQfinish(conn);
-		elog(ERROR, "Connection to myself with connstr %s failed", connstr);
-
+		elog(WARNING, "Connection to myself with connstr %s failed: %s",
+			 connstr, PQerrorMessage(conn));
+		goto fail;
 	}
 	SPI_finish(); /* Can't do earlier since connstr is allocated there */
 	res = PQexec(conn, cmd);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		PQclear(res);
-		PQfinish(conn);
-		elog(ERROR, "setting %s to %s failed", opt, val);
+		elog(WARNING, "setting %s to %s failed", opt, val);
+		goto fail;
 	}
 
 	PQclear(res);
 	PQfinish(conn);
 	PG_RETURN_VOID();
+
+fail:
+	reset_pqconn_and_res(&conn, res);
+	elog(ERROR, "alter_system_c failed");
 }

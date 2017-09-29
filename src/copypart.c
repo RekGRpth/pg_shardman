@@ -930,39 +930,53 @@ int
 check_sub_sync(const char *subname, PGconn **conn, XLogRecPtr ref_lsn,
 			   const char *log_pref)
 {
-	PGresult *res;
+	PGresult *res = NULL;
 	char *received_lsn_str;
 	XLogRecPtr received_lsn;
 	char *sql = received_lsn_sql(subname);
 
 	res = PQexec(*conn, sql);
-	pfree(sql);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		shmn_elog(LOG, "%s: failed to learn sub lsn on src: %s",
 				  log_pref, PQerrorMessage(*conn));
 		reset_pqconn_and_res(conn, res);
-		return -1;
+		res = NULL; /* TODO: reset_res */
+		goto fail;
 	}
 	/* FIXME: this should never be true, but sometimes it is. */
 	if (PQntuples(res) != 1)
 	{
 		shmn_elog(LOG, "learning sub %s lsn returned %d rows, query %s",
 				  subname, PQntuples(res), sql);
-		PQclear(res);
-		return -1;
+		goto fail;
+	}
+	/* FIXME: this should never be true, but sometimes it is. */
+	if (PQgetisnull(res, 0, 0))
+	{
+		shmn_elog(LOG, "learning sub %s lsn returned NULL received_lsn, query %s",
+				  subname, sql);
+		goto fail;
 	}
 	received_lsn_str = PQgetvalue(res, 0, 0);
 	shmn_elog(DEBUG1, "%s: received_lsn is %s", log_pref, received_lsn_str);
 	received_lsn = pg_lsn_in_c(received_lsn_str);
-	PQclear(res);
 	if (received_lsn < ref_lsn)
 	{
 		shmn_elog(DEBUG1, "%s: sub is not yet synced, received_lsn is %lu, "
 				  " but we wait for %lu", log_pref, received_lsn, ref_lsn);
-		return -1;
+		goto fail;
 	}
+
+	PQclear(res);
+	pfree(sql);
 	return 0;
+
+fail:
+	/* TODO: reset_res */
+	PQclear(res);
+	pfree(sql);
+	return -1;
 }
 
 /*

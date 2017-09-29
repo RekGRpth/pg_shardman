@@ -306,6 +306,7 @@ listen_cmd_log_inserts(void)
 {
 	PGresult   *res;
 
+	/* TODO: make sure we connect to ourselves, probably cmp ports */
 	conn = PQconnectdb(shardman_shardlord_connstring);
 	/* Check to see that the backend connection was successfully made */
 	if (PQstatus(conn) != CONNECTION_OK)
@@ -864,13 +865,13 @@ rm_node(Cmd *cmd)
 
 /*
  * Finish pq connection and set ptr to NULL. You must be sure that the
- * connection exists!
+ * connection exists or ptr is NULL.
  */
 void
 reset_pqconn(PGconn **conn) { PQfinish(*conn); *conn = NULL; }
 /*
  * Same, but also clear res. You must be sure that both connection and res
- * exist.
+ * exist or they are NULL ptrs.
  */
 void
 reset_pqconn_and_res(PGconn **conn, PGresult *res)
