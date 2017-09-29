@@ -1,5 +1,6 @@
 *.retry
 inventory/manual
+logs/
 
 /postgresql.conf.common
 /postgresql.conf.lord

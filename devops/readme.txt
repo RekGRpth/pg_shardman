@@ -52,6 +52,9 @@ ansible-playbook -i inventory_ec2 pg_ctl.yml -e "pg_ctl_action=restart"
 Read cmd log on shardlord:
 ansible-playbook -i inventory_ec2/ psql.yml --limit 'shardlord' -e "cmd='\'table shardman.cmd_log\''"
 
+Gather logs to ./logs:
+ansible-playbook -i inventory_ec2/ logs.yml
+
 Ubuntu images EC2 locator:
 https://cloud-images.ubuntu.com/locator/ec2/
 We need ami-4199282e.
@@ -67,3 +70,4 @@ Things that made me wonder during writing this:
 * No way to specify multiple inventory files, only whole directory or one file.
 * No way to append file to file, except for j2 templates, which doesn't work
   with files outside the template dir, really?
+* Writing yml files makes me nervous.
