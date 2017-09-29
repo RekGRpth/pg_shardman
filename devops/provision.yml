@@ -8,6 +8,13 @@
     CFLAGS: "{{ cflags }}"
 
   tasks:
+  - name: set Moscow timezone
+    timezone:
+      name: Europe/Moscow
+    become: yes
+    tags:
+      - tz
+
   - name: update apt cache (Debian)
     apt: update_cache=yes
     become: yes
@@ -85,3 +92,7 @@
       chdir: "{{shardman_src}}"
     tags:
       - build_shardman
+
+- import_playbook: init.yml
+  tags:
+    - init

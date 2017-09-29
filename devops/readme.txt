@@ -35,7 +35,7 @@ For manually configured nodes:
 ansible -i inventory_manual -m ping all
 Now you are ready to go.
 
-Ansible cheatsheet:
+Short usage guide & Ansible cheatsheet:
 
 Build only PG on ec2:
 ansible-playbook -i inventory_ec2 --tags "build_pg"
@@ -51,6 +51,10 @@ ansible-playbook -i inventory_ec2 pg_ctl.yml -e "pg_ctl_action=restart"
 
 Read cmd log on shardlord:
 ansible-playbook -i inventory_ec2/ psql.yml --limit 'shardlord' -e "cmd='\'table shardman.cmd_log\''"
+
+Ubuntu images EC2 locator:
+https://cloud-images.ubuntu.com/locator/ec2/
+We need ami-4199282e.
 
 Things that made me wonder during writing this:
 * Reusability of tasks. Playbooks, files with tasks, roles, includes, imports,

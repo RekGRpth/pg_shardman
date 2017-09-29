@@ -3,12 +3,22 @@
 ---
 - hosts: nodes
 
-  environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
-
   tasks:
+  - name: rm -rf logs
+    local_action: file path=logs state=absent
+    run_once: true
   - name: fetch logs
     fetch:
       src: "{{ pg_logfile }}"
-      dest: /tmp
+      dest: logs/{{ inventory_hostname }}.log
       validate_checksum: no # new logs might constantly arrive
+      flat: yes
+
+- hosts: shardlord
+
+  tasks:
+  - name: create symlink to shadlord log
+    local_action: file
+      src={{ inventory_hostname }}.log
+      dest=logs/shardlord.log
+      state=link
