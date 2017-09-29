@@ -421,20 +421,20 @@ BEGIN
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Drop all foreign server's options. Yes, I don't know simpler ways.
-CREATE FUNCTION reset_foreign_server_opts(sname name) RETURNS void AS $$
+CREATE FUNCTION reset_foreign_server_opts(server_name name) RETURNS void AS $$
 DECLARE
 	opts text[];
 	opt text;
 	opt_key text;
 BEGIN
-	ASSERT EXISTS (SELECT 1 FROM pg_foreign_server WHERE srvname = sname);
+	ASSERT EXISTS (SELECT 1 from pg_foreign_server WHERE srvname=server_name);
 	EXECUTE format($q$SELECT coalesce(srvoptions, '{}'::text[]) FROM
 									  pg_foreign_server WHERE srvname = %L$q$,
-									  sname) INTO opts;
-	FOREACH opt IN ARRAY opts LOOP
-		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
-		EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', sname, opt_key);
-	END LOOP;
+									       server_name) INTO opts;
+    FOREACH opt IN ARRAY opts LOOP
+	    opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
+	    EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', server_name, opt_key);
+    END LOOP;
 END $$ LANGUAGE plpgsql STRICT;
 -- Same for resetting user mapping opts
 CREATE or replace FUNCTION reset_um_opts(srvname name, umuser regrole)
@@ -449,19 +449,53 @@ BEGIN
 				   ON fs.oid = ums.umserver WHERE fs.srvname = %L AND
 				   ums.umuser = umuser$q$, srvname)
 		INTO opts;
-
-	FOREACH opt IN ARRAY opts LOOP
-		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
-		EXECUTE format('ALTER USER MAPPING FOR %I SERVER %I OPTIONS (DROP %s);',
+	IF opts IS NOT NULL THEN
+	    FOREACH opt IN ARRAY opts LOOP
+		    opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
+			EXECUTE format('ALTER USER MAPPING FOR %I SERVER %I OPTIONS (DROP %s);',
 					   umuser::name, srvname, opt_key);
-	END LOOP;
+	    END LOOP;
+	END IF;
+END $$ LANGUAGE plpgsql STRICT;
+
+CREATE FUNCTION create_foreign_server(node_id integer) RETURNS void AS $$
+DECLARE
+	connstring text;
+	server_opts text;
+	um_opts text;
+	server_name text;
+BEGIN
+	SELECT nodes.connstring FROM shardman.nodes WHERE id = node_id
+		INTO connstring;
+	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)
+		INTO server_opts, um_opts;
+	server_name := 'node_'||node_id;
+	IF NOT EXISTS (SELECT 1 from pg_foreign_server WHERE srvname=server_name)
+	THEN
+	    RAISE DEBUG 'Create foreign server % for with options %', server_name, server_opts;
+		EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER postgres_fdw %s;',
+			server_name, server_opts);
+	    -- TODO: support not only CURRENT_USER
+	    EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I %s;',
+			server_name, um_opts);
+	ELSE
+	    RAISE DEBUG 'Use existed foreign server % with options %', server_name, server_opts;
+		PERFORM shardman.reset_foreign_server_opts(server_name);
+		PERFORM shardman.reset_um_opts(server_name, current_user::regrole);
+
+		IF server_opts != '' THEN
+		   EXECUTE format('ALTER SERVER %I %s', server_name, server_opts);
+		END IF;
+		IF um_opts != '' THEN
+		   EXECUTE format('ALTER USER MAPPING FOR CURRENT_USER SERVER %I %s',
+					   server_name, um_opts);
+		END IF;
+ 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Update foreign server and user mapping params on current node according to
 -- partition part, so this is expected to be called on server/um params
--- change. We use dedicated server for each partition because we plan to use
--- multiple hosts/ports in connstrings for transient fallback to replica if
--- server with main partition fails. FDW server, user mapping, foreign table and
+-- change. FDW server, user mapping, foreign table and
 -- (obviously) parent partition must exist when called if they need to be
 -- updated; however, it is ok to call this func on nodes which don't need fdw
 -- setup for this part because they hold primary partition.
@@ -472,6 +506,8 @@ DECLARE
 	um_opts text;
 	me int := shardman.my_id();
 	my_part shardman.partitions;
+	server_oid oid;
+	foreign_table_oid oid;
 BEGIN
 	RAISE DEBUG '[SHMN] update_fdw_server called for part %, owner %',
 		part.part_name, part.owner;
@@ -487,24 +523,11 @@ BEGIN
 		END IF;
 	END IF;
 
-	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
-		INTO connstring;
-	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)
-	  INTO server_opts, um_opts;
+	PERFORM shardman.create_foreign_server(part.owner);
 
-	-- ALTER FOREIGN TABLE doesn't support changing server, ALTER SERVER doesn't
-	-- support dropping all params, and I don't want to recreate foreign table
-	-- each time server params change, so resorting to these hacks.
-	PERFORM shardman.reset_foreign_server_opts(part.part_name);
-	PERFORM shardman.reset_um_opts(part.part_name, current_user::regrole);
-
-	IF server_opts != '' THEN
-		EXECUTE format('ALTER SERVER %I %s', part.part_name, server_opts);
-	END IF;
-	IF um_opts != '' THEN
-		EXECUTE format('ALTER USER MAPPING FOR CURRENT_USER SERVER %I %s',
-					   part.part_name, um_opts);
-	END IF;
+	SELECT oid FROM pg_foreign_server WHERE srvname='node_'||part.owner into server_oid;
+	SELECT oid FROM pg_class WHERE relname=part.part_name||'_fdw' into foreign_table_oid;
+	UPDATE pg_foreign_table SET ftserver = server_oid WHERE ftrelid = foreign_table_oid;
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Replace existing hash partition with foreign, assuming 'partition' shows
@@ -514,23 +537,11 @@ CREATE FUNCTION replace_usual_part_with_foreign(part partitions)
 DECLARE
 	connstring text;
 	fdw_part_name text;
-	server_opts text;
-	um_opts text;
+	server_name text;
 BEGIN
-	EXECUTE format('DROP SERVER IF EXISTS %I CASCADE;', part.part_name);
+	server_name := 'node_'||part.owner;
+	PERFORM shardman.create_foreign_server(part.owner);
 
-	SELECT nodes.connstring FROM shardman.nodes WHERE id = part.owner
-		INTO connstring;
-	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)
-		INTO server_opts, um_opts;
-
-	EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER
-				   postgres_fdw %s;', part.part_name, server_opts);
-	EXECUTE format('DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER %I;',
-				   part.part_name);
-	-- TODO: support not only CURRENT_USER
-	EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I
-				   %s;', part.part_name, um_opts);
 	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
 	EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', fdw_part_name);
 
@@ -552,7 +563,7 @@ BEGIN
 				   (SELECT
 						shardman.reconstruct_table_attrs(
 							format('%I', part.relation))),
-							part.part_name,
+							server_name,
 							part.part_name);
 	-- replace local partition with foreign table
 	EXECUTE format('SELECT replace_hash_partition(%L, %L)',
