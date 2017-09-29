@@ -413,13 +413,13 @@ alter_system_c(PG_FUNCTION_ARGS)
 	connstr = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 
 	conn = PQconnectdb(connstr);
-	SPI_finish(); /* Can't do earlier since connstr is allocated there */
 	if (PQstatus(conn) != CONNECTION_OK)
 	{
 		PQfinish(conn);
 		elog(ERROR, "Connection to myself with connstr %s failed", connstr);
 
 	}
+	SPI_finish(); /* Can't do earlier since connstr is allocated there */
 	res = PQexec(conn, cmd);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
