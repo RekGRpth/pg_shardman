@@ -399,9 +399,13 @@ BEGIN
 	-- Create subscription for new data channel
 	-- It should never exist at this moment, but just in case...
 	PERFORM shardman.eliminate_sub(lname);
+	-- It is important to set synchronous_commit to local in apply
+	-- worker. Otherwise deadlocks arise because currently in sync replication
+	-- PG waits for any transaction remote commit regardless of which relations
+	-- it touches.
 	EXECUTE format(
 		'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = local);',
 		lname, oldtail_connstr, lname, lname);
 END $$ LANGUAGE plpgsql;
 
