@@ -189,7 +189,7 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 		else
 		{
 			mps->cp.type = COPYPARTTASK_MOVE_REPLICA;
-			mps->prev_connstr = get_worker_node_connstr(mps->prev_node);
+			mps->prev_connstr = get_node_connstr(mps->prev_node, SNT_WORKER);
 		}
 	}
 	mps->cp.dst_node = dst_node;
@@ -206,7 +206,7 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 		 * This part has replica, so after moving part we have to
 		 * reconfigure LR channel properly.
 		 */
-		mps->next_connstr = get_worker_node_connstr(mps->next_node);
+		mps->next_connstr = get_node_connstr(mps->next_node, SNT_WORKER);
 	}
 
 	mps->cp.update_metadata_sql = psprintf(
@@ -323,9 +323,9 @@ init_cp_state(CopyPartState *cps)
 	cps->fd_to_epoll = -1;
 	cps->fd_in_epoll_set = -1;
 
-	cps->src_connstr = get_worker_node_connstr(cps->src_node);
+	cps->src_connstr = get_node_connstr(cps->src_node, SNT_WORKER);
 	Assert(cps->src_connstr != NULL);
-	cps->dst_connstr = get_worker_node_connstr(cps->dst_node);
+	cps->dst_connstr = get_node_connstr(cps->dst_node, SNT_WORKER);
 	Assert(cps->dst_connstr != NULL);
 
 	/* constant strings */

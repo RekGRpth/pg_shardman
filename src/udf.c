@@ -22,6 +22,7 @@
 #include "replication/logicalworker.h"
 #include "replication/syncrep.h"
 #include "libpq-fe.h"
+#include "tcop/tcopprot.h"
 
 #include "pg_shardman.h"
 
@@ -34,15 +35,15 @@ PG_FUNCTION_INFO_V1(pg_shardman_cleanup_c);
 Datum
 pg_shardman_cleanup_c(PG_FUNCTION_ARGS)
 {
-    EventTriggerData *trigdata;
+	EventTriggerData *trigdata;
 	DropStmt *stmt;
 	Value *value;
 	char *ext_name;
 
-    if (!CALLED_AS_EVENT_TRIGGER(fcinfo))  /* internal error */
-        elog(ERROR, "not fired by event trigger manager");
+	if (!CALLED_AS_EVENT_TRIGGER(fcinfo))  /* internal error */
+		elog(ERROR, "not fired by event trigger manager");
 
-    trigdata = (EventTriggerData *) fcinfo->context;
+	trigdata = (EventTriggerData *) fcinfo->context;
 	Assert(trigdata->parsetree->type == T_DropStmt);
 	stmt = (DropStmt *) trigdata->parsetree;
 	Assert(stmt->removeType == OBJECT_EXTENSION);
@@ -66,7 +67,7 @@ pg_shardman_cleanup_c(PG_FUNCTION_ARGS)
 		SPI_finish();
 	}
 
-    PG_RETURN_NULL();
+	PG_RETURN_NULL();
 }
 
 /*
@@ -189,7 +190,7 @@ PG_FUNCTION_INFO_V1(pq_conninfo_parse);
 Datum
 pq_conninfo_parse(PG_FUNCTION_ARGS)
 {
-    TupleDesc            tupdesc;
+	TupleDesc            tupdesc;
 	/* array of keywords and array of vals as in PQconninfoOption */
 	Datum		values[2];
 	bool		nulls[2] = { false, false };
@@ -434,4 +435,118 @@ alter_system_c(PG_FUNCTION_ARGS)
 fail:
 	reset_pqconn_and_res(&conn, res);
 	elog(ERROR, "alter_system_c failed");
+}
+
+/*
+ * Send utility command to shardlord if it's run by worker.
+ */
+PG_FUNCTION_INFO_V1(execute_on_lord_c);
+Datum
+execute_on_lord_c(PG_FUNCTION_ARGS)
+{
+	char *cmd_type = TextDatumGetCString(PG_GETARG_TEXT_P(0));
+	ArrayType *cmd_opts = PG_GETARG_ARRAYTYPE_P(1);
+
+	Oid opts_elemtype;
+	int16 opts_elemlen;
+	bool opts_elembyval;
+	char opts_elemalign;
+	Datum *opts_values;
+	bool *opts_nulls;
+	int opts_count;
+
+	StringInfoData query;
+	const char **query_params;
+
+	char *connstr;
+	PGconn *conn = NULL;
+	PGresult *res = NULL;
+	char *res_str;
+	int i;
+
+	/* Oops, lord should not call this function! */
+	if (shardman_shardlord)
+		elog(ERROR, "Shardlord should never call function %s", __FUNCTION__);
+
+	/* Extract array of command options */
+	opts_elemtype = ARR_ELEMTYPE(cmd_opts);
+	get_typlenbyvalalign(opts_elemtype, &opts_elemlen,
+						 &opts_elembyval, &opts_elemalign);
+	deconstruct_array(cmd_opts,
+					  opts_elemtype,
+					  opts_elemlen,
+					  opts_elembyval,
+					  opts_elemalign,
+					  &opts_values,
+					  &opts_nulls,
+					  &opts_count);
+
+	/* Allocate some space for query params */
+	query_params = palloc(opts_count * sizeof(char *));
+
+	/* Prepare query */
+	initStringInfo(&query);
+	appendStringInfo(&query, "select shardman.%s(", quote_identifier(cmd_type));
+	for (i = 0; i < opts_count; i++)
+	{
+		int param = i + 1;
+		appendStringInfo(&query, "$%d", param);
+
+		if (param != opts_count)
+			appendStringInfoChar(&query, ',');
+
+		/* Save plaintext params for this query */
+		query_params[i] = opts_nulls[i] ?
+							NULL :
+							TextDatumGetCString(opts_values[i]);
+	}
+	appendStringInfo(&query, ");");
+
+
+	/* Get a connection string of the current lord */
+	if ((connstr = get_node_connstr(SHMN_INVALID_NODE_ID, SNT_LORD)) == NULL)
+	{
+		shmn_elog(NOTICE, "%s: failed to find the shardlord", query.data);
+
+		goto attempt_failed;
+	}
+
+	conn = PQconnectdb(connstr);
+	if (PQstatus(conn) != CONNECTION_OK)
+	{
+		shmn_elog(NOTICE,
+				  "%s: failed to connect to the shardlord, %s",
+				  connstr, PQerrorMessage(conn));
+
+		goto attempt_failed;
+	}
+
+	res = PQexecParams(conn, query.data, opts_count,
+					   NULL, query_params, NULL, NULL, 0);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		shmn_elog(NOTICE,
+				  "%s: failed to execute command on the shardlord, %s",
+				  connstr, PQerrorMessage(conn));
+
+		goto attempt_failed;
+	}
+
+	/* Extract the result produced by the API method */
+	Assert(PQntuples(res) == 1);
+	Assert(PQnfields(res) == 1);
+	res_str = PQgetvalue(res, 0, 0);
+
+	PQclear(res);
+	PQfinish(conn);
+	pfree(connstr);
+	pfree(query.data);
+
+	/* Finally, return the result */
+	PG_RETURN_TEXT_P(cstring_to_text(res_str));
+
+attempt_failed: /* clean resources */
+		reset_pqconn_and_res(&conn, res);
+
+		shmn_elog(ERROR, "Attempt to execute %s failed", query.data);
 }

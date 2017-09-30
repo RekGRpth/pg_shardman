@@ -23,62 +23,51 @@ BEGIN
 END
 $$;
 
--- available commands
-CREATE TYPE cmd AS ENUM ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_part', 'create_replica', 'rebalance',
-						 'set_replevel');
--- command status
-CREATE TYPE cmd_status AS ENUM ('waiting', 'canceled', 'failed', 'in progress',
-								'success', 'done');
-
 CREATE TABLE cmd_log (
 	id bigserial PRIMARY KEY,
-	cmd_type cmd NOT NULL,
+	cmd_type TEXT NOT NULL,
 	cmd_opts TEXT[],
-	status cmd_status DEFAULT 'waiting' NOT NULL
+	status TEXT DEFAULT 'waiting' NOT NULL,
+
+	-- available commands
+	CONSTRAINT check_cmd_type
+	CHECK (cmd_type IN ('add_node', 'rm_node', 'create_hash_partitions',
+						 'move_part', 'create_replica', 'rebalance',
+						 'set_replevel')),
+
+	-- command status
+	CONSTRAINT check_cmd_status
+	CHECK (status IN ('waiting', 'canceled', 'failed', 'in progress',
+					  'success', 'done'))
 );
 
--- Notify shardlord bgw about new commands
-CREATE FUNCTION notify_shardlord() RETURNS trigger AS $$
-BEGIN
-	NOTIFY shardman_cmd_log_update;
-	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
-CREATE TRIGGER cmd_log_inserts
-	AFTER INSERT ON cmd_log
-	FOR EACH STATEMENT EXECUTE PROCEDURE notify_shardlord();
 
 -- Interface functions
+
 
 -- Add a node. Its state will be reset, all shardman data lost.
 CREATE FUNCTION add_node(connstring text) RETURNS int AS $$
 DECLARE
-	c_id int;
+	cmd		text;
+	opts	text[];
 BEGIN
-	INSERT INTO @extschema@.cmd_log
-		VALUES (DEFAULT, 'add_node', ARRAY[connstring])
-		RETURNING id INTO c_id;
+	cmd = 'add_node';
+	opts = ARRAY[connstring::text];
 
-	RETURN c_id;
+	RETURN @extschema@.register_cmd(cmd, opts);
 END
 $$ LANGUAGE plpgsql;
 
 -- Remove node. Its state will be reset, all shardman data lost.
-CREATE FUNCTION rm_node(node_id int, force bool default false) RETURNS int AS $$
+CREATE FUNCTION rm_node(node_id int, force bool DEFAULT false) RETURNS int AS $$
 DECLARE
-	c_id int;
+	cmd		text;
+	opts	text[];
 BEGIN
-	INSERT INTO @extschema@.cmd_log
-		VALUES (DEFAULT,
-				'rm_node',
-				CASE force
-					WHEN true THEN ARRAY[node_id::text, 'force']
-					ELSE ARRAY[node_id::text]
-				END)
-		RETURNING id INTO c_id;
+	cmd = 'rm_node';
+	opts = ARRAY[node_id::text, force::text];
 
-	RETURN c_id;
+	RETURN @extschema@.register_cmd(cmd, opts);
 END
 $$ LANGUAGE plpgsql;
 
@@ -89,78 +78,111 @@ CREATE FUNCTION create_hash_partitions(
 	rebalance bool DEFAULT true)
 	RETURNS int AS $$
 DECLARE
-	c_id int;
+	cmd_id	int;
+	cmd		text;
+	opts	text[];
 BEGIN
-	INSERT INTO @extschema@.cmd_log
-		VALUES (DEFAULT,
-				'create_hash_partitions',
-				ARRAY[node_id::text, relation, expr, partitions_count::text])
-		RETURNING id INTO c_id;
+	cmd = 'create_hash_partitions';
+	opts = ARRAY[node_id::text,
+				 relation::text,
+				 expr::text,
+				 partitions_count::text,
+				 rebalance::text];
 
-	IF rebalance THEN
-		PERFORM shardman.rebalance(relation);
+	cmd_id = @extschema@.register_cmd(cmd, opts);
+
+	-- additional steps must check node's type
+	IF @extschema@.me_lord() AND rebalance THEN
+		cmd_id = @extschema@.rebalance(relation);
 	END IF;
-	RETURN c_id;
+
+	-- return last command's id
+	RETURN cmd_id;
 END
 $$ LANGUAGE plpgsql;
 
 -- Move primary or replica partition to another node. Params:
 -- 'part_name' is name of the partition to move
--- 'dest' is id of the destination node
+-- 'dst' is id of the destination node
 -- 'src' is id of the node with partition. If NULL, primary partition is moved.
-CREATE FUNCTION move_part(part_name text, dest int, src int DEFAULT NULL)
+CREATE FUNCTION move_part(part_name text, dst int, src int DEFAULT NULL)
 	RETURNS int AS $$
 DECLARE
-	c_id int;
+	cmd		text;
+	opts	text[];
 BEGIN
-	INSERT INTO @extschema@.cmd_log
-		VALUES (DEFAULT, 'move_part', ARRAY[part_name, src::text, dest::text])
-		RETURNING id INTO c_id;
+	cmd = 'move_part';
+	opts = ARRAY[part_name::text, dst::text, src::text];
 
-	RETURN c_id;
-END $$ LANGUAGE plpgsql;
+	RETURN @extschema@.register_cmd(cmd, opts);
+END
+$$ LANGUAGE plpgsql;
 
 -- Create replica partition. Params:
 -- 'part_name' is name of the partition to replicate
--- 'dest' is id of the node on which part will be created
-CREATE FUNCTION create_replica(part_name text, dest int) RETURNS int AS $$
+-- 'dst' is id of the node on which part will be created
+CREATE FUNCTION create_replica(part_name text, dst int) RETURNS int AS $$
 DECLARE
-	c_id int;
+	cmd		text;
+	opts	text[];
 BEGIN
-	INSERT INTO @extschema@.cmd_log
-		VALUES (DEFAULT, 'create_replica', ARRAY[part_name, dest::text])
-		RETURNING id INTO c_id;
+	cmd = 'create_replica';
+	opts = ARRAY[part_name::text, dst::text];
 
-	RETURN c_id;
-END $$ LANGUAGE plpgsql;
+	RETURN @extschema@.register_cmd(cmd, opts);
+END
+$$ LANGUAGE plpgsql;
 
 -- Evenly distribute partitions of table 'relation' across all nodes.
 CREATE FUNCTION rebalance(relation text) RETURNS int AS $$
 DECLARE
-	c_id int;
+	cmd		text;
+	opts	text[];
 BEGIN
-	INSERT INTO @extschema@.cmd_log
-		VALUES (DEFAULT, 'rebalance', ARRAY[relation])
-		RETURNING id INTO c_id;
+	cmd = 'rebalance';
+	opts = ARRAY[relation::text];
 
-	RETURN c_id;
-END $$ LANGUAGE plpgsql;
+	RETURN @extschema@.register_cmd(cmd, opts);
+END
+$$ LANGUAGE plpgsql;
 
 -- Add replicas to partitions of table 'relation' until we reach replevel
 -- replicas for each one. Note that it is pointless to set replevel to more than
 -- number of active workers - 1. Replica deletions is not implemented yet.
 CREATE FUNCTION set_replevel(relation text, replevel int) RETURNS int AS $$
 DECLARE
-	c_id int;
+	cmd		text;
+	opts	text[];
 BEGIN
-	INSERT INTO @extschema@.cmd_log
-		VALUES (DEFAULT, 'set_replevel', ARRAY[relation, replevel::text])
-		RETURNING id INTO c_id;
+	cmd = 'set_replevel';
+	opts = ARRAY[relation::text, replevel::text];
 
-	RETURN c_id;
-END $$ LANGUAGE plpgsql STRICT;
+	RETURN @extschema@.register_cmd(cmd, opts);
+END
+$$ LANGUAGE plpgsql STRICT;
+
 
 -- Internal functions
+
+
+-- Register command cmd_type for execution on shardlord.
+CREATE FUNCTION register_cmd(cmd_type text, cmd_opts text[]) RETURNS int AS $$
+DECLARE
+	cmd_id int;
+BEGIN
+	IF NOT @extschema@.me_lord() THEN
+		RETURN @extschema@.execute_on_lord_c(cmd_type, cmd_opts);
+	END IF;
+
+	INSERT INTO @extschema@.cmd_log
+		VALUES (DEFAULT, cmd_type, cmd_opts)
+		RETURNING id INTO cmd_id;
+
+	NOTIFY shardman_cmd_log_update; -- Notify bgw about the job
+
+	RETURN cmd_id;
+END
+$$ LANGUAGE plpgsql STRICT;
 
 -- Called on shardlord bgw start. Add itself to nodes table, set id, create
 -- publication.
@@ -194,7 +216,8 @@ BEGIN
 	IF init_lord THEN
 		-- TODO: set up lr channels
 	END IF;
-END $$ LANGUAGE plpgsql;
+END
+$$ LANGUAGE plpgsql;
 
 -- These tables will be replicated to worker nodes, notifying them about changes.
 -- Called on lord.
@@ -255,7 +278,8 @@ CREATE FUNCTION terminate_repslot_walsender(slot_name text) RETURNS void AS $$
 BEGIN
 	EXECUTE format('SELECT pg_terminate_backend(active_pid) FROM
 				   pg_replication_slots WHERE slot_name = %L', slot_name);
-END $$ LANGUAGE plpgsql STRICT;
+END
+$$ LANGUAGE plpgsql STRICT;
 
 -- Drop with fire repslot and publication with the same name. Useful for 1-to-1
 -- pub-sub.
@@ -263,7 +287,8 @@ CREATE FUNCTION drop_repslot_and_pub(pub name) RETURNS void AS $$
 BEGIN
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', pub);
 	PERFORM shardman.drop_repslot(pub, true);
-END $$ LANGUAGE plpgsql STRICT;
+END
+$$ LANGUAGE plpgsql STRICT;
 
 -- If sub exists, disable it, detach repslot from it and possibly drop. We
 -- manage repslots ourselves, so it is essential to detach rs before dropping
@@ -283,7 +308,8 @@ BEGIN
 			EXECUTE format('DROP SUBSCRIPTION %I', subname);
 		END IF;
 	END IF;
-END $$ LANGUAGE plpgsql STRICT;
+END
+$$ LANGUAGE plpgsql STRICT;
 
 -- Remove all our logical replication stuff in case of drop extension.
 -- Dropping extension cleanup is not that easy:
@@ -336,4 +362,8 @@ CREATE EVENT TRIGGER cleanup_lr_trigger ON ddl_command_start
 	EXECUTE PROCEDURE pg_shardman_cleanup_c();
 
 CREATE FUNCTION alter_system_c(opt text, val text) RETURNS void
+	AS 'pg_shardman' LANGUAGE C STRICT;
+
+-- Ask shardlord to perform a command if we're but a worker node.
+CREATE FUNCTION execute_on_lord_c(cmd_type text, cmd_opts text[]) RETURNS text
 	AS 'pg_shardman' LANGUAGE C STRICT;

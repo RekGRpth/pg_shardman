@@ -70,7 +70,8 @@ shardlord or not.
 
 Currently extension scheme is fixed, it is, who would have thought, 'shardman'.
 
-Now you can issue commands to the shardlord. All shardman commands (cmds) you
+Now you can issue commands to any node. If node is a simple worker, it will
+immediately send the command to the shardlord. All shardman commands (cmds) you
 issue return immediately because they technically just submit the cmd to the
 shardlord; he learns about them and starts the actual execution. At any time you
 can cancel currently executing command, just send SIGUSR1 to the shardlord. This
@@ -91,8 +92,7 @@ difference between 'success' and 'done'. We set the latter when the command is
 not atomic itself, but consists of several atomic steps, some of which were
 probably executed successfully and some failed.
 
-Currently cmd_log can be seen and commands issued only on the shardlord, but
-that's easy to change.
+Currently cmd_log can be seen only on the shardlord, but that's going to change.
 
 Let's get to the actual commands, which are implemented as functions in
 the extension's schema.
@@ -163,21 +163,21 @@ CREATE TABLE partitions (
 	PRIMARY KEY (part_name, owner)
 );
 
-move_part(part_name text, dest int, src int DEFAULT NULL)
-Move shard 'part_name' from node 'src' to node 'dest'. If src is NULL, primary
-shard is moved. Cmd fails if there is already copy of this shard on 'dest'.
+move_part(part_name text, dst int, src int DEFAULT NULL)
+Move shard 'part_name' from node 'src' to node 'dst'. If src is NULL, primary
+shard is moved. Cmd fails if there is already copy of this shard on 'dst'.
 
 rebalance(relation text)
 Evenly distribute all partitions including replicas of table 'relation' across
 all nodes. Currently this is pretty dumb function, it just tries to move each
 shard once to node choosen in round-robin manner, completely ignoring current
-distribution. Since dest node can already have replica of this partition, it is
+distribution. Since dst node can already have replica of this partition, it is
 not uncommon to see warnings about failed moves during execution. After
 completion cmd status is 'done', not 'success'.
 
-create_replica(part_name text, dest int)
-Create replica of shard 'part_name' on node 'dest'. Cmd fails if there is already
-replica of this shard on 'dest'.
+create_replica(part_name text, dst int)
+Create replica of shard 'part_name' on node 'dst'. Cmd fails if there is already
+replica of this shard on 'dst'.
 
 set_replevel(relation text, replevel int)
 Add replicas to shards of sharded table 'relation' until we reach replevel

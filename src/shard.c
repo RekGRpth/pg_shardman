@@ -52,7 +52,7 @@ create_hash_partitions(Cmd *cmd)
 		return;
 	}
 	/* connstr mem freed with ctxt */
-	if ((connstr = get_worker_node_connstr(node_id)) == NULL)
+	if ((connstr = get_node_connstr(node_id, SNT_WORKER)) == NULL)
 	{
 		shmn_elog(WARNING, "create_hash_partitions failed, no such worker node: %d",
 				  node_id);
@@ -153,10 +153,9 @@ void
 move_part(Cmd *cmd)
 {
 	char *part_name = cmd->opts[0];
-	char *src_node_str = cmd->opts[1];
-	int32 src_node = src_node_str != NULL ? atoi(src_node_str) :
-		SHMN_INVALID_NODE_ID;
-	int32 dst_node = atoi(cmd->opts[2]);
+	int32 dst_node = atoi(cmd->opts[1]);
+	int32 src_node = cmd->opts[2] ? atoi(cmd->opts[2]) : SHMN_INVALID_NODE_ID;
+
 	CopyPartState **tasks = palloc(sizeof(CopyPartState*));
 	MovePartState *mps = palloc0(sizeof(MovePartState));
 	init_mp_state(mps, part_name, src_node, dst_node);

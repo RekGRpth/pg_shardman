@@ -24,17 +24,24 @@
 #define shmn_elog(level,fmt,...) elog(level, "[SHMN] " fmt, ## __VA_ARGS__)
 
 /* Commonly used SPI stuff */
-#define SPI_PROLOG do { \
-	StartTransactionCommand(); \
-	SPI_connect(); \
-	PushActiveSnapshot(GetTransactionSnapshot()); \
-} while (0);
+#define SPI_XACT_STATUS \
+	bool spi_already_in_xact = IsTransactionState()
 
-#define SPI_EPILOG do { \
-	PopActiveSnapshot(); \
-	SPI_finish(); \
-	CommitTransactionCommand(); \
-} while (0);
+#define SPI_PROLOG \
+	do { \
+		if (!spi_already_in_xact) \
+			StartTransactionCommand(); \
+		SPI_connect(); \
+		PushActiveSnapshot(GetTransactionSnapshot()); \
+	} while (0)
+
+#define SPI_EPILOG \
+	do { \
+		PopActiveSnapshot(); \
+		SPI_finish(); \
+		if (!spi_already_in_xact) \
+			CommitTransactionCommand(); \
+	} while (0)
 
 /* flags set by signal handlers */
 extern volatile sig_atomic_t got_sigterm;
@@ -94,6 +101,13 @@ typedef struct RepCount
 	int64 count;
 } RepCount;
 
+typedef enum
+{
+	SNT_LORD,
+	SNT_WORKER
+} ShmnNodeType;
+
+
 extern void _PG_init(void);
 extern void _PG_fini(void);
 extern void shardlord_main(Datum main_arg);
@@ -108,7 +122,7 @@ extern void reset_pqconn(PGconn **conn);
 extern void reset_pqconn_and_res(PGconn **conn, PGresult *res);
 extern uint64 void_spi(char *sql);
 extern void update_cmd_status(int64 id, const char *new_status);
-extern char *get_worker_node_connstr(int32 node_id);
+extern char *get_node_connstr(int32 node_id, ShmnNodeType node_type);
 extern int32 *get_workers(uint64 *num_workers);
 extern int32 get_primary_owner(const char *part_name);
 extern int32 get_reptail_owner(const char *part_name);

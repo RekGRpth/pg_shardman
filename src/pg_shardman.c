@@ -288,6 +288,7 @@ uint64
 void_spi(char *sql)
 {
 	uint64 rows_processed;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 	if (SPI_exec(sql, 0) < 0)
@@ -373,6 +374,7 @@ next_cmd(void)
 	MemoryContext	oldcxt = CurrentMemoryContext,
 					spicxt;
 	int				e;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 
@@ -451,12 +453,12 @@ update_cmd_status(int64 id, const char *new_status)
 {
 	char *sql;
 	int e;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 	sql = psprintf("update shardman.cmd_log set status = '%s' where id = %ld;",
 				   new_status, id);
 	e = SPI_exec(sql, 0);
-	pfree(sql);
 	if (e < 0)
 	{
 		shmn_elog(FATAL, "Stmt failed: %s", sql);
@@ -754,16 +756,17 @@ attempt_failed: /* clean resources, sleep, check sigusr1 and try again */
 static bool
 node_in_cluster(int id)
 {
-	char *sql = psprintf(
-		"select id from shardman.nodes where id = %d and (shardlord or"
-		" worker_status = 'active' or worker_status = 'rm_in_progress');",
-		id);
+	char *sql;
 	bool res;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
+	sql = psprintf(
+		"select id from shardman.nodes where id = %d and (shardlord or"
+		" worker_status = 'active' or worker_status = 'rm_in_progress');",
+		id); /* pfreed by spi */
 	if (SPI_execute(sql, true, 0) < 0)
 		shmn_elog(FATAL, "Stmt failed: %s", sql);
-	pfree(sql);
 	res = SPI_processed == 1;
 
 	SPI_EPILOG;
@@ -783,34 +786,27 @@ void
 rm_node(Cmd *cmd)
 {
 	int32 node_id = atoi(cmd->opts[0]);
+	bool force = pg_strcasecmp(cmd->opts[1], "true") == 0;
 	char *sql;
-	char **opts;
-	bool force = false;
 	int e;
 	int64 parts_on_node;
-
-	for (opts = cmd->opts; *opts; opts++)
-	{
-		if (strcmp(*opts, "force") == 0)
-		{
-			force = true;
-			break;
-		}
-	}
 
 	if (force)
 	{
 		sql = psprintf("delete from shardman.partitions where owner=%d",
 					   node_id);
 		void_spi(sql);
+		pfree(sql);
 	}
 	else
 	{
 		bool isnull;
+		SPI_XACT_STATUS;
+
+		SPI_PROLOG;
 		sql = psprintf(
 			"select count(*) from shardman.partitions where owner=%d",
 			node_id);
-		SPI_PROLOG;
 		e = SPI_execute(sql, true, 0);
 		if (e < 0)
 			shmn_elog(FATAL, "Stmt failed: %s", sql);
@@ -820,7 +816,6 @@ rm_node(Cmd *cmd)
 										SPI_tuptable->tupdesc, 1, &isnull));
 		SPI_EPILOG;
 	}
-	pfree(sql);
 	if (!force && parts_on_node != 0)
 	{
 		shmn_elog(WARNING, "Can't remove node %d with existing shards. Add \"force\" option to ignore this",
@@ -889,24 +884,36 @@ get_substate_sql(const char *subname)
 }
 
 /*
- * Get connstr of worker node with id node_id. Memory is palloc'ed.
- * NULL is returned, if there is no such worker.
+ * Get connstr of a lord/worker node with id = node_id.
+ * Return NULL if there's no such node.
+ * node_id might (should) be SHMN_INVALID_NODE_ID if we are searching for lord.
  */
 char *
-get_worker_node_connstr(int32 node_id)
+get_node_connstr(int32 node_id, ShmnNodeType node_type)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
-	char *sql = psprintf("select connstring from shardman.nodes where id = %d"
-						 " and worker_status is not null", node_id);
+	StringInfoData query;
 	char *res;
+	SPI_XACT_STATUS;
+
+	/* We shouldn't use SHMN_INVALID_NODE_ID with SNT_WORKER */
+	Assert(node_id != SHMN_INVALID_NODE_ID || node_type == SNT_LORD);
 
 	SPI_PROLOG;
 
-	if (SPI_execute(sql, true, 0) < 0)
+	/* We assume that node is either worker or lord, it can't be idle */
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "select connstring from shardman.nodes "
+					 "where shardlord = %s ",
+					 (node_type == SNT_LORD) ? "true" : "false");
+	if (node_id != SHMN_INVALID_NODE_ID)
+		appendStringInfo(&query, "and id = %d ", node_id);
+
+	if (SPI_execute(query.data, true, 0) < 0)
 	{
-		shmn_elog(FATAL, "Stmt failed : %s", sql);
+		shmn_elog(FATAL, "Stmt failed : %s", query.data);
 	}
-	pfree(sql);
 
 	if (SPI_processed == 0)
 	{
@@ -916,8 +923,13 @@ get_worker_node_connstr(int32 node_id)
 	{
 		HeapTuple tuple = SPI_tuptable->vals[0];
 		TupleDesc rowdesc = SPI_tuptable->tupdesc;
+		MemoryContext spicxt;
+
+		/* We expect to see exactly one node */
+		Assert(SPI_processed == 1);
+
 		/* We need to allocate connstring in our ctxt, not spi's */
-		MemoryContext spicxt = MemoryContextSwitchTo(oldcxt);
+		spicxt = MemoryContextSwitchTo(oldcxt);
 		res = SPI_getvalue(tuple, rowdesc, 1);
 		MemoryContextSwitchTo(spicxt);
 	}
@@ -940,6 +952,7 @@ get_workers(uint64 *num_workers)
 	MemoryContext spicxt;
 	MemoryContext oldcxt = CurrentMemoryContext;
 	uint64 i;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 
@@ -972,6 +985,7 @@ get_primary_owner(const char *part_name)
 	char *sql;
 	bool isnull;
 	int owner;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
@@ -1005,6 +1019,7 @@ get_reptail_owner(const char *part_name)
 	char *sql;
 	bool isnull;
 	int owner;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
@@ -1038,6 +1053,7 @@ get_next_node(const char *part_name, int32 node_id)
 	char *sql;
 	bool isnull;
 	int32 next;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
@@ -1074,9 +1090,12 @@ get_prev_node(const char *part_name, int32 node_id, bool *part_exists)
 	char *sql;
 	bool isnull;
 	int32 prev;
-	*part_exists = true;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
+
+	*part_exists = true;
+
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
 		"select prv from shardman.partitions where part_name = '%s'"
 		" and owner = %d;", part_name, node_id);
@@ -1110,17 +1129,19 @@ char *
 get_partition_relation(const char *part_name)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
-	char *sql = psprintf("select relation from shardman.partitions"
-						 " where part_name = '%s';", part_name);
+	char *sql;
 	char *res;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
+
+	sql = psprintf("select relation from shardman.partitions"
+				   " where part_name = '%s';", part_name);
 
 	if (SPI_execute(sql, true, 0) < 0)
 	{
 		shmn_elog(FATAL, "Stmt failed : %s", sql);
 	}
-	pfree(sql);
 
 	if (SPI_processed == 0)
 	{
@@ -1154,6 +1175,7 @@ get_parts(const char *relation, uint64 *num_parts)
 	MemoryContext spicxt;
 	MemoryContext oldcxt = CurrentMemoryContext;
 	uint64 i;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */
@@ -1194,6 +1216,7 @@ get_repcount(const char *relation, uint64 *num_parts)
 	MemoryContext spicxt;
 	MemoryContext oldcxt = CurrentMemoryContext;
 	uint64 i;
+	SPI_XACT_STATUS;
 
 	SPI_PROLOG;
 	sql = psprintf( /* allocated in SPI ctxt, freed with ctxt release */

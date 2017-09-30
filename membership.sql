@@ -72,10 +72,11 @@ BEGIN
 	UPDATE shardman.local_meta SET v = my_id WHERE k = 'my_id';
 END $$ LANGUAGE plpgsql STRICT;
 
--- This node is shardlord?
+-- Is this node a shardlord?
 CREATE FUNCTION me_lord() RETURNS bool AS $$
 BEGIN
-	RETURN shardlord FROM shardman.nodes WHERE id = shardman.my_id();
+	-- We'd like to get rid of local_meta in favor of GUCs.
+	RETURN setting::bool FROM pg_settings WHERE name = '@extschema@.shardlord';
 END $$ LANGUAGE plpgsql STRICT;
 
 -- This node is worker node?
