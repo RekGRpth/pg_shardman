@@ -240,7 +240,7 @@ BEGIN
 	END IF;
 
 	-- And update fdw almost everywhere
-	PERFORM shardman.update_fdw_server(NEW);
+	PERFORM shardman.update_fdw_table_srv(NEW);
 	RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
@@ -326,7 +326,7 @@ BEGIN
 
 	IF NOT replica_removed AND shardman.me_worker() THEN
 	   -- update fdw almost everywhere
-	   PERFORM shardman.update_fdw_server(new_primary);
+	   PERFORM shardman.update_fdw_table_srv(new_primary);
 	END IF;
 
 	IF shardman.me_lord() THEN
@@ -427,14 +427,14 @@ DECLARE
 	opt text;
 	opt_key text;
 BEGIN
-	ASSERT EXISTS (SELECT 1 from pg_foreign_server WHERE srvname=server_name);
+	ASSERT EXISTS (SELECT 1 FROM pg_foreign_server WHERE srvname = server_name);
 	EXECUTE format($q$SELECT coalesce(srvoptions, '{}'::text[]) FROM
 									  pg_foreign_server WHERE srvname = %L$q$,
-									       server_name) INTO opts;
-    FOREACH opt IN ARRAY opts LOOP
-	    opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
-	    EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', server_name, opt_key);
-    END LOOP;
+									  server_name) INTO opts;
+	FOREACH opt IN ARRAY opts LOOP
+		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
+		EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', server_name, opt_key);
+	END LOOP;
 END $$ LANGUAGE plpgsql STRICT;
 -- Same for resetting user mapping opts
 CREATE or replace FUNCTION reset_um_opts(srvname name, umuser regrole)
@@ -450,36 +450,40 @@ BEGIN
 				   ums.umuser = umuser$q$, srvname)
 		INTO opts;
 	IF opts IS NOT NULL THEN
-	    FOREACH opt IN ARRAY opts LOOP
-		    opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
+		FOREACH opt IN ARRAY opts LOOP
+			opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
 			EXECUTE format('ALTER USER MAPPING FOR %I SERVER %I OPTIONS (DROP %s);',
 					   umuser::name, srvname, opt_key);
-	    END LOOP;
+		END LOOP;
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 
-CREATE FUNCTION create_foreign_server(node_id integer) RETURNS void AS $$
+-- Create foreign server & um pointing to node 'node_id' named "node_'node_id'",
+-- or alter existing one to match the connstring.
+CREATE FUNCTION ensure_foreign_server(node_id integer) RETURNS void AS $$
 DECLARE
-	connstring text;
+	connstring text := shardman.get_worker_node_connstr(node_id);
 	server_opts text;
 	um_opts text;
-	server_name text;
+	server_name text := 'node_' || node_id;
 BEGIN
-	SELECT nodes.connstring FROM shardman.nodes WHERE id = node_id
-		INTO connstring;
 	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)
 		INTO server_opts, um_opts;
-	server_name := 'node_'||node_id;
-	IF NOT EXISTS (SELECT 1 from pg_foreign_server WHERE srvname=server_name)
+	IF NOT EXISTS (SELECT 1 from pg_foreign_server WHERE srvname = server_name)
 	THEN
-	    RAISE DEBUG 'Create foreign server % for with options %', server_name, server_opts;
+		RAISE DEBUG '[SHMN] Create foreign server % for with options %',
+		  server_name, server_opts;
 		EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER postgres_fdw %s;',
-			server_name, server_opts);
-	    -- TODO: support not only CURRENT_USER
-	    EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I %s;',
+		  server_name, server_opts);
+		-- TODO: support not only CURRENT_USER
+		EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I %s;',
 			server_name, um_opts);
 	ELSE
-	    RAISE DEBUG 'Use existed foreign server % with options %', server_name, server_opts;
+		-- ALTER SERVER & UM doesn't support dropping all params. We could
+		-- recreate them, but since these hacks already exist for legacy code,
+		-- we can use them as well.
+		RAISE DEBUG 'Using existing foreign server % with options %',
+			server_name, server_opts;
 		PERFORM shardman.reset_foreign_server_opts(server_name);
 		PERFORM shardman.reset_um_opts(server_name, current_user::regrole);
 
@@ -493,13 +497,12 @@ BEGIN
  	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 
--- Update foreign server and user mapping params on current node according to
--- partition part, so this is expected to be called on server/um params
--- change. FDW server, user mapping, foreign table and
--- (obviously) parent partition must exist when called if they need to be
--- updated; however, it is ok to call this func on nodes which don't need fdw
--- setup for this part because they hold primary partition.
-CREATE FUNCTION update_fdw_server(part partitions) RETURNS void AS $$
+-- Make sure foreign table for given part is associated with proper foreign
+-- server, so this is expected to be called on server/um params change,
+-- e.g. shard move or connstring update. Foreign table must exist when called if
+-- they need to be updated; however, it is ok to call this func on nodes which
+-- don't need fdw setup for this part because they hold primary partition.
+CREATE FUNCTION update_fdw_table_srv(part partitions) RETURNS void AS $$
 DECLARE
 	connstring text;
 	server_opts text;
@@ -509,24 +512,31 @@ DECLARE
 	server_oid oid;
 	foreign_table_oid oid;
 BEGIN
-	RAISE DEBUG '[SHMN] update_fdw_server called for part %, owner %',
+	RAISE DEBUG '[SHMN] update_fdw_table_srv called for part %, owner %',
 		part.part_name, part.owner;
 
 	SELECT * FROM shardman.partitions WHERE part_name = part.part_name AND
 											owner = me INTO my_part;
 	IF my_part.part_name IS NOT NULL THEN -- we are holding the part
 		IF my_part.prv IS NULL THEN
-			RAISE DEBUG '[SHMN] we are holding primary for part %, not updating fdw server for it', part.part_name;
+			RAISE DEBUG '[SHMN] we are holding primary for part %, not updating fdw table for it',
+				part.part_name;
 			RETURN;
 		ELSE
-			RAISE DEBUG '[SHMN] we are holding replica for part %, updating fdw server for it', part.part_name;
+			RAISE DEBUG '[SHMN] we are holding replica for part %, updating fdw table for it',
+				part.part_name;
 		END IF;
 	END IF;
 
-	PERFORM shardman.create_foreign_server(part.owner);
+	PERFORM shardman.ensure_foreign_server(part.owner);
 
-	SELECT oid FROM pg_foreign_server WHERE srvname='node_'||part.owner into server_oid;
-	SELECT oid FROM pg_class WHERE relname=part.part_name||'_fdw' into foreign_table_oid;
+	-- Well, ALTER FOREIGN TABLE doesn't support changing server, but this hack
+	-- seems to be working.
+	SELECT oid FROM pg_foreign_server WHERE srvname = 'node_' || part.owner
+	  INTO server_oid;
+	SELECT oid FROM pg_class WHERE relname = shardman.get_fdw_part_name(part.part_name)
+	  INTO foreign_table_oid;
+	ASSERT foreign_table_oid IS NOT NULL, 'update_fdw_table_srv: table not found';
 	UPDATE pg_foreign_table SET ftserver = server_oid WHERE ftrelid = foreign_table_oid;
 END $$ LANGUAGE plpgsql STRICT;
 
@@ -536,13 +546,11 @@ CREATE FUNCTION replace_usual_part_with_foreign(part partitions)
 	RETURNS void AS $$
 DECLARE
 	connstring text;
-	fdw_part_name text;
-	server_name text;
+	fdw_part_name text := shardman.get_fdw_part_name(part.part_name);
+	server_name text := 'node_' || part.owner;
 BEGIN
-	server_name := 'node_'||part.owner;
-	PERFORM shardman.create_foreign_server(part.owner);
+	PERFORM shardman.ensure_foreign_server(part.owner);
 
-	SELECT shardman.get_fdw_part_name(part.part_name) INTO fdw_part_name;
 	EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I;', fdw_part_name);
 
 	-- Generate and execute CREATE FOREIGN TABLE sql statement which will
