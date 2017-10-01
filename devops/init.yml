@@ -1,4 +1,4 @@
-### initdb and send configs
+### initdb, send configs and add all workers.
 
 ---
 - hosts: nodes
@@ -68,7 +68,7 @@
   - name: add manual workers
     command: >
       psql -p {{ pg_port }} -c "select shardman.add_node(
-      'hostaddr={{ item]}} port={{ pg_port }}')"
+      'hostaddr={{ item }} port={{ pg_port }}')"
     with_items: "{{ groups.manual_workers }}"
     tags:
       - add_nodes

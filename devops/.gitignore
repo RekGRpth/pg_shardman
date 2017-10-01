@@ -1,7 +1,9 @@
 *.retry
-inventory/manual
+inventory_manual/manual
 logs/
 
 /postgresql.conf.common
 /postgresql.conf.lord
 /postgresql.conf.worker
+
+*.log

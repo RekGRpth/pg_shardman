@@ -51,6 +51,8 @@ ansible-playbook -i inventory_ec2 pg_ctl.yml -e "pg_ctl_action=restart"
 
 Read cmd log on shardlord:
 ansible-playbook -i inventory_ec2/ psql.yml --limit 'shardlord' -e "cmd='\'table shardman.cmd_log\''"
+Read nodes table on workers:
+nodes': ansible-playbook -i inventory_manual/ psql.yml --limit 'workers' -e "cmd='\'table shardman.nodes\''"
 
 Gather logs to ./logs:
 ansible-playbook -i inventory_ec2/ logs.yml
@@ -67,6 +69,8 @@ Things that made me wonder during writing this:
   why projects like
   https://github.com/larsks/ansible-toolbox
   emerge. Printing cmd output via saved var is pretty horrible too.
+* They also try to reinvent all the concepts of normal languages in YML. How
+  about infinite repeat..until?
 * No way to specify multiple inventory files, only whole directory or one file.
 * No way to append file to file, except for j2 templates, which doesn't work
   with files outside the template dir, really?
