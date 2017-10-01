@@ -60,6 +60,11 @@ ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=10 re
 Gather logs to ./logs:
 ansible-playbook -i inventory_ec2/ logs.yml
 
+Start micro instances:
+ansible-playbook -i inventory_ec2/ ec2.yml --tags "micro" -e "count=2"
+Terminate all ec2 instances:
+ansible-playbook -i inventory_ec2/ ec2.yml --tags "terminate"
+
 Ubuntu images EC2 locator:
 https://cloud-images.ubuntu.com/locator/ec2/
 We need ami-4199282e.

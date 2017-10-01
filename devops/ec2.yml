@@ -1,0 +1,46 @@
+### Manage ec2 instances. Env vars AWS_ACCESS_KEY_ID and AWS_ACCESS_KEY are
+# required!
+
+---
+- hosts: localhost
+  gather_facts: False
+  vars:
+    key_name: aws
+    security_group: cluster
+    count: 3
+    vpc_subnet_id: subnet-99ba45d4
+    region: eu-central-1
+
+  tasks:
+  - name: start instances
+    ec2:
+      key_name: "{{ key_name }}"
+      instance_type: "{{ instance_type }}"
+      image: "{{ image }}"
+      group: "{{ security_group }}"
+      count: "{{ count }}"
+      vpc_subnet_id: "{{ vpc_subnet_id }}"
+      region: "{{ region }}"
+      wait: yes
+      assign_public_ip: yes
+    vars:
+      instance_type: t2.micro
+      image: ami-1e339e71 # basic ubuntu backed by ebs
+    tags:
+      - micro
+
+  - import_tasks: tasks/clean_ec2_cache.yml
+    tags:
+      - terminate
+
+  - name: terminate all ec2 instances
+    ec2:
+      state: absent
+      region: "{{ region }}"
+      instance_ids: "{{ hostvars[item]['ec2_id'] }}"
+      wait: "{{ wait }}"
+    with_items: "{{ groups.ec2 }}"
+    vars:
+      wait: no
+    tags:
+      - terminate

@@ -1,0 +1,4 @@
+---
+
+- name: clean ec2 cache
+  shell: "rm -rf ~/.ansible/tmp/ansible-ec2-*"
