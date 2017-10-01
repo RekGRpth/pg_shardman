@@ -1,0 +1,72 @@
+### create pgbench_history everywhere, create pgbench tables on init node,
+# shard them. TODO: drop sharded tables.
+
+- hosts: workers
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: recreate pgbench_history on workers
+    command: >
+      psql -p {{ pg_port }} -c "drop table if exists pgbench_history;
+      create table pgbench_history (tid int, bid int, aid int,
+      delta int, mtime timestamp, filler char(22));"
+    tags:
+      - pgbench_history
+
+- hosts: init_node
+  vars:
+    scale: 3
+    nparts: 3
+    repfactor: 0
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: drop old pgbench tables with deps
+    command: >
+      psql -p {{ pg_port }} -c "
+      drop table if exists pgbench_accounts cascade;
+      drop table if exists pgbench_tellers cascade;
+      drop table if exists pgbench_branches cascade;
+      drop table if exists pgbench_tellers cascade;
+      drop table if exists pgbench_accounts cascade;
+      "
+    tags:
+      - pgbench_init
+
+  - name: learn init node id
+    command: >
+      psql -p {{ pg_port }} -qtA -c "select shardman.my_id();"
+    register: my_id
+    until: my_id.stdout != ""
+    retries: 19481948 # oh my
+    tags:
+      - pgbench_init
+
+  - name: initialize pgbench, scale {{ scale }}
+    command: >
+      pgbench -p {{ pg_port }} -s {{ scale }} -i
+    tags:
+      - pgbench_init
+
+  - name: create_hash_partitions, nparts {{ nparts }}
+    command: >
+      psql -p {{ pg_port }} -c "
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_accounts', 'aid', {{ nparts }});
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_tellers', 'tid', {{ nparts }});
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_branches', 'bid', {{ nparts }});
+      "
+    tags:
+      - create_hash_partitions
+
+  - name: set_repfactor, repfactor {{ repfactor }}
+    command: >
+      psql -p {{ pg_port }} -c "
+      select shardman.set_replevel('pgbench_accounts', {{ repfactor }});
+      select shardman.set_replevel('pgbench_tellers', {{ repfactor }});
+      select shardman.set_replevel('pgbench_branches', {{ repfactor }});
+      "
+    tags:
+      - set_repfactor
+    when: repfactor != 0

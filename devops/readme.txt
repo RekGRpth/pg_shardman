@@ -52,7 +52,10 @@ ansible-playbook -i inventory_ec2 pg_ctl.yml -e "pg_ctl_action=restart"
 Read cmd log on shardlord:
 ansible-playbook -i inventory_ec2/ psql.yml --limit 'shardlord' -e "cmd='\'table shardman.cmd_log\''"
 Read nodes table on workers:
-nodes': ansible-playbook -i inventory_manual/ psql.yml --limit 'workers' -e "cmd='\'table shardman.nodes\''"
+nodes': ansible-playbook -i inventory_ec2/ psql.yml --limit 'workers' -e "cmd='\'table shardman.nodes\''"
+
+Create, fill and shard pgbench tables:
+ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=10 repfactor=1"
 
 Gather logs to ./logs:
 ansible-playbook -i inventory_ec2/ logs.yml

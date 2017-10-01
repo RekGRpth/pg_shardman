@@ -6,4 +6,6 @@ logs/
 /postgresql.conf.lord
 /postgresql.conf.worker
 
+# vagrant stuff
 *.log
+.vagrant/
