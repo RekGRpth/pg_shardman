@@ -2,6 +2,9 @@
 # Templates in the root of the project are copied automatically. You can append
 # something to them by creating same-titled in this (devops/) directory, they
 # are not tracked by git.
+# BTW, you can refer to ansible vars there.
+# The only guc we manage dynamically by default is shardlord_connstring, it
+# requires inventory knowledge
 
 ---
 - hosts: shardlord

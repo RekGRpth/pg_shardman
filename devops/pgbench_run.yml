@@ -1,6 +1,7 @@
 ### create pgbench_history everywhere, create pgbench tables on init node,
 # shard them. TODO: drop sharded tables.
-# Controlling vars: tmstmp (true/false), tname, clients, seconds.
+# Controlling vars: tmstmp (true/false), tname, clients, t (true/false),
+# seconds, xacts
 
 
 # set global var to use in all plays, oh my
@@ -22,6 +23,8 @@
   vars:
     clients: 1
     seconds: 5
+    xacts: 100
+    t: False
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
@@ -30,10 +33,21 @@
     command: >
       psql -p {{ pg_port }} -U {{ ansible_user }} -c "VACUUM;"
 
-  - name: run pgbench
+  - name: run pgbench -T {{ seconds }}
     shell: >
-      pgbench -p {{ pg_port }} --report-latencies --progress 1 --no-vacuum
+      pgbench -p {{ pg_port }} --report-latencies --no-vacuum
       -c {{ clients }} -T {{ seconds }} 2>&1 > "{{ test_id }}.out"
+    when: not ( t | bool )
+
+  - name: run pgbench -t {{ xacts }}
+    shell: >
+      pgbench -p {{ pg_port }} --report-latencies --no-vacuum
+      -c {{ clients }} -t {{ xacts }} 2>&1 > "{{ test_id }}.out"
+    when: t | bool
+
+  - name: clear log dir
+    local_action: file path="res/{{ test_id }}/" state=absent
+    run_once: true
 
   - name: fetch pgbench exec times
     fetch:

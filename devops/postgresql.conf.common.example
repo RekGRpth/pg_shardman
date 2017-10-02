@@ -1,0 +1,27 @@
+TimeZone = 'Europe/Moscow'
+log_timezone = 'Europe/Moscow'
+
+listen_addresses = '*'
+
+log_min_messages = LOG
+client_min_messages = NOTICE
+log_replication_commands = on
+
+max_replication_slots = 300
+max_wal_senders = 300
+max_logical_replication_workers = 300
+max_worker_processes = 300
+
+# performance-related settings
+shared_buffers = {{ (ansible_memtotal_mb * 0.5) | int }}MB
+effective_cache_size = 4GB
+work_mem = 32MB
+max_connections = 1000
+# don't do checkpoints
+checkpoint_timeout = 60min
+max_wal_size = 100GB
+fsync = off
+autovacuum = off
+
+shardman.shardlord_dbname = ubuntu
+shardman.poll_interval = 500 # long operations poll frequency in milliseconds

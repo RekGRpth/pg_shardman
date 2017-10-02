@@ -57,7 +57,9 @@ nodes': ansible-playbook -i inventory_ec2/ psql.yml --limit 'workers' -e "cmd='\
 Create, fill and shard pgbench tables:
 ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=3 repfactor=0"
 Run pgbench test:
-ansible-playbook -f 20 -i inventory_ec2/ pgbench_run.yml -e "tmstmp=false tname=test seconds=30"
+ansible-playbook -i inventory_ec2/ pgbench_run.yml -e "tmstmp=false tname=test seconds=30"
+Run pgbench on single worker (to estimate shardman overhead):
+ansible-playbook -i inventory_ec2/ pgbench_single.yml -e "scale=10 tmstmp=false tname=test t=false clients=8 seconds=15"
 
 Gather logs to ./logs:
 ansible-playbook -i inventory_ec2/ logs.yml
@@ -70,6 +72,11 @@ ansible-playbook -i inventory_ec2/ ec2.yml --tags "terminate"
 Ubuntu images EC2 locator:
 https://cloud-images.ubuntu.com/locator/ec2/
 We need ami-4199282e.
+
+Other hints:
+Currently pgbench exits on first error. postgres_fdw currently supports only
+repeatable read / serializable isolation levels which immediately leads to
+serialization errors, so you should use either patched postgres_fdw or pgbench.
 
 Things that made me wonder during writing this:
 * Reusability of tasks. Playbooks, files with tasks, roles, includes, imports,

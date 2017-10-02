@@ -22,8 +22,8 @@
 
 - hosts: init_node
   vars:
-    scale: 3
-    nparts: 3
+    scale: 10
+    nparts: 10
     repfactor: 0
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"

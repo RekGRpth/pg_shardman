@@ -12,20 +12,9 @@
     region: eu-central-1
 
   tasks:
-  - name: start instances
-    ec2:
-      key_name: "{{ key_name }}"
-      instance_type: "{{ instance_type }}"
-      image: "{{ image }}"
-      group: "{{ security_group }}"
-      count: "{{ count }}"
-      vpc_subnet_id: "{{ vpc_subnet_id }}"
-      region: "{{ region }}"
-      wait: yes
-      assign_public_ip: yes
-    vars:
-      instance_type: t2.micro
-      image: ami-1e339e71 # basic ubuntu backed by ebs
+
+  # image here is basic ubuntu backed by ebs
+  - import_tasks: tasks/ec2.yml instance_type="t2.micro" image="ami-1e339e71"
     tags:
       - micro
 

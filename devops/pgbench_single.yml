@@ -1,0 +1,48 @@
+### Init and run pgbench on random worker. Controlling vars as in
+# pgbench_prepare and pgbench_run, except for tname.
+---
+
+- hosts: workers[0]
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+  vars:
+    scale: 10
+    clients: 1
+    tmstmp: True
+    tname: pgbench
+
+  tasks:
+
+  - name: drop old pgbench tables with deps
+    command: >
+      psql -p {{ pg_port }} -c "
+      drop table if exists pgbench_accounts cascade;
+      drop table if exists pgbench_tellers cascade;
+      drop table if exists pgbench_branches cascade;
+      drop table if exists pgbench_tellers cascade;
+      drop table if exists pgbench_accounts cascade;
+      "
+  - name: initialize pgbench, scale {{ scale }}
+    command: >
+      pgbench -p {{ pg_port }} -s {{ scale }} -i
+
+  - name: run pgbench -T {{ seconds }}
+    shell: >
+      pgbench -p {{ pg_port }} --report-latencies
+      -c {{ clients }} -T {{ seconds }} 2>&1 > "pgbench.out"
+    when: not ( t | bool )
+
+  - name: run pgbench -t {{ xacts }}
+    shell: >
+      pgbench -p {{ pg_port }} --report-latencies
+      -c {{ clients }} -t {{ xacts }} 2>&1 > "pgbench.out"
+    when: t | bool
+
+  - name: fetch pgbench exec time
+    fetch:
+      src: "pgbench.out"
+      dest: res/pgbench_single.out
+      flat: yes
+      fail_on_missing: yes
+    tags:
+      - fetch
