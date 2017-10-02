@@ -664,9 +664,8 @@ CREATE FUNCTION readonly_table_on(relation regclass)
 	RETURNS void AS $$
 BEGIN
 	-- Create go away trigger to prevent any modifications
-	PERFORM shardman.readonly_table_off(relation);
-	PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly',
-												 'shardman.go_away()');
+	-- PERFORM shardman.readonly_table_off(relation);
+	-- PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly', 'shardman.go_away()');
 END
 $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION go_away() RETURNS TRIGGER AS $$
@@ -689,9 +688,8 @@ CREATE FUNCTION readonly_replica_on(relation regclass)
 BEGIN
 	RAISE DEBUG '[SHMN] table % made read-only for all but apply workers',
 		relation;
-	PERFORM shardman.readonly_replica_off(relation);
-	PERFORM shardman.create_modification_triggers(
-		relation, 'shardman_readonly_replica', 'shardman.ror_go_away()');
+	-- PERFORM shardman.readonly_replica_off(relation);
+	-- PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly_replica', 'shardman.ror_go_away()');
 END $$ LANGUAGE plpgsql STRICT;
 -- This function is impudent because it is used as both stmt and row trigger.
 -- The idea is that we must never reach RETURN NEW after stmt row trigger,
