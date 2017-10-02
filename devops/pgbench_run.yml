@@ -1,0 +1,58 @@
+### create pgbench_history everywhere, create pgbench tables on init node,
+# shard them. TODO: drop sharded tables.
+# Controlling vars: tmstmp (true/false), tname, clients, seconds.
+
+
+# set global var to use in all plays, oh my
+- hosts: nodes
+  vars:
+    tmstmp: True
+    tname: pgbench
+  tasks:
+  - name: gen test date
+    local_action: command date "+%Y-%m-%d-%H-%M"
+    run_once: true
+    register: now
+
+  - set_fact: test_id="{{ tname }}"
+  - set_fact: test_id="{{ test_id }}-{{ now.stdout }}"
+    when: tmstmp
+
+- hosts: workers
+  vars:
+    clients: 1
+    seconds: 5
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: vacuum
+    command: >
+      psql -p {{ pg_port }} -U {{ ansible_user }} -c "VACUUM;"
+
+  - name: run pgbench
+    shell: >
+      pgbench -p {{ pg_port }} --report-latencies --progress 1 --no-vacuum
+      -c {{ clients }} -T {{ seconds }} 2>&1 > "{{ test_id }}.out"
+
+  - name: fetch pgbench exec times
+    fetch:
+      src: "{{ test_id }}.out"
+      dest: res/{{ test_id }}/pgbench/{{ inventory_hostname }}.out
+      flat: yes
+
+  - name: grep tps
+    local_action: >
+      shell grep -h -R "tps.*including" res/{{ test_id }}/pgbench/ |
+      awk '{print $3}' > res/{{ test_id }}/tps.txt
+    run_once: true
+
+  - name: calc sum tps
+    local_action: >
+      shell echo "sum: `awk '{ sum += $1 } END { print sum }'
+      res/{{ test_id }}/tps.txt`" >> res/{{test_id}}/tps.txt
+    run_once: true
+
+- import_playbook: logs.yml logs=res/{{ test_id }}/logs
+  tags:
+    - logs

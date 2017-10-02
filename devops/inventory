@@ -37,6 +37,9 @@ shardman_version_tag=master
 
 shardman_shardlord_connstring="host={{ shardlord_ip }} port={{ pg_port }} user={{ ansible_user }}"
 
+test_id=""
+logs=logs
+
 [nodes:children]
 ec2
 manual

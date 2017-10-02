@@ -1,5 +1,11 @@
 ### create pgbench_history everywhere, create pgbench tables on init node,
 # shard them. TODO: drop sharded tables.
+# Controlling vars: scale, nparts, repfactor
+
+# This is useful since we don't drop tables yet
+- import_playbook: init.yml
+  tags:
+    - init
 
 - hosts: workers
   environment:
@@ -70,3 +76,21 @@
     tags:
       - set_repfactor
     when: repfactor != 0
+
+
+- hosts: shardlord
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: wait for cmd finishing
+    command: >
+      psql -p {{ pg_port }} -qtA -c "
+      select count(*) from shardman.cmd_log
+      where status in ('waiting', 'in progress');
+      "
+    register: jobs_count
+    until: jobs_count.stdout == "0"
+    retries: 19481948 # oh my
+    tags:
+      - wait

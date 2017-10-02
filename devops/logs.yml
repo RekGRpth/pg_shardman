@@ -1,33 +1,31 @@
-### Collect logs
+### Collect logs to {{ logs }}
 
 ---
 - hosts: nodes
 
   tasks:
   - name: rm -rf logs
-    local_action: file path=logs state=absent
+    local_action: file path={{ logs }} state=absent
     run_once: true
-  - name: fetch logs
+
+  - name: fetch logs to {{ logs }}
     fetch:
       src: "{{ pg_logfile }}"
-      dest: logs/{{ inventory_hostname }}.log
+      dest: "{{ logs }}/{{ inventory_hostname }}.log"
       validate_checksum: no # new logs might constantly arrive
       flat: yes
 
   - name: touch logs/united.log
-    local_action: copy content="" dest=logs/united.log
+    local_action: copy content="" dest={{ logs }}/united.log
     run_once: true
 
   - name: unite logs
-    local_action: shell cat logs/{{ item }}.log >> logs/united.log
+    local_action: shell cat {{ logs }}/{{ item }}.log >> {{ logs }}/united.log
     with_items: "{{ groups.nodes }}"
     run_once: true
 
-- hosts: shardlord
-
-  tasks:
   - name: create symlink to shadlord log
     local_action: file
-      src={{ inventory_hostname }}.log
-      dest=logs/shardlord.log
+      src={{ groups['shardlord'][0] }}.log
+      dest={{ logs }}/shardlord.log
       state=link

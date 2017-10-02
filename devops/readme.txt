@@ -55,7 +55,9 @@ Read nodes table on workers:
 nodes': ansible-playbook -i inventory_ec2/ psql.yml --limit 'workers' -e "cmd='\'table shardman.nodes\''"
 
 Create, fill and shard pgbench tables:
-ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=10 repfactor=1"
+ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=3 repfactor=0"
+Run pgbench test:
+ansible-playbook -f 20 -i inventory_ec2/ pgbench_run.yml -e "tmstmp=false tname=test seconds=30"
 
 Gather logs to ./logs:
 ansible-playbook -i inventory_ec2/ logs.yml
