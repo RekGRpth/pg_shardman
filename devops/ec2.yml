@@ -8,19 +8,23 @@
     key_name: aws
     security_group: cluster
     count: 3
-    vpc_subnet_id: subnet-99ba45d4
+    vpc_subnet_id: subnet-e0e2d99a
     region: eu-central-1
 
   tasks:
 
-  # image here is basic ubuntu backed by ebs
+  # image here is ubuntu xenial backed by ebs
   - import_tasks: tasks/ec2.yml instance_type="t2.micro" image="ami-1e339e71"
     tags:
       - micro
 
-  - import_tasks: tasks/clean_ec2_cache.yml
+  # image here is ubuntu xenial backed by instance store
+  - import_tasks: tasks/ec2.yml instance_type="c3.2xlarge" image="ami-4199282e"
     tags:
-      - terminate
+      - c3.2xlarge
+
+  # good for both launch and termination
+  - import_tasks: tasks/clean_ec2_cache.yml
 
   - name: terminate all ec2 instances
     ec2:

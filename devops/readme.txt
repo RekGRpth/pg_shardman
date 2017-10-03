@@ -43,6 +43,8 @@ Same on hardcoded nodes:
 ansible-playbook -i inventory_manual --tags "build_pg"
 Provision only the second node:
 ansible-playbook -i inventory_ec2 provision.yml --limit nodes[1]
+Build PG, but don't remove src and build with O0:
+ansible-playbook -i inventory_ec2/ provision.yml --skip-tags "rm_pg_src" -e "cflags='-O0'"
 
 Reload configs:
 ansible-playbook -i inventory_ec2/ send_config.yml
@@ -77,6 +79,9 @@ Other hints:
 Currently pgbench exits on first error. postgres_fdw currently supports only
 repeatable read / serializable isolation levels which immediately leads to
 serialization errors, so you should use either patched postgres_fdw or pgbench.
+
+If you don't want to measure the dist performance, keep data dir on tmpfs or
+turn of fsync, the effect it similar.
 
 Things that made me wonder during writing this:
 * Reusability of tasks. Playbooks, files with tasks, roles, includes, imports,
