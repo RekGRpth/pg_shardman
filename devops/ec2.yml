@@ -9,12 +9,13 @@
     security_group: cluster
     count: 3
     vpc_subnet_id: subnet-e0e2d99a
+    image: ami-1e339e71 # ubuntu xenial backed by ebs
     region: eu-central-1
 
   tasks:
 
-  # image here is ubuntu xenial backed by ebs
-  - import_tasks: tasks/ec2.yml instance_type="t2.micro" image="ami-1e339e71"
+  # image here is
+  - import_tasks: tasks/ec2.yml instance_type="t2.micro"
     tags:
       - micro
 

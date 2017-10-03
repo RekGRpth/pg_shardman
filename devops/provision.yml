@@ -2,10 +2,13 @@
 
 ---
 - hosts: nodes
+  vars:
+    ars_conf: "{{ ansible_env.HOME }}/ars_conf"
 
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
     CFLAGS: "{{ cflags }}"
+    CONFPATH: "{{ ars_conf }}"
 
   tasks:
   - name: set Moscow timezone
@@ -40,6 +43,7 @@
     - flex
     - libreadline-dev
     - zlib1g-dev
+    - gdb
     when: ansible_os_family == "Debian"
     become: yes
     tags:
@@ -106,10 +110,62 @@
     tags:
       - build_shardman
 
+  # to run something iff tags were specified
+  - shell: /bin/true
+    register: tags_not_specified
+
+  - name: clone repo with Arseny's conf
+    git: repo=https://github.com/arssher/conf.git
+      dest="{{ ars_conf }}"
+      version=master
+      depth=1
+      accept_hostkey=True
+    when: tags_not_specified is not defined
+    tags: ars
+
+  - name: add emacs25 repo
+    apt_repository:
+      repo="ppa:kelleyk/emacs"
+      state=present
+      update_cache=yes
+    become: yes
+    when: tags_not_specified is not defined and ansible_os_family == "Debian"
+    tags: ars
+
+  - name: install emacs & other stuff for Arseny
+    apt: name={{item}} state=installed
+    with_items:
+     - x11-xkb-utils
+     - emacs25
+    become: yes
+    when: tags_not_specified is not defined and ansible_os_family == "Debian"
+    tags: ars
+
+  - name: setup Arseny's conf
+    shell: >
+      "{{ ars_conf }}"/bash/.bash_scripts/bin/restore_all.sh;
+    when: tags_not_specified is not defined
+    tags: ars
+
   - name: set PATH in .bashrc
     lineinfile: dest=~/.bashrc line="export PATH={{ pg_dst }}/bin:$PATH"
     tags:
       - set_path
+
+  - name: allow ptrace for non-root users
+    lineinfile: dest=/etc/sysctl.d/10-ptrace.conf
+      regexp='^kernel.yama.ptrace_scope'
+      line='kernel.yama.ptrace_scope = 0'
+      state=present
+    become: yes
+    tags:
+      - allow_ptrace
+
+  - name: allow ptrace for non-root users
+    shell: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+    become: yes
+    tags:
+      - allow_ptrace
 
 - import_playbook: init.yml
   tags:
