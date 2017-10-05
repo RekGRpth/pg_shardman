@@ -14,6 +14,20 @@
       dest: "{{ logs }}/{{ inventory_hostname }}.log"
       validate_checksum: no # new logs might constantly arrive
       flat: yes
+    tags:
+      fetch
+
+  - name: find out node id from log
+    local_action: shell grep -m 1 -o -P 'SHND \d' logs/{{ inventory_hostname }}.log | sed 's/SHND //'
+    register: node_id
+    tags:
+      node_symlink
+
+  - name: create symlink 'node_id'.log -> 'ip'.log
+    local_action: file
+      src={{ inventory_hostname }}.log
+      dest={{ logs }}/{{ node_id.stdout }}.log
+      state=link
 
   - name: touch logs/united.log
     local_action: copy content="" dest={{ logs }}/united.log
@@ -24,7 +38,7 @@
     with_items: "{{ groups.nodes }}"
     run_once: true
 
-  - name: create symlink to shadlord log
+  - name: create symlink to shardlord log
     local_action: file
       src={{ groups['shardlord'][0] }}.log
       dest={{ logs }}/shardlord.log

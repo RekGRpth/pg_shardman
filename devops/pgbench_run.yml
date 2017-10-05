@@ -1,11 +1,10 @@
-### create pgbench_history everywhere, create pgbench tables on init node,
-# shard them. TODO: drop sharded tables.
+### Run pgbench benchmark.
 # Controlling vars: tmstmp (true/false), tname, clients, t (true/false),
 # seconds, xacts
 
 
 # set global var to use in all plays, oh my
-- hosts: nodes
+- hosts: nodes:localhost
   vars:
     tmstmp: True
     tname: pgbench
@@ -67,6 +66,34 @@
       res/{{ test_id }}/tps.txt`" >> res/{{test_id}}/tps.txt
     run_once: true
 
+  - name: collect worker conf
+    fetch:
+      src: "{{ pg_conffile }}"
+      dest: res/{{ test_id }}/postgresql.conf.worker
+      flat: yes
+    run_once: true
+
 - import_playbook: logs.yml logs=res/{{ test_id }}/logs
   tags:
     - logs
+
+- hosts: shardlord
+  tasks:
+  - name: collect shardlord conf
+    fetch:
+      src: "{{ pg_conffile }}"
+      dest: res/{{ test_id }}/postgresql.conf.lord
+      flat: yes
+    run_once: true
+
+- hosts: localhost
+  tasks:
+  - name: Dump all vars
+    action: template src=templates/dumpallvars.j2 dest=res/{{ test_id }}/allvars.txt
+
+  - name: print tps
+    local_action: shell cat res/{{ test_id }}/tps.txt
+    register: tps
+    run_once: true
+
+  - debug: msg={{ tps.stdout }}
