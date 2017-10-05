@@ -157,7 +157,7 @@ BEGIN
 		PERFORM shardman.eliminate_sub(prev_lname);
 		EXECUTE format(
 			'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = local);',
 		prev_lname, prev_connstr, prev_lname, prev_lname);
 		-- If we have prev, we are replica
 		PERFORM shardman.readonly_replica_on(p_name::regclass);
@@ -177,7 +177,7 @@ BEGIN
 	PERFORM shardman.eliminate_sub(lname);
 	EXECUTE format(
 		'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = local);',
 		lname, dst_connstr, lname, lname);
 END $$ LANGUAGE plpgsql STRICT;
 
@@ -664,8 +664,8 @@ CREATE FUNCTION readonly_table_on(relation regclass)
 	RETURNS void AS $$
 BEGIN
 	-- Create go away trigger to prevent any modifications
-	-- PERFORM shardman.readonly_table_off(relation);
-	-- PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly', 'shardman.go_away()');
+	PERFORM shardman.readonly_table_off(relation);
+	PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly', 'shardman.go_away()');
 END
 $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION go_away() RETURNS TRIGGER AS $$
@@ -688,8 +688,8 @@ CREATE FUNCTION readonly_replica_on(relation regclass)
 BEGIN
 	RAISE DEBUG '[SHMN] table % made read-only for all but apply workers',
 		relation;
-	-- PERFORM shardman.readonly_replica_off(relation);
-	-- PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly_replica', 'shardman.ror_go_away()');
+	PERFORM shardman.readonly_replica_off(relation);
+	PERFORM shardman.create_modification_triggers(relation, 'shardman_readonly_replica', 'shardman.ror_go_away()');
 END $$ LANGUAGE plpgsql STRICT;
 -- This function is impudent because it is used as both stmt and row trigger.
 -- The idea is that we must never reach RETURN NEW after stmt row trigger,

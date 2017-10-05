@@ -220,12 +220,16 @@ rebalance(Cmd *cmd)
 	for (part_idx = 0, worker_idx = 0; part_idx < num_parts; part_idx++)
 	{
 		Partition part = parts[part_idx];
-		int32 worker = workers[worker_idx];
+		int32 worker;
 		MovePartState *mps = palloc0(sizeof(MovePartState));
+
+		do {
+			worker = workers[worker_idx];
+			worker_idx = (worker_idx + 1) % num_workers;
+		} while (node_has_partition(worker, part.part_name));
 
 		init_mp_state(mps, part.part_name, part.owner, worker);
 		tasks[part_idx] = (CopyPartState *) mps;
-		worker_idx = (worker_idx + 1) % num_workers;
 	}
 
 	exec_tasks(tasks, num_parts);
@@ -286,8 +290,14 @@ set_replevel(Cmd *cmd)
 			if (rc.count < replevel)
 			{
 				CreateReplicaState *crs = palloc0(sizeof(CreateReplicaState));
-				int32 dst_node = workers[rand() % num_workers];
+				int32 dst_node;
+
+				do {
+					dst_node = workers[rand() % num_workers];
+				} while (node_has_partition(dst_node, rc.part_name));
+
 				init_cr_state(crs, rc.part_name, dst_node);
+
 				tasks[ntasks] = (CopyPartState *) crs;
 				ntasks++;
 				shmn_elog(DEBUG1, "Adding replica for shard %s on node %d",

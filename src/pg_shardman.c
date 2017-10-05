@@ -1121,6 +1121,34 @@ get_prev_node(const char *part_name, int32 node_id, bool *part_exists)
 	return prev;
 }
 
+bool
+node_has_partition(int32 node, const char *part_name)
+{
+	char *sql;
+	int64 count = 0;
+	SPI_XACT_STATUS;
+
+	SPI_PROLOG;
+
+	sql = psprintf("select count(*) from shardman.partitions"
+				   " where part_name = '%s' and owner = %d", part_name, node);
+
+	if (SPI_execute(sql, true, 0) < 0)
+	{
+		shmn_elog(FATAL, "Stmt failed : %s", sql);
+	}
+	if (SPI_processed != 0)
+	{
+		bool isnull;
+		count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc,
+											1,
+											&isnull));
+	}
+	SPI_EPILOG;
+	return count != 0;
+}
+
 /*
  * Get relation name of partition part_name. Memory is palloc'ed.
  * NULL is returned, if there is no such partition.
