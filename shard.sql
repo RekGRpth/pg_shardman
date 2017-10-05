@@ -115,7 +115,7 @@ DECLARE
 	me int := shardman.my_id();
 	lname text := shardman.get_data_lname(p_name, me, dst);
 BEGIN
-	PERFORM shardman.create_repslot(lname);
+	PERFORM shardman.drop_repslot(lname);
 	-- Create publication for new data channel prev replica -> dst, make it sync
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
 	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, p_name);
@@ -141,7 +141,7 @@ BEGIN
 	IF next_rep IS NOT NULL THEN -- we need to setup channel dst -> next replica
 		next_lname := shardman.get_data_lname(p_name, dst, next_rep);
 		-- This must be first write in the transaction!
-		PERFORM shardman.create_repslot(next_lname);
+		PERFORM shardman.drop_repslot(next_lname);
 		EXECUTE format('DROP PUBLICATION IF EXISTS %I', next_lname);
 		EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
 					   next_lname, p_name);
@@ -371,9 +371,9 @@ DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
 	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
 BEGIN
-	-- Repslot for new data channel. Must be first, since we "cannot create
-	-- logical replication slot in transaction that has performed writes".
-	PERFORM shardman.create_repslot(lname);
+    -- Repslot for new data channel. Must be first, since we "cannot create
+    -- logical replication slot in transaction that has performed writes".
+    PERFORM shardman.drop_repslot(lname);
 	-- Drop publication & repslot used for copy
 	PERFORM shardman.drop_repslot_and_pub(cp_logname);
 	-- Create publication for new data channel

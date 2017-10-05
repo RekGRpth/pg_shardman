@@ -140,6 +140,12 @@ static XLogRecPtr pg_lsn_in_c(const char *lsn);
 static struct timespec timespec_now_plus_millis(int millis);
 struct timespec timespec_now(void);
 
+static char* 
+get_data_lname(char const* part_name, int pub_node, int sub_node)
+{
+	return psprintf("shardman_data_%s_%d_%d", part_name, pub_node, sub_node);
+}
+
 /*
  * Fill MovePartState for moving partition. If src_node is
  * SHMN_INVALID_NODE_ID, assume primary partition must be moved. If something
@@ -223,12 +229,14 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 	if (mps->prev_node != SHMN_INVALID_NODE_ID)
 	{
 		mps->prev_sql = psprintf(
-			"select shardman.part_moved_prev('%s', %d, %d);",
-			part_name, mps->cp.src_node, mps->cp.dst_node);
+			"select shardman.part_moved_prev('%s', %d, %d); SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
+			part_name, mps->cp.src_node, mps->cp.dst_node,
+			get_data_lname(part_name, shardman_my_id, mps->cp.dst_node));
 	}
 	mps->dst_sql = psprintf(
-		"select shardman.part_moved_dst('%s', %d, %d);",
-		part_name, mps->cp.src_node, mps->cp.dst_node);
+		"select shardman.part_moved_dst('%s', %d, %d); SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
+		part_name, mps->cp.src_node, mps->cp.dst_node,
+		get_data_lname(part_name, mps->cp.dst_node, get_next_node(part_name, mps->cp.src_node)));
 	if (mps->next_node != SHMN_INVALID_NODE_ID)
 	{
 		mps->next_sql = psprintf(
@@ -280,8 +288,9 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 	 * settings are not getting reloaded, but not sure why.
 	 */
 	crs->create_data_pub_sql = psprintf(
-		"select shardman.replica_created_create_data_pub('%s', %d, %d);",
-		part_name, crs->cp.src_node, crs->cp.dst_node);
+										"select shardman.replica_created_create_data_pub('%s', %d, %d); SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
+										part_name, crs->cp.src_node, crs->cp.dst_node,
+										get_data_lname(part_name, crs->cp.src_node, crs->cp.dst_node));
 	crs->create_data_sub_sql = psprintf(
 		"select shardman.replica_created_create_data_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
@@ -338,10 +347,11 @@ init_cp_state(CopyPartState *cps)
 	 * transaction that performed writes
 	 */
 	cps->src_create_pub_and_rs_sql = psprintf(
-		"begin; drop publication if exists %s cascade;"
-		" create publication %s for table %s; end;"
-		" select shardman.create_repslot('%s');",
-		cps->logname, cps->logname, cps->part_name, cps->logname
+		"drop publication if exists %s cascade;"
+		"create publication %s for table %s;"
+		"select shardman.drop_repslot('%s');"
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
+		cps->logname, cps->logname, cps->part_name, cps->logname, cps->logname
 		);
 	cps->relation = get_partition_relation(cps->part_name);
 	Assert(cps->relation != NULL);
@@ -638,6 +648,29 @@ exec_move_part(MovePartState *mps)
 	mps->cp.exec_res = TASK_DONE;
 }
 
+static bool remote_exec(PGconn** conn, CopyPartState *cps, char* stmts)
+{
+	char* sql = stmts, *sep;
+	PGresult *res;
+	while ((sep = strchr(sql, ';')) != NULL) {
+		*sep = '\0';
+		res = PQexec(*conn, sql);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK && PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			shmn_elog(LOG, "REMOTE_EXEC: execution of query '%s' failed for paritions %s: %s",
+					  sql, cps->part_name, PQerrorMessage(*conn));
+			*sep = ';';
+			reset_pqconn_and_res(conn, res);
+			configure_retry(cps, shardman_cmd_retry_naptime);
+			return false;
+		}
+		PQclear(res);
+		*sep = ';';
+		sql = sep + 1;
+	}
+	return true;
+}
+
 /*
  * Reconfigure LR channel for moved primary: prev to moved, moved to next or
  * both, if they exist.
@@ -648,39 +681,21 @@ exec_move_part(MovePartState *mps)
 int
 mp_rebuild_lr(MovePartState *mps)
 {
-	PGresult *res;
-
 	if (mps->prev_node != SHMN_INVALID_NODE_ID)
 	{
 		if (ensure_pqconn(&mps->prev_conn, mps->prev_connstr,
 					   (CopyPartState *) mps) == -1)
 			return -1;
-		res = PQexec(mps->prev_conn, mps->prev_sql);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			shmn_elog(NOTICE, "Moving part %s: failed to configure LR on prev replica: %s",
-					  mps->cp.part_name, PQerrorMessage(mps->prev_conn));
-			reset_pqconn_and_res(&mps->prev_conn, res);
-			configure_retry((CopyPartState *) mps, shardman_cmd_retry_naptime);
+		if (!remote_exec(&mps->prev_conn, (CopyPartState *)mps, mps->prev_sql))
 			return -1;
-		}
-		PQclear(res);
 		shmn_elog(DEBUG1, "mp %s: LR conf on prev done", mps->cp.part_name);
 	}
 
 	if (ensure_pqconn_cp((CopyPartState *) mps,
 						 ENSURE_PQCONN_DST) == -1)
 		return -1;
-	res = PQexec(mps->cp.dst_conn, mps->dst_sql);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		shmn_elog(NOTICE, "Moving part %s: failed to configure LR on dst : %s",
-				  mps->cp.part_name, PQerrorMessage(mps->cp.dst_conn));
-		reset_pqconn_and_res(&mps->cp.dst_conn, res);
-		configure_retry((CopyPartState *) mps, shardman_cmd_retry_naptime);
+	if (!remote_exec(&mps->cp.dst_conn, (CopyPartState *)mps, mps->dst_sql))
 		return -1;
-	}
-	PQclear(res);
 	shmn_elog(DEBUG1, "mp %s: LR conf on dst done", mps->cp.part_name);
 
 	if (mps->next_node != SHMN_INVALID_NODE_ID)
@@ -688,16 +703,8 @@ mp_rebuild_lr(MovePartState *mps)
 		if (ensure_pqconn(&mps->next_conn, mps->next_connstr,
 						  (CopyPartState *) mps) == -1)
 			return -1;
-		res = PQexec(mps->next_conn, mps->next_sql);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			shmn_elog(NOTICE, "Moving part %s: failed to configure LR on next replica: %s",
-					  mps->cp.part_name, PQerrorMessage(mps->next_conn));
-			reset_pqconn_and_res(&mps->next_conn, res);
-			configure_retry((CopyPartState *) mps, shardman_cmd_retry_naptime);
+		if (!remote_exec(&mps->next_conn, (CopyPartState *)mps, mps->next_sql))
 			return -1;
-		}
-		PQclear(res);
 		shmn_elog(DEBUG1, "mp %s: LR conf on next done", mps->cp.part_name);
 	}
 
@@ -747,46 +754,20 @@ exec_create_replica(CreateReplicaState *crs)
 int
 cr_rebuild_lr(CreateReplicaState *crs)
 {
-	PGresult *res;
-
 	if (ensure_pqconn_cp((CopyPartState *) crs,
 						 ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
-	res = PQexec(crs->cp.dst_conn, crs->drop_cp_sub_sql);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		shmn_elog(NOTICE, "Creating replica %s: failed to configure LR, step 1: %s",
-				  crs->cp.part_name, PQerrorMessage(crs->cp.dst_conn));
-		reset_pqconn_and_res(&crs->cp.dst_conn, res);
-		configure_retry((CopyPartState *) crs, shardman_cmd_retry_naptime);
+	if (!remote_exec(&crs->cp.dst_conn, (CopyPartState *) crs, crs->drop_cp_sub_sql))
 		return -1;
-	}
-	PQclear(res);
 	shmn_elog(DEBUG1, "cr %s: drop_cp_sub done", crs->cp.part_name);
 
-	res = PQexec(crs->cp.src_conn, crs->create_data_pub_sql);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		shmn_elog(NOTICE, "Creating replica %s: failed to configure LR, step 2: %s",
-				  crs->cp.part_name, PQerrorMessage(crs->cp.src_conn));
-		reset_pqconn_and_res(&crs->cp.src_conn, res);
-		configure_retry((CopyPartState *) crs, shardman_cmd_retry_naptime);
+	if (!remote_exec(&crs->cp.src_conn, (CopyPartState *) crs, crs->create_data_pub_sql))
 		return -1;
-	}
-	PQclear(res);
 	shmn_elog(DEBUG1, "cr %s: create_data_pub done", crs->cp.part_name);
 
-	res = PQexec(crs->cp.dst_conn, crs->create_data_sub_sql);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		shmn_elog(NOTICE, "Creating replica %s: failed to configure LR, step 3: %s",
-				  crs->cp.part_name, PQerrorMessage(crs->cp.dst_conn));
-		reset_pqconn_and_res(&crs->cp.dst_conn, res);
-		configure_retry((CopyPartState *) crs, shardman_cmd_retry_naptime);
+	if (!remote_exec(&crs->cp.dst_conn, (CopyPartState *) crs, crs->create_data_sub_sql))
 		return -1;
-	}
-	PQclear(res);
 	shmn_elog(DEBUG1, "cr %s: create_data_sub done", crs->cp.part_name);
 
 	return 0;
@@ -847,7 +828,6 @@ exec_cp(CopyPartState *cps)
 int
 cp_start_tablesync(CopyPartState *cps)
 {
-	PGresult *res;
 	XLogRecPtr lord_lsn = GetXLogWriteRecPtr();
 
 	if (ensure_pqconn_cp(cps, ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
@@ -878,37 +858,16 @@ cp_start_tablesync(CopyPartState *cps)
 		goto fail;
 	}
 
-	res = PQexec(cps->dst_conn, cps->dst_drop_sub_sql);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		shmn_elog(NOTICE, "Failed to drop sub on dst: %s",
-				  PQerrorMessage(cps->dst_conn));
-		reset_pqconn_and_res(&cps->dst_conn, res);
+	if (!remote_exec(&cps->dst_conn, cps, cps->dst_drop_sub_sql))
 		goto fail;
-	}
-	PQclear(res);
 	shmn_elog(DEBUG1, "cp %s: sub on dst dropped, if any", cps->part_name);
 
-	res = PQexec(cps->src_conn, cps->src_create_pub_and_rs_sql);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		shmn_elog(NOTICE, "Failed to create pub and repslot on src: %s",
-				  PQerrorMessage(cps->src_conn));
-		reset_pqconn_and_res(&cps->src_conn, res);
+	if (!remote_exec(&cps->src_conn, cps, cps->src_create_pub_and_rs_sql))
 		goto fail;
-	}
-	PQclear(res);
 	shmn_elog(DEBUG1, "cp %s: pub and rs recreated on src", cps->part_name);
 
-	res = PQexec(cps->dst_conn, cps->dst_create_tab_and_sub_sql);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		shmn_elog(NOTICE, "Failed to recreate table & sub on dst: %s",
-				  PQerrorMessage(cps->dst_conn));
-		reset_pqconn_and_res(&cps->dst_conn, res);
+	if (!remote_exec(&cps->dst_conn, cps, cps->dst_create_tab_and_sub_sql)) 
 		goto fail;
-	}
-	PQclear(res);
 	shmn_elog(DEBUG1, "cp %s: table & sub created on dst, tablesync started",
 			  cps->part_name);
 
