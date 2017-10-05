@@ -239,9 +239,20 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 		get_data_lname(part_name, mps->cp.dst_node, get_next_node(part_name, mps->cp.src_node)));
 	if (mps->next_node != SHMN_INVALID_NODE_ID)
 	{
+		mps->dst_sql = psprintf(
+								"select shardman.part_moved_dst('%s', %d, %d); SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
+								part_name, mps->cp.src_node, mps->cp.dst_node,
+								get_data_lname(part_name, mps->cp.dst_node, mps->next_node));
+
 		mps->next_sql = psprintf(
 			"select shardman.part_moved_next('%s', %d, %d);",
 			part_name, mps->cp.src_node, mps->cp.dst_node);
+	}
+	else
+	{
+		mps->dst_sql = psprintf(
+								"select shardman.part_moved_dst('%s', %d, %d);",
+								part_name, mps->cp.src_node, mps->cp.dst_node);
 	}
 }
 
