@@ -207,5 +207,3 @@ Limitations:
 * We can't switch shardlord for now.
 * The shardlord itself can't be worker node for now.
 * ALTER TABLE for sharded tables is not supported.
-* Cmd redirection is not yet implemented, sharding cmds must be issued to
-  shardlord directly.
