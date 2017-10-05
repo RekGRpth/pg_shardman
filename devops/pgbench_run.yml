@@ -73,6 +73,17 @@
       flat: yes
     run_once: true
 
+  - name: collect pg_config
+    shell: pg_config > "pg_config.out"
+    run_once: true
+
+  - name: collect pg_config
+    fetch:
+      src: "pg_config.out"
+      dest: res/{{ test_id }}/pg_config.out
+      flat: yes
+    run_once: true
+
 - import_playbook: logs.yml logs=res/{{ test_id }}/logs
   tags:
     - logs
@@ -96,4 +107,4 @@
     register: tps
     run_once: true
 
-  - debug: msg={{ tps.stdout }}
+  - debug: msg="{{ tps.stdout }}. test_id {{ test_id }} "

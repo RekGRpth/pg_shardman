@@ -46,3 +46,10 @@
       fail_on_missing: yes
     tags:
       - fetch
+
+  - name: print tps
+    local_action: shell cat res/pgbench_single.out
+    register: tps
+    run_once: true
+
+  - debug: msg={{ tps.stdout }}
