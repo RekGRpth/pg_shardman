@@ -222,24 +222,32 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 
 	if (mps->prev_node != SHMN_INVALID_NODE_ID)
 	{
+		char *prev_dst_lname = get_data_lname(part_name, shardman_my_id,
+											  mps->cp.dst_node);
 		mps->prev_sql = psprintf(
 			"select shardman.part_moved_prev('%s', %d, %d);"
             " select pg_create_logical_replication_slot('%s', 'pgoutput');",
-			part_name, mps->cp.src_node, mps->cp.dst_node,
-			get_data_lname(part_name, shardman_my_id, mps->cp.dst_node));
+			part_name, mps->cp.src_node, mps->cp.dst_node, prev_dst_lname);
+
+		mps->sync_standby_prev_sql = psprintf(
+			"select shardman.ensure_sync_standby('%s');", prev_dst_lname);
 	}
 	mps->dst_sql = psprintf(
 		"select shardman.part_moved_dst('%s', %d, %d);",
 		part_name, mps->cp.src_node, mps->cp.dst_node);
 	if (mps->next_node != SHMN_INVALID_NODE_ID)
 	{
+		char *dst_next_lname = get_data_lname(part_name, mps->cp.dst_node,
+											  mps->next_node);
 		mps->next_sql = psprintf(
 			"select shardman.part_moved_next('%s', %d, %d);",
 			part_name, mps->cp.src_node, mps->cp.dst_node);
 		mps->dst_sql = psprintf(
 			"%s select pg_create_logical_replication_slot('%s', 'pgoutput');",
-			mps->dst_sql,
-			get_data_lname(part_name, mps->cp.dst_node, mps->next_node));
+			mps->dst_sql, dst_next_lname);
+
+		mps->sync_standby_dst_sql = psprintf(
+			"select shardman.ensure_sync_standby('%s');", dst_next_lname);
 	}
 }
 
@@ -287,6 +295,11 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 	crs->create_data_sub_sql = psprintf(
 		"select shardman.replica_created_create_data_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
+	crs->sync_standby_sql = psprintf(
+		"select shardman.ensure_sync_standby('%s');"
+		" select shardman.readonly_table_off('%s'::regclass);",
+		get_data_lname(part_name, crs->cp.src_node, crs->cp.dst_node),
+		part_name);
 }
 
 /*
@@ -386,18 +399,14 @@ static void finalize_cp_state(CopyPartState *cps)
 	/* Failed tasks never open pq connections */
 	if (cps->res != TASK_FAILED)
 	{
-		if (cps->src_conn != NULL)
-			reset_pqconn(&cps->src_conn);
-		if (cps->dst_conn != NULL)
-			reset_pqconn(&cps->dst_conn);
+		reset_pqconn(&cps->src_conn);
+		reset_pqconn(&cps->dst_conn);
 		if (cps->type == COPYPARTTASK_MOVE_PRIMARY ||
 			cps->type == COPYPARTTASK_MOVE_REPLICA)
 		{
 			MovePartState *mps = (MovePartState *) cps;
-			if (mps->prev_conn != NULL)
-				reset_pqconn(&mps->prev_conn);
-			if (mps->next_conn != NULL)
-				reset_pqconn(&mps->next_conn);
+			reset_pqconn(&mps->prev_conn);
+			reset_pqconn(&mps->next_conn);
 		}
 	}
 }
@@ -649,7 +658,8 @@ exec_move_part(MovePartState *mps)
  */
 static bool remote_exec(PGconn** conn, CopyPartState *cps, char* stmts)
 {
-	char* sql = stmts, *sep;
+	char *sql = stmts;
+	char *sep;
 	PGresult *res;
 	while ((sep = strchr(sql, ';')) != NULL) {
 		*sep = '\0';
@@ -698,6 +708,14 @@ mp_rebuild_lr(MovePartState *mps)
 		return -1;
 	shmn_elog(DEBUG1, "mp %s: LR conf on dst done", mps->cp.part_name);
 
+	if (mps->prev_node != SHMN_INVALID_NODE_ID)
+	{
+		if (!remote_exec(&mps->prev_conn, (CopyPartState *) mps,
+						 mps->sync_standby_prev_sql))
+			return -1;
+		shmn_elog(DEBUG1, "mp %s: make sync standby on prev", mps->cp.part_name);
+	}
+
 	if (mps->next_node != SHMN_INVALID_NODE_ID)
 	{
 		if (ensure_pqconn(&mps->next_conn, mps->next_connstr,
@@ -706,6 +724,10 @@ mp_rebuild_lr(MovePartState *mps)
 		if (!remote_exec(&mps->next_conn, (CopyPartState *) mps, mps->next_sql))
 			return -1;
 		shmn_elog(DEBUG1, "mp %s: LR conf on next done", mps->cp.part_name);
+
+		if (!remote_exec(&mps->cp.dst_conn, (CopyPartState *) mps,
+						 mps->sync_standby_dst_sql))
+			return -1;
 	}
 
 	return 0;
@@ -742,14 +764,6 @@ exec_create_replica(CreateReplicaState *crs)
  * Work to do in general is described below. We execute them in steps written
  * in parentheses so that every time we create sub, pub is already exist and
  * every time we drop pub, sub is already dropped.
- * On old tail node, i.e. src:
- * - Drop repslot & pub used for copy (create_data_pub)
- * - Create repslot & pub for new data channel (create_data_pub)
- * - Make it synchronous; make table writable. (create_data_pub)
- * On new tail node, i.e. dst:
- * - Make table read-only for all but apply workers (drop_cp_sub)
- * - Drop sub used for copy (drop_cp_sub)
- * - Create sub for new data channel. (create_data_sub)
  */
 int
 cr_rebuild_lr(CreateReplicaState *crs)
@@ -758,7 +772,8 @@ cr_rebuild_lr(CreateReplicaState *crs)
 						 ENSURE_PQCONN_SRC | ENSURE_PQCONN_DST) == -1)
 		return -1;
 
-	if (!remote_exec(&crs->cp.dst_conn, (CopyPartState *) crs, crs->drop_cp_sub_sql))
+	if (!remote_exec(&crs->cp.dst_conn, (CopyPartState *) crs,
+					 crs->drop_cp_sub_sql))
 		return -1;
 	shmn_elog(DEBUG1, "cr %s: drop_cp_sub done", crs->cp.part_name);
 
@@ -766,9 +781,15 @@ cr_rebuild_lr(CreateReplicaState *crs)
 		return -1;
 	shmn_elog(DEBUG1, "cr %s: create_data_pub done", crs->cp.part_name);
 
-	if (!remote_exec(&crs->cp.dst_conn, (CopyPartState *) crs, crs->create_data_sub_sql))
+	if (!remote_exec(&crs->cp.dst_conn, (CopyPartState *) crs,
+					 crs->create_data_sub_sql))
 		return -1;
 	shmn_elog(DEBUG1, "cr %s: create_data_sub done", crs->cp.part_name);
+
+	if (!remote_exec(&crs->cp.src_conn, (CopyPartState *) crs,
+					 crs->sync_standby_sql))
+		return -1;
+	shmn_elog(DEBUG1, "cr %s: sync_standby done", crs->cp.part_name);
 
 	return 0;
 }
@@ -1075,17 +1096,24 @@ ensure_pqconn(PGconn **conn, const char *connstr,
 	}
 	if (*conn == NULL)
 	{
+		char s[] = "set session synchronous_commit to local;";
+
 		Assert(connstr != NULL);
 		*conn = PQconnectdb(connstr);
 		if (PQstatus(*conn) != CONNECTION_OK)
 		{
-			shmn_elog(NOTICE, "Connection to node %s failed: %s",
-					  connstr, PQerrorMessage(*conn));
+			shmn_elog(NOTICE, "Connection to node %s failed: %s", connstr,
+					  PQerrorMessage(*conn));
 			reset_pqconn(conn);
 			configure_retry(cps, shardman_cmd_retry_naptime);
 			return -1;
 		}
 		shmn_elog(DEBUG1, "Connection to %s established", connstr);
+
+		/* All our cmds don't need to wait for sync replication */
+		/* remote_exec modifies sql, so it must be writable */
+		if (!remote_exec(conn, cps, s))
+			return -1;
 	}
 	return 0;
 }

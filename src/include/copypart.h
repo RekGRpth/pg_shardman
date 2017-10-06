@@ -96,6 +96,7 @@ typedef struct
 	char *drop_cp_sub_sql;
 	char *create_data_pub_sql;
 	char *create_data_sub_sql;
+	char *sync_standby_sql;
 } CreateReplicaState;
 
 /* State of move partition task */
@@ -111,7 +112,9 @@ typedef struct
 	/* SQL executed to reconfigure LR channels */
 	char *prev_sql;
 	char *dst_sql;
+	char *sync_standby_prev_sql;
 	char *next_sql;
+	char *sync_standby_dst_sql;
 } MovePartState;
 
 extern void init_mp_state(MovePartState *mps, const char *part_name,

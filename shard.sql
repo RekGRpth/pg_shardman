@@ -119,10 +119,6 @@ BEGIN
 	-- Create publication for new data channel prev replica -> dst, make it sync
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
 	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, p_name);
-	-- This is neccessary since sub is not created, and with sync commit we will
-	-- hang forever
-	SET LOCAL synchronous_commit TO local;
-	PERFORM shardman.ensure_sync_standby(lname);
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Executed on node with new part, see mp_rebuild_lr
@@ -140,15 +136,10 @@ BEGIN
 	ASSERT dst = shardman.my_id(), 'part_moved_dst must be called on dst';
 	IF next_rep IS NOT NULL THEN -- we need to setup channel dst -> next replica
 		next_lname := shardman.get_data_lname(p_name, dst, next_rep);
-		-- This must be first write in the transaction!
 		PERFORM shardman.drop_repslot(next_lname);
 		EXECUTE format('DROP PUBLICATION IF EXISTS %I', next_lname);
 		EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I',
 					   next_lname, p_name);
-		-- This is neccessary since sub is not created, and with sync commit we will
-		-- hang forever
-		SET LOCAL synchronous_commit TO local;
-		PERFORM shardman.ensure_sync_standby(next_lname);
 	END IF;
 
 	IF prev_rep IS NOT NULL THEN -- we need to setup channel prev replica -> dst
@@ -377,13 +368,6 @@ BEGIN
 	-- Create publication for new data channel
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
 	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, part_name);
-	-- Make this channel sync.
-	-- This is neccessary since sub is not created, and with sync commit we will
-	-- hang forever.
-	SET LOCAL synchronous_commit TO local;
-	PERFORM shardman.ensure_sync_standby(lname);
-	-- Now it is safe to make old tail writable again
-	PERFORM shardman.readonly_table_off(part_name::regclass);
 END $$ LANGUAGE plpgsql;
 
 -- Executed on newtail node, see cr_rebuild_lr
