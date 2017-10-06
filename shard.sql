@@ -157,7 +157,7 @@ BEGIN
 		PERFORM shardman.eliminate_sub(prev_lname);
 		EXECUTE format(
 			'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = local);',
 		prev_lname, prev_connstr, prev_lname, prev_lname);
 		-- If we have prev, we are replica
 		PERFORM shardman.readonly_replica_on(p_name::regclass);
@@ -177,7 +177,7 @@ BEGIN
 	PERFORM shardman.eliminate_sub(lname);
 	EXECUTE format(
 		'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = on);',
+		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = local);',
 		lname, dst_connstr, lname, lname);
 END $$ LANGUAGE plpgsql STRICT;
 

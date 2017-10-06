@@ -131,5 +131,5 @@ extern int32 get_prev_node(const char *part_name, int32 node_id, bool *part_exis
 extern char *get_partition_relation(const char *part_name);
 extern Partition *get_parts(const char *relation, uint64 *num_parts);
 extern RepCount *get_repcount(const char *relation, uint64 *num_parts);
-
+extern bool node_has_partition(int32 node, const char *part_name);
 #endif							/* PG_SHARDMAN_H */

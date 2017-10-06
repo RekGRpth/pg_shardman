@@ -363,7 +363,7 @@ init_cp_state(CopyPartState *cps)
 		" including storage);"
 		" drop subscription if exists %s cascade;"
 		" create subscription %s connection '%s' publication %s with"
-		"   (create_slot = false, slot_name = '%s');",
+		"   (create_slot = false, slot_name = '%s', synchronous_commit = local);",
 		cps->part_name,
 		cps->part_name, cps->relation,
 		cps->logname,
