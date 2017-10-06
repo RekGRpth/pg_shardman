@@ -371,8 +371,6 @@ DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
 	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
 BEGIN
-    -- Repslot for new data channel. Must be first, since we "cannot create
-    -- logical replication slot in transaction that has performed writes".
     PERFORM shardman.drop_repslot(lname);
 	-- Drop publication & repslot used for copy
 	PERFORM shardman.drop_repslot_and_pub(cp_logname);

@@ -74,12 +74,6 @@
  *   specify since which lsn start replication, tables must be synced anyway
  *   during these operations, so what the point of reusing old sub?
  *
- *  About fdws on replicas: we have to keep partition of parent table as fdw,
- *  because otherwise we would not be able to write anything to it. On the
- *  other hand, keeping the whole list of replicas is a bit excessive and
- *  slower in case of primary failure: we need actually only primary and
- *  ourself.
- *
  *  Currently we don't save progress of separate tasks (e.g. for copy part
  *  whether initial sync started or done, lsn, etc), so we have to start
  *  everything from the ground if shardlord reboots. This is arguably fine.
@@ -140,7 +134,7 @@ static XLogRecPtr pg_lsn_in_c(const char *lsn);
 static struct timespec timespec_now_plus_millis(int millis);
 struct timespec timespec_now(void);
 
-static char* 
+static char*
 get_data_lname(char const* part_name, int pub_node, int sub_node)
 {
 	return psprintf("shardman_data_%s_%d_%d", part_name, pub_node, sub_node);
@@ -229,19 +223,23 @@ init_mp_state(MovePartState *mps, const char *part_name, int32 src_node,
 	if (mps->prev_node != SHMN_INVALID_NODE_ID)
 	{
 		mps->prev_sql = psprintf(
-			"select shardman.part_moved_prev('%s', %d, %d); SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
+			"select shardman.part_moved_prev('%s', %d, %d);"
+            " select pg_create_logical_replication_slot('%s', 'pgoutput');",
 			part_name, mps->cp.src_node, mps->cp.dst_node,
 			get_data_lname(part_name, shardman_my_id, mps->cp.dst_node));
 	}
 	mps->dst_sql = psprintf(
-		"select shardman.part_moved_dst('%s', %d, %d); SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
-		part_name, mps->cp.src_node, mps->cp.dst_node,
-		get_data_lname(part_name, mps->cp.dst_node, get_next_node(part_name, mps->cp.src_node)));
+		"select shardman.part_moved_dst('%s', %d, %d);",
+		part_name, mps->cp.src_node, mps->cp.dst_node);
 	if (mps->next_node != SHMN_INVALID_NODE_ID)
 	{
 		mps->next_sql = psprintf(
 			"select shardman.part_moved_next('%s', %d, %d);",
 			part_name, mps->cp.src_node, mps->cp.dst_node);
+		mps->dst_sql = psprintf(
+			"%s select pg_create_logical_replication_slot('%s', 'pgoutput');",
+			mps->dst_sql,
+			get_data_lname(part_name, mps->cp.dst_node, mps->next_node));
 	}
 }
 
@@ -280,17 +278,12 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 	crs->drop_cp_sub_sql = psprintf(
 		"select shardman.replica_created_drop_cp_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
-	/*
-	 * Separate trxn for ensure_sync_standby as in init_mp_state. It is
-	 * interesting that while I got expected behaviour (hanged transaction) in
-	 * move_part if ensure_sync_standby was executed in one trxn with create
-	 * repslot and pub, here I didn't. Probably it is committing so fast that
-	 * settings are not getting reloaded, but not sure why.
-	 */
-	crs->create_data_pub_sql = psprintf(
-										"select shardman.replica_created_create_data_pub('%s', %d, %d); SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
-										part_name, crs->cp.src_node, crs->cp.dst_node,
-										get_data_lname(part_name, crs->cp.src_node, crs->cp.dst_node));
+
+	crs->create_data_pub_sql =
+		psprintf("select shardman.replica_created_create_data_pub('%s', %d, %d);"
+				 " select pg_create_logical_replication_slot('%s', 'pgoutput');",
+				 part_name, crs->cp.src_node, crs->cp.dst_node,
+				 get_data_lname(part_name, crs->cp.src_node, crs->cp.dst_node));
 	crs->create_data_sub_sql = psprintf(
 		"select shardman.replica_created_create_data_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
@@ -350,7 +343,7 @@ init_cp_state(CopyPartState *cps)
 		"drop publication if exists %s cascade;"
 		"create publication %s for table %s;"
 		"select shardman.drop_repslot('%s');"
-		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput');",
+		"select pg_create_logical_replication_slot('%s', 'pgoutput');",
 		cps->logname, cps->logname, cps->part_name, cps->logname, cps->logname
 		);
 	cps->relation = get_partition_relation(cps->part_name);
@@ -648,6 +641,12 @@ exec_move_part(MovePartState *mps)
 	mps->cp.exec_res = TASK_DONE;
 }
 
+/*
+ * Execute given statement in separate transactions. In case of any failure
+ * return false, destroy connection and configure_retry on given cps.
+ * This function is used only for internal SQL, where we guarantee no ';'
+ * in statements.
+ */
 static bool remote_exec(PGconn** conn, CopyPartState *cps, char* stmts)
 {
 	char* sql = stmts, *sep;
@@ -655,7 +654,8 @@ static bool remote_exec(PGconn** conn, CopyPartState *cps, char* stmts)
 	while ((sep = strchr(sql, ';')) != NULL) {
 		*sep = '\0';
 		res = PQexec(*conn, sql);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK && PQresultStatus(res) != PGRES_COMMAND_OK)
+		if (PQresultStatus(res) != PGRES_TUPLES_OK &&
+			PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
 			shmn_elog(LOG, "REMOTE_EXEC: execution of query '%s' failed for paritions %s: %s",
 					  sql, cps->part_name, PQerrorMessage(*conn));
@@ -686,7 +686,7 @@ mp_rebuild_lr(MovePartState *mps)
 		if (ensure_pqconn(&mps->prev_conn, mps->prev_connstr,
 					   (CopyPartState *) mps) == -1)
 			return -1;
-		if (!remote_exec(&mps->prev_conn, (CopyPartState *)mps, mps->prev_sql))
+		if (!remote_exec(&mps->prev_conn, (CopyPartState *) mps, mps->prev_sql))
 			return -1;
 		shmn_elog(DEBUG1, "mp %s: LR conf on prev done", mps->cp.part_name);
 	}
@@ -694,7 +694,7 @@ mp_rebuild_lr(MovePartState *mps)
 	if (ensure_pqconn_cp((CopyPartState *) mps,
 						 ENSURE_PQCONN_DST) == -1)
 		return -1;
-	if (!remote_exec(&mps->cp.dst_conn, (CopyPartState *)mps, mps->dst_sql))
+	if (!remote_exec(&mps->cp.dst_conn, (CopyPartState *) mps, mps->dst_sql))
 		return -1;
 	shmn_elog(DEBUG1, "mp %s: LR conf on dst done", mps->cp.part_name);
 
@@ -703,7 +703,7 @@ mp_rebuild_lr(MovePartState *mps)
 		if (ensure_pqconn(&mps->next_conn, mps->next_connstr,
 						  (CopyPartState *) mps) == -1)
 			return -1;
-		if (!remote_exec(&mps->next_conn, (CopyPartState *)mps, mps->next_sql))
+		if (!remote_exec(&mps->next_conn, (CopyPartState *) mps, mps->next_sql))
 			return -1;
 		shmn_elog(DEBUG1, "mp %s: LR conf on next done", mps->cp.part_name);
 	}
@@ -850,12 +850,12 @@ cp_start_tablesync(CopyPartState *cps)
 	if (check_sub_sync("shardman_meta_sub", &cps->src_conn, lord_lsn,
 					   "meta sub") == -1)
 	{
-		goto fail;
+		goto configure_retry_and_fail;
 	}
 	if (check_sub_sync("shardman_meta_sub", &cps->dst_conn, lord_lsn,
 					   "meta sub") == -1)
 	{
-		goto fail;
+		goto configure_retry_and_fail;
 	}
 
 	if (!remote_exec(&cps->dst_conn, cps, cps->dst_drop_sub_sql))
@@ -866,7 +866,7 @@ cp_start_tablesync(CopyPartState *cps)
 		goto fail;
 	shmn_elog(DEBUG1, "cp %s: pub and rs recreated on src", cps->part_name);
 
-	if (!remote_exec(&cps->dst_conn, cps, cps->dst_create_tab_and_sub_sql)) 
+	if (!remote_exec(&cps->dst_conn, cps, cps->dst_create_tab_and_sub_sql))
 		goto fail;
 	shmn_elog(DEBUG1, "cp %s: table & sub created on dst, tablesync started",
 			  cps->part_name);
@@ -874,8 +874,9 @@ cp_start_tablesync(CopyPartState *cps)
 	cps->curstep = COPYPART_START_FINALSYNC;
 	return 0;
 
-fail:
+configure_retry_and_fail:
 	configure_retry(cps, shardman_cmd_retry_naptime);
+fail:
 	return -1;
 }
 
@@ -1078,8 +1079,8 @@ ensure_pqconn(PGconn **conn, const char *connstr,
 		*conn = PQconnectdb(connstr);
 		if (PQstatus(*conn) != CONNECTION_OK)
 		{
-			shmn_elog(NOTICE, "Connection to node failed: %s",
-					  PQerrorMessage(*conn));
+			shmn_elog(NOTICE, "Connection to node %s failed: %s",
+					  connstr, PQerrorMessage(*conn));
 			reset_pqconn(conn);
 			configure_retry(cps, shardman_cmd_retry_naptime);
 			return -1;
