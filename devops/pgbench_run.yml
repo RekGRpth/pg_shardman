@@ -1,6 +1,5 @@
 ### Run pgbench benchmark.
-# Controlling vars: tmstmp (true/false), tname, clients, t (true/false),
-# seconds, xacts
+# Controlling vars: tmstmp (true/false), tname, pgbench_opts
 
 
 # set global var to use in all plays, oh my
@@ -20,10 +19,7 @@
 
 - hosts: workers
   vars:
-    clients: 1
-    seconds: 5
-    xacts: 100
-    t: False
+    pgbench_opts: ""
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
@@ -32,17 +28,10 @@
     command: >
       psql -p {{ pg_port }} -U {{ ansible_user }} -c "VACUUM;"
 
-  - name: run pgbench -T {{ seconds }}
+  - name: run pgbench --report-latencies --no-vacuum {{ pgbench_opts }}
     shell: >
       pgbench -p {{ pg_port }} --report-latencies --no-vacuum
-      -c {{ clients }} -T {{ seconds }} 2>&1 > "{{ test_id }}.out"
-    when: not ( t | bool )
-
-  - name: run pgbench -t {{ xacts }}
-    shell: >
-      pgbench -p {{ pg_port }} --report-latencies --no-vacuum
-      -c {{ clients }} -t {{ xacts }} 2>&1 > "{{ test_id }}.out"
-    when: t | bool
+      {{ pgbench_opts }} 2>&1 > "{{ test_id }}.out"
 
   - name: clear log dir
     local_action: file path="res/{{ test_id }}/" state=absent

@@ -59,7 +59,7 @@ nodes': ansible-playbook -i inventory_ec2/ psql.yml --limit 'workers' -e "cmd='\
 Create, fill and shard pgbench tables:
 ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=3 repfactor=0"
 Run pgbench test:
-ansible-playbook -i inventory_ec2/ pgbench_run.yml -e "tmstmp=false tname=test seconds=30"
+ansible-playbook -i inventory_ec2/ pgbench_run.yml -e 'tmstmp=false tname=t pgbench_opts="-c 1 -T 5"'
 Run pgbench on single worker (to estimate shardman overhead):
 ansible-playbook -i inventory_ec2/ pgbench_single.yml -e "scale=10 tmstmp=false tname=test t=false clients=8 seconds=15"
 
