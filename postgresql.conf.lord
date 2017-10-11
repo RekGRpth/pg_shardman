@@ -5,3 +5,7 @@ shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
 # shardlord bgw itself after this period of time if it has failed.
 shardman.cmd_retry_naptime = 500
 shardman.poll_interval = 500 # long operations poll frequency in milliseconds
+		       	     # If 'on', shardlord will add replicas to synchronous_standby_names while
+# creating and moving them. Note that currently sync replicas
+# are extremely slow.
+shardman.sync_replicas = off

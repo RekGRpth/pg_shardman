@@ -710,7 +710,8 @@ mp_rebuild_lr(MovePartState *mps)
 
 	if (mps->prev_node != SHMN_INVALID_NODE_ID)
 	{
-		if (!remote_exec(&mps->prev_conn, (CopyPartState *) mps,
+		if (shardman_sync_replicas &&
+			!remote_exec(&mps->prev_conn, (CopyPartState *) mps,
 						 mps->sync_standby_prev_sql))
 			return -1;
 		shmn_elog(DEBUG1, "mp %s: make sync standby on prev", mps->cp.part_name);
@@ -725,7 +726,8 @@ mp_rebuild_lr(MovePartState *mps)
 			return -1;
 		shmn_elog(DEBUG1, "mp %s: LR conf on next done", mps->cp.part_name);
 
-		if (!remote_exec(&mps->cp.dst_conn, (CopyPartState *) mps,
+		if (shardman_sync_replicas &&
+			!remote_exec(&mps->cp.dst_conn, (CopyPartState *) mps,
 						 mps->sync_standby_dst_sql))
 			return -1;
 	}
@@ -786,7 +788,8 @@ cr_rebuild_lr(CreateReplicaState *crs)
 		return -1;
 	shmn_elog(DEBUG1, "cr %s: create_data_sub done", crs->cp.part_name);
 
-	if (!remote_exec(&crs->cp.src_conn, (CopyPartState *) crs,
+	if (shardman_sync_replicas &&
+		!remote_exec(&crs->cp.src_conn, (CopyPartState *) crs,
 					 crs->sync_standby_sql))
 		return -1;
 	shmn_elog(DEBUG1, "cr %s: sync_standby done", crs->cp.part_name);

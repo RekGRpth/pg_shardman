@@ -80,6 +80,7 @@ extern char *shardman_shardlord_connstring;
 extern int shardman_cmd_retry_naptime;
 extern int shardman_poll_interval;
 extern int shardman_my_id;
+extern bool shardman_sync_replicas;
 
 typedef struct Cmd
 {

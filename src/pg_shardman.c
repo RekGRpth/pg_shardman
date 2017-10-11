@@ -65,6 +65,7 @@ char *shardman_shardlord_connstring;
 int shardman_cmd_retry_naptime;
 int shardman_poll_interval;
 int shardman_my_id;
+bool shardman_sync_replicas;
 
 /* Just global vars. */
 /* Connection to local server for LISTEN notifications. Is is global for easy
@@ -177,6 +178,16 @@ _PG_init()
 							PGC_SIGHUP,
 							0,
 							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("shardman.sync_replicas",
+							 "Make replicas synchronous?",
+							 NULL,
+							 &shardman_sync_replicas,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
+
 
 	if (shardman_shardlord)
 	{
