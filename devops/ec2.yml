@@ -26,6 +26,8 @@
 
   # good for both launch and termination
   - import_tasks: tasks/clean_ec2_cache.yml
+    tags:
+      - clean_ec2_cache
 
   - name: terminate all ec2 instances
     ec2:

@@ -17,11 +17,13 @@
   - set_fact: test_id="{{ test_id }}-{{ now.stdout }}"
     when: tmstmp
 
-- hosts: workers
-  vars:
-    pgbench_opts: ""
+# run pgbench on active_workers workers, by default all of them.
+- hosts: workers[0:{{ (active_workers | int ) - 1 }}]
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ fg_path }}:{{ ansible_env.PATH }}"
+  vars:
+    active_workers: "{{ groups['workers'] | length }}"
+    pgbench_opts: ""
 
   tasks:
   - name: vacuum

@@ -40,6 +40,8 @@ shardman_version_tag=master
 
 shardman_shardlord_connstring="host={{ shardlord_ip }} port={{ pg_port }} user={{ ansible_user }}"
 
+fg_path="{{ ansible_env.HOME }}/FlameGraph"
+
 test_id=""
 logs=logs
 
