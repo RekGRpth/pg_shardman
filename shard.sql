@@ -342,17 +342,22 @@ CREATE TRIGGER part_removed AFTER DELETE ON shardman.partitions
 -- fire trigger only on either shardlord and worker nodes
 ALTER TABLE shardman.partitions ENABLE ALWAYS TRIGGER part_removed;
 
-
-
-
 -- Executed on newtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_drop_cp_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
+	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
+	rel_name text := substring(part_name from '^[^_]*');
 BEGIN
+	RAISE DEBUG '[SHMN] replica_created_drop_cp_sub(%,%,%): create table % for relation %',
+		part_name, oldtail, newtail, lname, rel_name;
 	-- Drop subscription used for copy
 	PERFORM shardman.eliminate_sub(cp_logname);
+/*
+	EXECUTE format('create table %s (like %s including defaults including indexes including storage)',
+		lname, rel_name);
+*/
 END $$ LANGUAGE plpgsql;
 
 -- Executed on oldtail node, see cr_rebuild_lr
@@ -361,23 +366,101 @@ CREATE FUNCTION replica_created_create_data_pub(
 DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
 	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
+	srv_name text := 'node_' || newtail;
+	rel_name text := substring(part_name from '^[^_]*');
+    src text;
+    dst text;
+    pk text;
 BEGIN
+	EXECUTE format('CREATE FOREIGN TABLE %s_fdw %s SERVER %I OPTIONS (table_name %L)',
+				   lname,
+				   (SELECT
+						shardman.reconstruct_table_attrs(
+							format('%I', rel_name))),
+				   srv_name,
+				   part_name);
+
+	SELECT INTO dst, src
+          string_agg(quote_ident(attname), ', '),
+		  string_agg('NEW.' || quote_ident(attname), ', ')
+    FROM   pg_attribute
+    WHERE  attrelid = rel_name::regclass
+    AND    NOT attisdropped   -- no dropped (dead) columns
+    AND    attnum > 0;
+
+	SELECT INTO pk
+          string_agg(quote_ident(a.attname) || '=OLD.'|| quote_ident(a.attname), ' AND ')
+	FROM   pg_index i
+	JOIN   pg_attribute a ON a.attrelid = i.indrelid
+                     AND a.attnum = ANY(i.indkey)
+    WHERE  i.indrelid = rel_name::regclass
+    AND    i.indisprimary;
+
+	EXECUTE format(
+		'create or replace function %s_update() returns trigger as ''
+		 begin
+		    UPDATE public.%s_fdw SET (%s) = (%s) WHERE %s;
+			return new;
+	     end; '' LANGUAGE plpgsql;
+ 		 create trigger on_%s_update after update on %s for each row execute procedure %s_update()',
+		lname, lname, dst, src, pk,
+		lname, part_name, lname);
+
+	EXECUTE format(
+		'create or replace function %s_insert() returns trigger as ''
+		 begin
+		    INSERT INTO public.%s_fdw (%s) VALUES (%s);
+			return new;
+	     end; '' LANGUAGE plpgsql;
+ 		 create trigger on_%s_insert after insert on %s for each row execute procedure %s_insert()',
+		lname, lname, dst, src,
+		lname, part_name, lname);
+
+	EXECUTE format(
+		'create or replace function %s_delete() returns trigger as ''
+		 begin
+		    DELETE FROM public.%s_fdw WHERE %s;
+			return new;
+	     end; '' LANGUAGE plpgsql;
+ 		 create trigger on_%s_delete after delete on %s for each row execute procedure %s_delete()',
+		lname, lname, pk,
+		lname, part_name, lname);
+
+/*
+	EXECUTE format(
+		'CREATE OR REPLACE RULE %s_insert AS ON INSERT TO %s DO ALSO INSERT INTO %s_fdw (%s) values (%s)',
+		lname, part_name, lname, dst, src);
+
+	EXECUTE format(
+		'CREATE OR REPLACE RULE %s_update AS ON UPDATE TO %s DO ALSO UPDATE %s_fdw SET (%s) = (%s) WHERE %s',
+		lname, part_name, lname, dst, src, pk);
+
+	EXECUTE format(
+		'CREATE OR REPLACE RULE %s_delete AS ON DELETE TO %s DO ALSO DELETE FROM %s_fdw WHERE %s',
+		lname, part_name, lname, pk);
+*/
+
+/* TBR:
     PERFORM shardman.drop_repslot(lname);
 	-- Drop publication & repslot used for copy
 	PERFORM shardman.drop_repslot_and_pub(cp_logname);
 	-- Create publication for new data channel
 	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
 	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, part_name);
+*/
 END $$ LANGUAGE plpgsql;
 
 -- Executed on newtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_create_data_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
+/* TBR:
 DECLARE
 	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
 	oldtail_connstr text := shardman.get_worker_node_connstr(oldtail);
+*/
 BEGIN
 	PERFORM shardman.readonly_replica_on(part_name::regclass);
+/* TBR:
 	-- Create subscription for new data channel
 	-- It should never exist at this moment, but just in case...
 	PERFORM shardman.eliminate_sub(lname);
@@ -389,6 +472,7 @@ BEGIN
 		'CREATE SUBSCRIPTION %I connection %L
 		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = local);',
 		lname, oldtail_connstr, lname, lname);
+*/
 END $$ LANGUAGE plpgsql;
 
 -- Otherwise partitioned tables on worker nodes not will be dropped properly,
@@ -407,19 +491,19 @@ BEGIN
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Drop all foreign server's options. Yes, I don't know simpler ways.
-CREATE FUNCTION reset_foreign_server_opts(server_name name) RETURNS void AS $$
+CREATE FUNCTION reset_foreign_server_opts(srv_name name) RETURNS void AS $$
 DECLARE
 	opts text[];
 	opt text;
 	opt_key text;
 BEGIN
-	ASSERT EXISTS (SELECT 1 FROM pg_foreign_server WHERE srvname = server_name);
+	ASSERT EXISTS (SELECT 1 FROM pg_foreign_server WHERE srvname = srv_name);
 	EXECUTE format($q$SELECT coalesce(srvoptions, '{}'::text[]) FROM
 									  pg_foreign_server WHERE srvname = %L$q$,
-									  server_name) INTO opts;
+									  srv_name) INTO opts;
 	FOREACH opt IN ARRAY opts LOOP
 		opt_key := regexp_replace(substring(opt from '^.*?='), '=$', '');
-		EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', server_name, opt_key);
+		EXECUTE format('ALTER SERVER %I OPTIONS (DROP %s);', srv_name, opt_key);
 	END LOOP;
 END $$ LANGUAGE plpgsql STRICT;
 -- Same for resetting user mapping opts
@@ -451,34 +535,34 @@ DECLARE
 	connstring text := shardman.get_worker_node_connstr(node_id);
 	server_opts text;
 	um_opts text;
-	server_name text := 'node_' || node_id;
+	srv_name text := 'node_' || node_id;
 BEGIN
 	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(connstring)
 		INTO server_opts, um_opts;
-	IF NOT EXISTS (SELECT 1 from pg_foreign_server WHERE srvname = server_name)
+	IF NOT EXISTS (SELECT 1 from pg_foreign_server WHERE srvname = srv_name)
 	THEN
 		RAISE DEBUG '[SHMN] Create foreign server % for with options %',
-		  server_name, server_opts;
+		  srv_name, server_opts;
 		EXECUTE format('CREATE SERVER %I FOREIGN DATA WRAPPER postgres_fdw %s;',
-		  server_name, server_opts);
+		  srv_name, server_opts);
 		-- TODO: support not only CURRENT_USER
 		EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER %I %s;',
-			server_name, um_opts);
+			srv_name, um_opts);
 	ELSE
 		-- ALTER SERVER & UM doesn't support dropping all params. We could
 		-- recreate them, but since these hacks already exist for legacy code,
 		-- we can use them as well.
 		RAISE DEBUG 'Using existing foreign server % with options %',
-			server_name, server_opts;
-		PERFORM shardman.reset_foreign_server_opts(server_name);
-		PERFORM shardman.reset_um_opts(server_name, current_user::regrole);
+			srv_name, server_opts;
+		PERFORM shardman.reset_foreign_server_opts(srv_name);
+		PERFORM shardman.reset_um_opts(srv_name, current_user::regrole);
 
 		IF server_opts != '' THEN
-		   EXECUTE format('ALTER SERVER %I %s', server_name, server_opts);
+		   EXECUTE format('ALTER SERVER %I %s', srv_name, server_opts);
 		END IF;
 		IF um_opts != '' THEN
 		   EXECUTE format('ALTER USER MAPPING FOR CURRENT_USER SERVER %I %s',
-					   server_name, um_opts);
+					   srv_name, um_opts);
 		END IF;
  	END IF;
 END $$ LANGUAGE plpgsql STRICT;
@@ -533,7 +617,7 @@ CREATE FUNCTION replace_usual_part_with_foreign(part partitions)
 DECLARE
 	connstring text;
 	fdw_part_name text := shardman.get_fdw_part_name(part.part_name);
-	server_name text := 'node_' || part.owner;
+	srv_name text := 'node_' || part.owner;
 BEGIN
 	PERFORM shardman.ensure_foreign_server(part.owner);
 
@@ -557,7 +641,7 @@ BEGIN
 				   (SELECT
 						shardman.reconstruct_table_attrs(
 							format('%I', part.relation))),
-							server_name,
+							srv_name,
 							part.part_name);
 	-- replace local partition with foreign table
 	EXECUTE format('SELECT replace_hash_partition(%L, %L)',
@@ -809,7 +893,9 @@ CREATE FUNCTION remove_sync_standby_c(standby text) RETURNS text
 
 CREATE FUNCTION set_sync_standbys(standby text) RETURNS void AS $$
 BEGIN
+/* TBR:
 	PERFORM shardman.alter_system_c('synchronous_standby_names', standby);
 	PERFORM pg_reload_conf();
+*/
 	RAISE DEBUG '[SHMN] sync_standbys set to %', standby;
 END $$ LANGUAGE plpgsql STRICT;
