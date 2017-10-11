@@ -223,10 +223,8 @@ rebalance(Cmd *cmd)
 		int32 worker;
 		MovePartState *mps = palloc0(sizeof(MovePartState));
 
-		do {
-			worker = workers[worker_idx];
-			worker_idx = (worker_idx + 1) % num_workers;
-		} while (node_has_partition(worker, part.part_name));
+		worker = workers[worker_idx];
+		worker_idx = (worker_idx + 1) % num_workers;
 
 		init_mp_state(mps, part.part_name, part.owner, worker);
 		tasks[part_idx] = (CopyPartState *) mps;
