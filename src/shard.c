@@ -255,6 +255,8 @@ set_replevel(Cmd *cmd)
 	int ntasks;
 	int i;
 
+	pg_usleep(10 * 1000000L); /* Wait 10 seconds to make asynchronous replication complete it work and all trigers fired */
+
 	if (num_workers == 0)
 	{
 		elog(WARNING, "Set replevel on table %s failed: no active workers",

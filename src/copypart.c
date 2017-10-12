@@ -81,13 +81,17 @@
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "miscadmin.h"
 #include "libpq-fe.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
 #include "catalog/pg_subscription_rel.h"
+#include "utils/snapmgr.h"
 #include "utils/pg_lsn.h"
 #include "utils/builtins.h"
 #include "lib/ilist.h"
+#include "executor/spi.h"
 
 #include <unistd.h>
 #include <time.h>
@@ -287,14 +291,10 @@ init_cr_state(CreateReplicaState *crs, const char *part_name, int32 dst_node)
 		"select shardman.replica_created_drop_cp_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
 
-	crs->create_data_pub_sql =
-		psprintf("select shardman.replica_created_create_data_pub('%s', %d, %d);"
-				 " select pg_create_logical_replication_slot('%s', 'pgoutput');",
-				 part_name, crs->cp.src_node, crs->cp.dst_node,
-				 get_data_lname(part_name, crs->cp.src_node, crs->cp.dst_node));
 	crs->create_data_sub_sql = psprintf(
 		"select shardman.replica_created_create_data_sub('%s', %d, %d);",
 		part_name, crs->cp.src_node, crs->cp.dst_node);
+
 	crs->sync_standby_sql = psprintf(
 		"select shardman.ensure_sync_standby('%s');"
 		" select shardman.readonly_table_off('%s'::regclass);",
@@ -755,6 +755,50 @@ exec_create_replica(CreateReplicaState *crs)
 	crs->cp.exec_res = TASK_DONE;
 }
 
+static bool create_triggers(CreateReplicaState *crs)
+{
+	int	 i;
+	int	 e;
+	SPI_XACT_STATUS;
+	SPI_PROLOG;
+	e = SPI_execute("select id,connstring from shardman.nodes where worker_status='active' and not shardlord", true, 0);
+	if (e < 0)
+		shmn_elog(FATAL, "Failed to select from nodes table");
+	for (i = 0; i < SPI_processed; i++)
+	{
+		bool isnull;
+		int32 node_id =  DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+													 SPI_tuptable->tupdesc,
+													 1,
+													 &isnull));
+		char* connstr = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+		char* sql = psprintf("select shardman.replica_created_create_data_pub('%s', %d, %d, %d)",
+							 crs->cp.part_name, node_id, crs->cp.src_node, crs->cp.dst_node);
+		PGconn* con = NULL;
+		if (ensure_pqconn(&con, connstr, &crs->cp) == 0)
+		{
+			PGresult *res = PQexec(con, sql);
+			if (PQresultStatus(res) == PGRES_TUPLES_OK || PQresultStatus(res) == PGRES_COMMAND_OK) {
+				elog(LOG, "Create trigger for %s on node %d, origin=%d, replica=%d", crs->cp.part_name, node_id, crs->cp.src_node, crs->cp.dst_node);
+				PQclear(res);
+				PQfinish(con);
+				continue;
+			}
+			shmn_elog(WARNING, "Failed to create trigger at node %d connection string %s: %s", node_id, connstr, PQerrorMessage(con));
+			PQclear(res);
+			PQfinish(con);
+		} else {
+			shmn_elog(WARNING, "Failed to establish connection with node %d using connectoin string %s", node_id, connstr);
+		}
+		configure_retry(&crs->cp, shardman_cmd_retry_naptime);
+		SPI_EPILOG;
+		return false;
+	}
+	elog(LOG, "Finish creation of triggers for partition %s, origin=%d, replica=%d", crs->cp.part_name, crs->cp.src_node, crs->cp.dst_node);
+	SPI_EPILOG;
+	return true;
+}
+
 /*
  * Reconfigure LR channels for freshly created replica.
  *
@@ -777,7 +821,7 @@ cr_rebuild_lr(CreateReplicaState *crs)
 		return -1;
 	shmn_elog(DEBUG1, "cr %s: drop_cp_sub done", crs->cp.part_name);
 
-	if (!remote_exec(&crs->cp.src_conn, (CopyPartState *) crs, crs->create_data_pub_sql))
+	if (!create_triggers(crs))
 		return -1;
 	shmn_elog(DEBUG1, "cr %s: create_data_pub done", crs->cp.part_name);
 

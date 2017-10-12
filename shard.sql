@@ -354,32 +354,42 @@ BEGIN
 		part_name, oldtail, newtail, lname, rel_name;
 	-- Drop subscription used for copy
 	PERFORM shardman.eliminate_sub(cp_logname);
-/*
-	EXECUTE format('create table %s (like %s including defaults including indexes including storage)',
-		lname, rel_name);
-*/
 END $$ LANGUAGE plpgsql;
 
 -- Executed on oldtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_create_data_pub(
-	part_name name, oldtail int, newtail int) RETURNS void AS $$
+	part_name name, node_id int, orig_node_id int, repl_node_id int) RETURNS void AS $$
 DECLARE
-	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
-	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
-	srv_name text := 'node_' || newtail;
+	lname name := shardman.get_data_lname(part_name, node_id, repl_node_id);
+	srv_name text := 'node_' || repl_node_id;
 	rel_name text := substring(part_name from '^[^_]*');
+	dst_part_name text;
+	src_part_name text;
     src text;
     dst text;
     pk text;
 BEGIN
-	EXECUTE format('CREATE FOREIGN TABLE %s_fdw %s SERVER %I OPTIONS (table_name %L)',
-				   lname,
+	RAISE DEBUG '[SHMN] replica_created_create_data_pub(%,%,%,%)',
+		  part_name,node_id,orig_node_id,repl_node_id;
+
+	IF orig_node_id=node_id THEN
+	    src_part_name := part_name;
+    ELSE
+	    src_part_name := part_name||'_fdw';
+	END IF;
+	IF repl_node_id=node_id THEN
+	    -- it is node where replica is located
+	    dst_part_name := part_name;
+	ELSE
+		dst_part_name := lname||'_fdw';
+        EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %I OPTIONS (table_name %L)',
+	   			   dst_part_name,
 				   (SELECT
 						shardman.reconstruct_table_attrs(
 							format('%I', rel_name))),
 				   srv_name,
 				   part_name);
-
+    END IF;
 	SELECT INTO dst, src
           string_agg(quote_ident(attname), ', '),
 		  string_agg('NEW.' || quote_ident(attname), ', ')
@@ -399,80 +409,39 @@ BEGIN
 	EXECUTE format(
 		'create or replace function %s_update() returns trigger as ''
 		 begin
-		    UPDATE public.%s_fdw SET (%s) = (%s) WHERE %s;
+		    UPDATE public.%I SET (%s) = (%s) WHERE %s;
 			return new;
 	     end; '' LANGUAGE plpgsql;
- 		 create trigger on_%s_update after update on %s for each row execute procedure %s_update()',
-		lname, lname, dst, src, pk,
-		lname, part_name, lname);
+ 		 create trigger on_%s_update after update on %I for each row when (current_setting(''application_name'') <> ''postgres_fdw'') execute procedure %s_update()',
+		lname, dst_part_name, dst, src, pk,
+		lname, src_part_name, lname);
 
 	EXECUTE format(
 		'create or replace function %s_insert() returns trigger as ''
 		 begin
-		    INSERT INTO public.%s_fdw (%s) VALUES (%s);
+		    INSERT INTO public.%I (%s) VALUES (%s);
 			return new;
 	     end; '' LANGUAGE plpgsql;
- 		 create trigger on_%s_insert after insert on %s for each row execute procedure %s_insert()',
-		lname, lname, dst, src,
-		lname, part_name, lname);
+ 		 create trigger on_%s_insert after insert on %I for each row when( current_setting(''application_name'') <> ''postgres_fdw'') execute procedure %s_insert()',
+		lname, dst_part_name, dst, src,
+		lname, src_part_name, lname);
 
 	EXECUTE format(
 		'create or replace function %s_delete() returns trigger as ''
 		 begin
-		    DELETE FROM public.%s_fdw WHERE %s;
+		    DELETE FROM public.%I WHERE %s;
 			return new;
 	     end; '' LANGUAGE plpgsql;
- 		 create trigger on_%s_delete after delete on %s for each row execute procedure %s_delete()',
-		lname, lname, pk,
-		lname, part_name, lname);
-
-/*
-	EXECUTE format(
-		'CREATE OR REPLACE RULE %s_insert AS ON INSERT TO %s DO ALSO INSERT INTO %s_fdw (%s) values (%s)',
-		lname, part_name, lname, dst, src);
-
-	EXECUTE format(
-		'CREATE OR REPLACE RULE %s_update AS ON UPDATE TO %s DO ALSO UPDATE %s_fdw SET (%s) = (%s) WHERE %s',
-		lname, part_name, lname, dst, src, pk);
-
-	EXECUTE format(
-		'CREATE OR REPLACE RULE %s_delete AS ON DELETE TO %s DO ALSO DELETE FROM %s_fdw WHERE %s',
-		lname, part_name, lname, pk);
-*/
-
-/* TBR:
-    PERFORM shardman.drop_repslot(lname);
-	-- Drop publication & repslot used for copy
-	PERFORM shardman.drop_repslot_and_pub(cp_logname);
-	-- Create publication for new data channel
-	EXECUTE format('DROP PUBLICATION IF EXISTS %I', lname);
-	EXECUTE format('CREATE PUBLICATION %I FOR TABLE %I', lname, part_name);
-*/
+ 		 create trigger on_%s_delete after delete on %I for each row when (current_setting(''application_name'') <> ''postgres_fdw'') execute procedure %s_delete()',
+		lname, dst_part_name, pk,
+		lname, src_part_name, lname);
 END $$ LANGUAGE plpgsql;
 
 -- Executed on newtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_create_data_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
-/* TBR:
-DECLARE
-	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
-	oldtail_connstr text := shardman.get_worker_node_connstr(oldtail);
-*/
 BEGIN
 	PERFORM shardman.readonly_replica_on(part_name::regclass);
-/* TBR:
-	-- Create subscription for new data channel
-	-- It should never exist at this moment, but just in case...
-	PERFORM shardman.eliminate_sub(lname);
-	-- It is important to set synchronous_commit to local in apply
-	-- worker. Otherwise deadlocks arise because currently in sync replication
-	-- PG waits for any transaction remote commit regardless of which relations
-	-- it touches.
-	EXECUTE format(
-		'CREATE SUBSCRIPTION %I connection %L
-		PUBLICATION %I with (create_slot = false, slot_name = %L, copy_data = false, synchronous_commit = local);',
-		lname, oldtail_connstr, lname, lname);
-*/
 END $$ LANGUAGE plpgsql;
 
 -- Otherwise partitioned tables on worker nodes not will be dropped properly,
@@ -893,9 +862,5 @@ CREATE FUNCTION remove_sync_standby_c(standby text) RETURNS text
 
 CREATE FUNCTION set_sync_standbys(standby text) RETURNS void AS $$
 BEGIN
-/* TBR:
-	PERFORM shardman.alter_system_c('synchronous_standby_names', standby);
-	PERFORM pg_reload_conf();
-*/
 	RAISE DEBUG '[SHMN] sync_standbys set to %', standby;
 END $$ LANGUAGE plpgsql STRICT;
