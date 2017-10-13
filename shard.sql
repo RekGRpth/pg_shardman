@@ -368,14 +368,17 @@ DECLARE
     src text;
     dst text;
     pk text;
+    trigger_cond text;
 BEGIN
 	RAISE DEBUG '[SHMN] replica_created_create_data_pub(%,%,%,%)',
 		  part_name,node_id,orig_node_id,repl_node_id;
 
 	IF orig_node_id=node_id THEN
 	    src_part_name := part_name;
+		trigger_cond := 'when (current_setting(''application_name'') <> ''postgres_fdw'')';
     ELSE
 	    src_part_name := part_name||'_fdw';
+		trigger_cond := '';
 	END IF;
 	IF repl_node_id=node_id THEN
 	    -- it is node where replica is located
@@ -409,32 +412,32 @@ BEGIN
 	EXECUTE format(
 		'create or replace function %s_update() returns trigger as ''
 		 begin
-		    UPDATE public.%I SET (%s) = (%s) WHERE %s;
+		    UPDATE %I SET (%s) = (%s) WHERE %s;
 			return new;
 	     end; '' LANGUAGE plpgsql;
- 		 create trigger on_%s_update after update on %I for each row when (current_setting(''application_name'') <> ''postgres_fdw'') execute procedure %s_update()',
+ 		 create trigger on_%s_update after update on %I for each row %s execute procedure %s_update()',
 		lname, dst_part_name, dst, src, pk,
-		lname, src_part_name, lname);
+		lname, src_part_name, trigger_cond, lname);
 
 	EXECUTE format(
 		'create or replace function %s_insert() returns trigger as ''
 		 begin
-		    INSERT INTO public.%I (%s) VALUES (%s);
+		    INSERT INTO %I (%s) VALUES (%s);
 			return new;
 	     end; '' LANGUAGE plpgsql;
- 		 create trigger on_%s_insert after insert on %I for each row when( current_setting(''application_name'') <> ''postgres_fdw'') execute procedure %s_insert()',
+ 		 create trigger on_%s_insert after insert on %I for each row %s execute procedure %s_insert()',
 		lname, dst_part_name, dst, src,
-		lname, src_part_name, lname);
+		lname, src_part_name, trigger_cond, lname);
 
 	EXECUTE format(
 		'create or replace function %s_delete() returns trigger as ''
 		 begin
-		    DELETE FROM public.%I WHERE %s;
+		    DELETE FROM %I WHERE %s;
 			return new;
 	     end; '' LANGUAGE plpgsql;
- 		 create trigger on_%s_delete after delete on %I for each row when (current_setting(''application_name'') <> ''postgres_fdw'') execute procedure %s_delete()',
+ 		 create trigger on_%s_delete after delete on %I for each row %s execute procedure %s_delete()',
 		lname, dst_part_name, pk,
-		lname, src_part_name, lname);
+		lname, src_part_name, trigger_cond, lname);
 END $$ LANGUAGE plpgsql;
 
 -- Executed on newtail node, see cr_rebuild_lr
