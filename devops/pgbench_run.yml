@@ -98,4 +98,4 @@
     register: tps
     run_once: true
 
-  - debug: msg="{{ tps.stdout }}. test_id {{ test_id }} "
+  - debug: msg="{{ tps.stdout_lines }}. test_id {{ test_id }} "

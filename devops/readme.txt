@@ -57,13 +57,13 @@ Read nodes table on workers:
 nodes': ansible-playbook -i inventory_ec2/ psql.yml --limit 'workers' -e "cmd='\'table shardman.nodes\''"
 
 Create, fill and shard pgbench tables:
-ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=3 repfactor=0"
+ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=3 repfactor=0 rebalance=true"
 Run pgbench test:
 ansible-playbook -i inventory_ec2/ pgbench_run.yml -e 'tmstmp=false tname=t pgbench_opts="-c 1 -T 5"'
 Run pgbench only on node:
 ansible-playbook -i inventory_ec2/ pgbench_run.yml -e 'tmstmp=false tname=t pgbench_opts="-c 1 -T 2" active_workers=1'
 Run pgbench on single node without shardman (to estimate shardman overhead):
-ansible-playbook -i inventory_ec2/ pgbench_single.yml -e "scale=10 tmstmp=false tname=test t=false clients=8 seconds=15"
+ansible-playbook -i inventory_ec2/ pgbench_single.yml -e 'scale=10 tmstmp=false tname=test t=false pgbench_opts="-c 1 -T 5"'
 
 Gather logs to ./logs:
 ansible-playbook -i inventory_ec2/ logs.yml

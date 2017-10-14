@@ -156,6 +156,7 @@
     lineinfile: dest=~/.bashrc line="export PATH={{ pg_dst }}/bin:$PATH"
     tags:
       - set_path
+      - ars
 
   - name: allow ptrace for non-root users
     lineinfile: dest=/etc/sysctl.d/10-ptrace.conf

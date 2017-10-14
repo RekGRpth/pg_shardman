@@ -25,6 +25,7 @@
     scale: 10
     nparts: 10
     repfactor: 0
+    rebalance: true
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
@@ -59,9 +60,9 @@
   - name: create_hash_partitions, nparts {{ nparts }}
     command: >
       psql -p {{ pg_port }} -c "
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_accounts', 'aid', {{ nparts }});
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_tellers', 'tid', {{ nparts }});
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_branches', 'bid', {{ nparts }});
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_accounts', 'aid', {{ nparts }}, {{ rebalance }});
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_tellers', 'tid', {{ nparts }}, {{ rebalance }});
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_branches', 'bid', {{ nparts }}, {{ rebalance }});
       "
     tags:
       - create_hash_partitions

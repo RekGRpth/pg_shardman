@@ -26,17 +26,9 @@
     command: >
       pgbench -p {{ pg_port }} -s {{ scale }} -i
 
-  - name: run pgbench -T {{ seconds }}
+  - name: run pgbench --report-latencies {{ pgbench_opts }}
     shell: >
-      pgbench -p {{ pg_port }} --report-latencies
-      -c {{ clients }} -T {{ seconds }} 2>&1 > "pgbench.out"
-    when: not ( t | bool )
-
-  - name: run pgbench -t {{ xacts }}
-    shell: >
-      pgbench -p {{ pg_port }} --report-latencies
-      -c {{ clients }} -t {{ xacts }} 2>&1 > "pgbench.out"
-    when: t | bool
+      pgbench -p {{ pg_port }} --report-latencies {{ pgbench_opts }} 2>&1 > "pgbench.out"
 
   - name: fetch pgbench exec time
     fetch:
@@ -52,4 +44,4 @@
     register: tps
     run_once: true
 
-  - debug: msg={{ tps.stdout }}
+  - debug: msg={{ tps.stdout_lines }}
