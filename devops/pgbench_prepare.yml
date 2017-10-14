@@ -20,12 +20,20 @@
     tags:
       - pgbench_history
 
+  - name: initialize pgbench everywhere to avoid count(*) failure, scale {{ scale }}
+    command: >
+      pgbench -p {{ pg_port }} -s {{ scale }} -i
+    tags:
+      - pgbench_init
+
+
 - hosts: init_node
   vars:
     scale: 10
     nparts: 10
     repfactor: 0
     rebalance: true
+    tellers_branches: true
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
@@ -57,27 +65,26 @@
     tags:
       - pgbench_init
 
-  - name: create_hash_partitions, nparts {{ nparts }}
+  - name: create_hash_partitions for pgbench_accounts, nparts {{ nparts }}
     command: >
       psql -p {{ pg_port }} -c "
       select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_accounts', 'aid', {{ nparts }}, {{ rebalance }});
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_tellers', 'tid', {{ nparts }}, {{ rebalance }});
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_branches', 'bid', {{ nparts }}, {{ rebalance }});
+      select shardman.set_replevel('pgbench_accounts', {{ repfactor }});
       "
     tags:
-      - create_hash_partitions
+      - create_hash_partitions_accounts
 
-  - name: set_repfactor, repfactor {{ repfactor }}
+  - name: create_hash_partitions for branches & tellers, nparts {{ nparts }}
     command: >
       psql -p {{ pg_port }} -c "
-      select shardman.set_replevel('pgbench_accounts', {{ repfactor }});
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_tellers', 'tid', {{ nparts }}, {{ rebalance }});
+      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_branches', 'bid', {{ nparts }}, {{ rebalance }});
       select shardman.set_replevel('pgbench_tellers', {{ repfactor }});
       select shardman.set_replevel('pgbench_branches', {{ repfactor }});
       "
     tags:
-      - set_repfactor
-    when: repfactor != 0
-
+      - create_hash_partitions_tellers_branches
+    when: tellers_branches | bool
 
 - hosts: shardlord
   environment:
