@@ -28,10 +28,14 @@ checkpoint_timeout = 60min
 max_wal_size = 100GB
 fsync = on
 autovacuum = off
-# synchronous_commit = on
-synchronous_commit = local
+synchronous_commit = on
+# synchronous_commit = local
 
 shardman.shardlord_dbname = ubuntu
 shardman.poll_interval = 500 # long operations poll frequency in milliseconds
 
-shardman.sync_replicas = off
+shardman.sync_replicas = on
+
+max_prepared_transactions = 100000
+postgres_fdw.use_2pc = on
+postgres_fdw.use_repeatable_read = off

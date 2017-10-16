@@ -49,7 +49,7 @@
     tags:
       - build_pg
 
-  - name: clone postgres sources
+  - name: clone postgres sources {{ pg_repo }}/{{ pg_version_tag }}
     git: repo={{pg_repo}}
       dest={{pg_src}}
       version={{pg_version_tag}}
@@ -93,7 +93,7 @@
     tags:
       - build_pathman
 
-  - name: clone shardman
+  - name: clone shardman {{ shardman_repo }}/{{ shardman_version_tag }}
     git: repo={{shardman_repo}}
       dest={{shardman_src}}
       version={{shardman_version_tag}}
@@ -193,7 +193,7 @@
       accept_hostkey=True
     tags: perf
 
-  - name: set PATH in .bashrc
+  - name: set PATH to flamegraph in .bashrc
     lineinfile: dest=~/.bashrc line="export PATH={{ fg_path }}:$PATH"
     tags:
       - perf

@@ -20,6 +20,8 @@ makejobs=4
 # pg_version_tag=REL_10_STABLE
 pg_repo=https://github.com/arssher/postgresql
 pg_version_tag=postgres_fdw_read_committed
+# postgres_fdw 2pc and triggers on fdw tables
+pg_version_tag=pg_shardman_tbr_2pc
 # pg_prefix="{{ansible_env.HOME}}/pg"
 pg_prefix="/tmp/pg"
 pg_src="{{pg_prefix}}/src"
@@ -37,6 +39,8 @@ pathman_version_tag=master
 shardman_repo=https://github.com/postgrespro/pg_shardman.git
 shardman_src="{{pg_prefix}}/pg_shardman"
 shardman_version_tag=master
+# trigger based replication
+# shardman_version_tag=tbr-2pc
 
 shardman_shardlord_connstring="host={{ shardlord_ip }} port={{ pg_port }} user={{ ansible_user }}"
 
