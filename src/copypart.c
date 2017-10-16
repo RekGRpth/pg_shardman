@@ -772,9 +772,12 @@ static bool create_triggers(CreateReplicaState *crs)
 													 1,
 													 &isnull));
 		char* connstr = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
-		char* sql = psprintf("select shardman.replica_created_create_data_pub('%s', %d, %d, %d)",
-							 crs->cp.part_name, node_id, crs->cp.src_node, crs->cp.dst_node);
+		char* sql;
 		PGconn* con = NULL;
+		char const* suffix = strrchr(crs->cp.part_name, '_');
+		Assert(suffix != NULL);
+		sql = psprintf("select shardman.replica_created_create_data_pub('%.*s', '%s', %d, %d, %d)",
+					   (int)(suffix - crs->cp.part_name), crs->cp.part_name, crs->cp.part_name, node_id, crs->cp.src_node, crs->cp.dst_node);
 		if (ensure_pqconn(&con, connstr, &crs->cp) == 0)
 		{
 			PGresult *res = PQexec(con, sql);

@@ -347,22 +347,18 @@ CREATE FUNCTION replica_created_drop_cp_sub(
 	part_name name, oldtail int, newtail int) RETURNS void AS $$
 DECLARE
 	cp_logname text := shardman.get_cp_logname(part_name, oldtail, newtail);
-	lname name := shardman.get_data_lname(part_name, oldtail, newtail);
-	rel_name text := substring(part_name from '^[^_]*');
 BEGIN
-	RAISE DEBUG '[SHMN] replica_created_drop_cp_sub(%,%,%): create table % for relation %',
-		part_name, oldtail, newtail, lname, rel_name;
+	RAISE DEBUG '[SHMN] replica_created_drop_cp_sub(%,%,%)', part_name, oldtail, newtail;
 	-- Drop subscription used for copy
 	PERFORM shardman.eliminate_sub(cp_logname);
 END $$ LANGUAGE plpgsql;
 
 -- Executed on oldtail node, see cr_rebuild_lr
 CREATE FUNCTION replica_created_create_data_pub(
-	part_name name, node_id int, orig_node_id int, repl_node_id int) RETURNS void AS $$
+	rel_name name, part_name name, node_id int, orig_node_id int, repl_node_id int) RETURNS void AS $$
 DECLARE
 	lname name := shardman.get_data_lname(part_name, node_id, repl_node_id);
 	srv_name text := 'node_' || repl_node_id;
-	rel_name text := substring(part_name from '^[^_]*');
 	dst_part_name text;
 	src_part_name text;
     src text;
