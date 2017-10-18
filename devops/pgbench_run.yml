@@ -53,7 +53,7 @@
 
   - name: calc sum tps
     local_action: >
-      shell echo "sum: `awk '{ sum += $1 } END { print sum }'
+      shell echo -e "sum: \n`awk '{ sum += $1 } END { print sum }'
       res/{{ test_id }}/tps.txt`" >> res/{{test_id}}/tps.txt
     run_once: true
 
@@ -63,10 +63,14 @@
       dest: res/{{ test_id }}/postgresql.conf.worker
       flat: yes
     run_once: true
+    tags:
+      - dump
 
   - name: collect pg_config
     shell: pg_config > "pg_config.out"
     run_once: true
+    tags:
+      - dump
 
   - name: collect pg_config
     fetch:
@@ -74,10 +78,13 @@
       dest: res/{{ test_id }}/pg_config.out
       flat: yes
     run_once: true
+    tags:
+      - dump
 
 - import_playbook: logs.yml logs=res/{{ test_id }}/logs
   tags:
     - logs
+    - dump
 
 - hosts: shardlord
   tasks:
@@ -87,15 +94,19 @@
       dest: res/{{ test_id }}/postgresql.conf.lord
       flat: yes
     run_once: true
+    tags:
+      - dump
 
 - hosts: localhost
   tasks:
   - name: Dump all vars
     action: template src=templates/dumpallvars.j2 dest=res/{{ test_id }}/allvars.txt
+    tags:
+      - dump
 
   - name: print tps
     local_action: shell cat res/{{ test_id }}/tps.txt
     register: tps
     run_once: true
 
-  - debug: msg="{{ tps.stdout_lines }}. test_id {{ test_id }} "
+  - debug: msg="{{ tps.stdout_lines }}. test_id is {{ test_id }}"

@@ -30,11 +30,10 @@ fsync = on
 autovacuum = off
 synchronous_commit = on
 # synchronous_commit = local
+shardman.sync_replicas = on
 
 shardman.shardlord_dbname = ubuntu
 shardman.poll_interval = 500 # long operations poll frequency in milliseconds
-
-shardman.sync_replicas = on
 
 max_prepared_transactions = 100000
 postgres_fdw.use_2pc = on

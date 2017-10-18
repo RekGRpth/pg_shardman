@@ -27,7 +27,7 @@
   # good for both launch and termination
   - import_tasks: tasks/clean_ec2_cache.yml
     tags:
-      - clean_ec2_cache
+      - always
 
   - name: terminate all ec2 instances
     ec2:
@@ -37,6 +37,6 @@
       wait: "{{ wait }}"
     with_items: "{{ groups.ec2 }}"
     vars:
-      wait: no
+      wait: yes
     tags:
       - terminate

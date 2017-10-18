@@ -74,7 +74,7 @@
     tags:
       - create_hash_partitions_accounts
 
-  - name: create_hash_partitions for branches & tellers, nparts {{ nparts }}
+  - name: create_hash_partitions for branches & tellers, nparts {{ nparts }}, repfactor {{ repfactor }}
     command: >
       psql -p {{ pg_port }} -c "
       select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_tellers', 'tid', {{ nparts }}, {{ rebalance }});

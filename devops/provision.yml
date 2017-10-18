@@ -152,8 +152,9 @@
     when: tags_not_specified is not defined
     tags: ars
 
-  - name: set PATH in .bashrc
-    lineinfile: dest=~/.bashrc line="export PATH={{ pg_dst }}/bin:$PATH"
+  - name: set PATH to pg binaries in .bashrc.
+    # It is important to insert at the beginning, otherwise non-interactive shells won't read this.
+    lineinfile: dest=~/.bashrc insertbefore=BOF line="export PATH={{ pg_dst }}/bin:$PATH"
     tags:
       - set_path
       - ars
@@ -194,7 +195,8 @@
     tags: perf
 
   - name: set PATH to flamegraph in .bashrc
-    lineinfile: dest=~/.bashrc line="export PATH={{ fg_path }}:$PATH"
+    # It is important to insert at the beginning, otherwise non-interactive shells won't read this.
+    lineinfile: dest=~/.bashrc insertbefore=BOF line="export PATH={{ fg_path }}:$PATH"
     tags:
       - perf
 
