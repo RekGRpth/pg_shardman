@@ -27,6 +27,7 @@
     local_action: file
       src={{ inventory_hostname }}.log
       dest={{ logs }}/{{ node_id.stdout }}.log
+      force=yes
       state=link
 
   - name: touch logs/united.log
@@ -42,4 +43,5 @@
     local_action: file
       src={{ groups['shardlord'][0] }}.log
       dest={{ logs }}/shardlord.log
+      force=yes
       state=link

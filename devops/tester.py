@@ -5,6 +5,7 @@ import re
 import csv
 import os
 import shutil
+import subprocess
 from subprocess import check_call, check_output
 
 from inventory_ec2.ec2_elect_shardlord import ec2_elect_shardlord
@@ -12,27 +13,33 @@ from inventory_ec2.ec2_elect_shardlord import ec2_elect_shardlord
 scale = 10
 duration = 30
 
-workers = [3, 6, 9]
+workers = [6]
 # replications = ['none', 'logical_sync', 'logical_async', 'trigger']
-replications = ['logical_async']
+replications = ['logical_sync']
 async_config = '''
 synchronous_commit = local
 shardman.sync_replicas = off
 '''
-nparts_per_node = [3, 10]
+nparts_per_node = [2]
 clients = [1, 16, 32, 64, 128]
-
-# debug
-# workers = [3]
-# replications = ['logical_async']
-# nparts_per_node = [3]
-# clients = [8]
 
 create_instances = True
 destroy_instances = True
 provision = True
 rebuild_shardman = True
 prepare = True
+
+
+# debug
+# workers = [3]
+# replications = ['logical_async']
+# nparts_per_node = [3]
+# clients = [8]
+# create_instances = False
+# destroy_instances = False
+# provision = False
+# rebuild_shardman = False
+# prepare = False
 
 resfile_path = "tester_res.csv"
 resfile_writer = None
@@ -48,10 +55,10 @@ class TestRow:
         self.wal_lag = ''
 
 def res_header():
-    return ["test_id", "instance_type", "num of workers", "nparts", "replicas",
-            "repmode", "sync_replicas", "sync_commit", "CFLAGS", "scale",
+    return ["test_id", "instance_type", "num of workers", "nparts", "sharded tables",
+            "replicas", "repmode", "sync_replicas", "sync_commit", "CFLAGS", "scale",
             "seconds", "test", "fdw 2pc", "active_workers", "clients", "tps sum",
-            "avg latency", "end latency", "wal lag"]
+            "avg latency", "end latency", "wal lag", "comment"]
 
 def tester():
     if os.path.isfile(resfile_path):
@@ -139,11 +146,19 @@ def run(test_row):
             ssh {} 'nohup /home/ubuntu/monitor_wal_lag.sh > monitor_wal_lag.out 2>&1 &'
             '''.format(mon_node), shell=True)
 
-    run_output = check_output(
-        '''
-        ansible-playbook -i inventory_ec2/ pgbench_run.yml -e \
-        'tmstmp=true tname=t pgbench_opts="-N -c {} -T {}"'
-        '''.format(test_row.clients, duration), shell=True).decode("ascii")
+    try:
+        run_output = check_output(
+            '''
+            ansible-playbook -i inventory_ec2/ pgbench_run.yml -e \
+            'tmstmp=true tname=t pgbench_opts="-N -c {} -T {}"'
+            '''.format(test_row.clients, duration), shell=True, stderr=subprocess.STDOUT).decode("ascii")
+    except subprocess.CalledProcessError as e:
+        print('pgbench_run failed, stdout and stderr was:')
+        print(e.output.decode('ascii'))
+        raise e
+
+    print('Here is run output:')
+    print(run_output)
 
     # stop wal lag monitoring and pull the results
     if test_row.replication == 'logical_async':
@@ -152,11 +167,11 @@ def run(test_row):
         max_lag_bytes = int(check_output(
             "awk -v max=0 '{if ($1 > max) {max=$1} }END {print max}' wal_lag.txt",
             shell=True))
-        test_row.wal_lag = size_pretty(max_lag_bytes)
+        test_row.wal_lag = max_lag_bytes
+    else:
+        test_row.wal_lag = ''
 
 
-    print('Here is run output:')
-    print(run_output)
     test_id_re = re.compile('test_id is ([\w-]+)')
     test_id = test_id_re.search(run_output).group(1)
     print('test id is {}'.format(test_id))
@@ -190,17 +205,10 @@ def form_csv_row(test_row):
         sync_commit = 'local'
 
     return [test_row.test_id, 'c3.2xlarge', test_row.workers, test_row.workers * test_row.nparts_per_node,
-            replicas, repmode, sync_replicas, sync_commit, "-O2", scale, duration,
+            "pgbench_accounts", replicas, repmode, sync_replicas, sync_commit, "-O2", scale, duration,
             "pgbench -N", "on", test_row.workers, test_row.clients, test_row.tps_sum,
-            '', '', test_row.wal_lag]
+            '', '', test_row.wal_lag, '']
 
-def size_pretty(size, precision=2):
-    suffixes = ['B','KB','MB','GB','TB']
-    suffixIndex = 0
-    while size > 1024 and suffixIndex < 4:
-        suffixIndex += 1
-        size = size / 1024.0
-    return "%.*f%s" % (precision, size, suffixes[suffixIndex])
 
 if __name__ == '__main__':
     tester()
