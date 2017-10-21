@@ -24,6 +24,10 @@ CREATE TABLE tables (
 	initial_node int NOT NULL REFERENCES nodes(id)
 );
 
+
+
+
+
 -- On adding new table, create this table on non-owner nodes using provided sql
 -- and partition it. We destroy all existing tables with needed names.
 CREATE FUNCTION new_table_worker_side() RETURNS TRIGGER AS $$
@@ -77,12 +81,18 @@ CREATE TRIGGER new_table_lord_side AFTER INSERT ON shardman.tables
 -- allow several copies of the same partition on one node.
 CREATE TABLE partitions (
 	part_name text,
-	owner int NOT NULL REFERENCES nodes(id), -- node on which partition lies
-	prv int REFERENCES nodes(id),
-	nxt int REFERENCES nodes(id),
+	node int NOT NULL REFERENCES nodes(id), -- node on which partition lies
 	relation text NOT NULL REFERENCES tables(relation),
-	PRIMARY KEY (part_name, owner)
+	PRIMARY KEY (part_name)
 );
+
+
+CREATE TABLE replicas (
+	part_name text NOT NULL REFERENCES parititions(part_name),
+	node int NOT NULL REFERENCES nodes(id), -- node on which partition lies
+	PRIMARY KEY (part_name,node)
+);
+	   
 
 ------------------------------------------------------------
 -- Metadata triggers and funcs called from libpq updating metadata & LR channels

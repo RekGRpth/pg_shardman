@@ -789,7 +789,7 @@ rm_node(Cmd *cmd)
 	bool force = pg_strcasecmp(cmd->opts[1], "true") == 0;
 	char *sql;
 	int e;
-	int64 parts_on_node;
+	int64 parts_on_node = 0;
 
 	if (force)
 	{

@@ -21,8 +21,7 @@ CREATE TABLE nodes (
 	worker_status worker_node_status, -- NULL if this node is not a worker
 	-- is this node shardlord?
 	shardlord bool NOT NULL DEFAULT false,
-	-- cmd by which node was added
-	added_by bigint REFERENCES shardman.cmd_log(id)
+	replication_group text -- replication group
 );
 CREATE UNIQUE INDEX unique_node_connstr ON shardman.nodes (connstring)
 	WHERE (worker_status = 'active' OR shardlord);

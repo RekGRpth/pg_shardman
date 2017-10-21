@@ -11,63 +11,135 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_shardman" to load this file. \quit
 
--- Functions here use some gucs defined in .so, so we have to ensure that the
--- library is actually loaded.
-DO $$
-BEGIN
--- Yes, malicious user might have another extension containing 'pg_shardman'...
--- Probably better just call no-op func from the library
-	IF strpos(current_setting('shared_preload_libraries'), 'pg_shardman') = 0 THEN
-		RAISE EXCEPTION 'pg_shardman must be loaded via shared_preload_libraries. Refusing to proceed.';
-	END IF;
-END
-$$;
-
-CREATE TABLE cmd_log (
-	id bigserial PRIMARY KEY,
-	cmd_type TEXT NOT NULL,
-	cmd_opts TEXT[],
-	status TEXT DEFAULT 'waiting' NOT NULL,
-
-	-- available commands
-	CONSTRAINT check_cmd_type
-	CHECK (cmd_type IN ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_part', 'create_replica', 'rebalance',
-						 'set_replevel')),
-
-	-- command status
-	CONSTRAINT check_cmd_status
-	CHECK (status IN ('waiting', 'canceled', 'failed', 'in progress',
-					  'success', 'done'))
-);
 
 
 -- Interface functions
 
 
--- Add a node. Its state will be reset, all shardman data lost.
-CREATE FUNCTION add_node(connstring text) RETURNS int AS $$
-DECLARE
-	cmd		text;
-	opts	text[];
-BEGIN
-	cmd = 'add_node';
-	opts = ARRAY[connstring::text];
 
-	RETURN @extschema@.register_cmd(cmd, opts);
+
+-- Add a node. Its state will be reset, all shardman data lost.
+CREATE FUNCTION add_node(conn_string text, repl_group text) RETURNS void AS $$
+DECLARE
+	new_node_id integer;
+    node    nodes;
+	lord_connstr text;
+	pubs text := '';
+	subs text := '';
+	sync text := '';
+	lord_id integer;
+BEGIN
+	INSERT INTO nodes (connstring,worker_status,replication_group) values (conn_string, 'active',repl_group) returning id into new_node_id;
+
+	SELECT string_agg('node_'||id, ',') INTO sync_stanbys from nodes WHERE NOT shardlord;
+
+	FOR node IN SELECT * FROM nodes WHERE replication_group=repl_group AND id<>new_node_id AND NOT shardlord
+	LOOP
+		pubs := format('%s%s:CREATE PUBLICATION node_%s;
+			 			  %s:CREATE PUBLICATION node_%s;',
+			pubs, node.id, new_node_id,
+				  new_node_id, node.id);
+		subs := format('%s%s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (synchronous_commit = local);
+			 			  %s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (synchronous_commit = local);',
+			 subs, node.id, new_node_id, conn_string, node.id);
+			 	   new_node_id, node.id, node.connstring, new_node_id);
+		sync := format('%s%s:SELECT shardman_set_sync_standbys(%L);', sync, sync_stanbys);
+	END LOOP;
+
+	sync := format('%s%s:SELECT shardman_set_sync_standbys(%L);', sync, new_node_id, sync_stanbys);
+
+	lord_id := shardman.my_id();
+	SELECT connstring INTO lord_connstr FROM nodes WHERE id=lord_id;
+	subs := format('%s%s:CREATE SUBSCRIPTION shardman_meta_sub CONNECTION %L PUBLICATION shardman_meta_pub with (synchronous_commit = local);',
+		 subs, new_node_id, connstring);
+
+    PERFORM sharman.broadcast(pubs);
+	PERFORM sharman.broadcast(subs);
+	PERFORM sharman.broadcast(sync);
 END
 $$ LANGUAGE plpgsql;
 
--- Remove node. Its state will be reset, all shardman data lost.
-CREATE FUNCTION rm_node(node_id int, force bool DEFAULT false) RETURNS int AS $$
-DECLARE
-	cmd		text;
-	opts	text[];
-BEGIN
-	cmd = 'rm_node';
-	opts = ARRAY[node_id::text, force::text];
 
-	RETURN @extschema@.register_cmd(cmd, opts);
+-- Remove node. Its state will be reset, all shardman data lost.
+CREATE FUNCTION rm_node(rm_node_id int, force bool DEFAULT false) RETURNS void AS $$
+DECLARE
+	n_parts integer;
+	part partitions;
+	pubs text := '';
+	subs text := '';
+	fdws text := '';
+    new_master_id integer;
+BEGIN
+	IF NOT force THEN
+	   SELECT count(*) INFO n_parts FROM partitions WHERE node=rm_node_id;
+	   IF (n_parts <> 0) THEN
+	   	  RAISE ERROR 'Use forse=true to remove non-empty node';
+	   END IF;
+    END IF;
+
+	SELECT string_agg('node_'||id, ',') INTO sync_stanbys from nodes WHERE NOT shardlord AND is<>rm_node_id;
+
+	-- remove all subscriptions of this node
+    FOR node IN SELECT * FROM nodes WHERE replication_group=repl_group AND id<>rm_node_id AND NOT shardlord
+	LOOP
+		pubs := format('%s%s:DROP PUBLICATION node_%s;
+			 			  %s:DROP PUBLICATION node_%s;',
+			 pubs, node.id, rm_node_id,
+			 	   rm_node_id, node.id);
+		subs := format('%s%s:DROP SUBSCRIPTION node_%s;
+			 			  %s:DROP SUBSCRIPTION node_%s',
+			 subs, rm_node_id, node.id,
+			 	   node.id, rm_node_id);
+		sync := format('%s%s:SELECT shardman_set_sync_standbys(%L);', sync, sync_stanbys);
+	END LOOP;
+
+    subs := format('%s%s:DROP SUBSCRIPTION shardman_meta_sub;',
+		 subs, rm_node_id, connstring);
+
+	PERFORM sharman.broadcast(subs, ignore_errors:=true);
+    PERFORM sharman.broadcast(pubs, ignore_errors:=true);
+	PERFORM sharman.broadcast(sync, ignore_errors:=true);
+
+	FOR part in SELECT * from shardman.partitions where node=rm_node_id
+	LOOP
+		SELECT node INTO new_master_id FROM shardman.replicas WHERE part_name=part.part_name;
+		IF new_master_id IS NOT NULL
+		THEN -- exists some replica for this node: redirect foreign table to this replica and refresh LR channels for this replication group
+		    UPDATE shardman.partitions SET node=new_master_id WHERE part_name=part.part_name;
+			DELETE FROM sharaman.replicas WHERE part_name=part.part_name AND node=new_master_id;
+
+			pubs := '';
+			subs := '';
+			FOR repl in SELECT * FROM sharman.replicas WHERE part_name=part.part_name
+			LOOP
+			    pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
+				    pubs, new_master_id, repl.node, part.part_name);
+				subs := format('%s%s:ALTER SUBSCRIPTION node_%s REFRESH PUBLICATION',
+					 subs, repl.node, new_master_id);
+			END LOOP;
+
+			PERFORM sharman.broadcast(subs);
+			PERFORM sharman.broadcast(pubs);
+		ELSE -- there is no replica: we have to create new empty partition and redirect all FDWs to it
+			SELECT id INTO new_master_id FROM nodes WHERE NOT shardlord AND id<>rm_node_id ORDER BY random() LIMIT 1;
+		    INSERT INTO shardman.partitions (part_name,node,relation) VALUES (part.part.name,new_master_id,part.relation);
+		END IF;
+
+		FOR node IN SELECT * FROM nodes WHERE id<>rm_node_id AND NOT shardlord
+		LOOP
+			IF id=new_master_id THEN
+			    fdws := format('%s%d:SELECT replace_hash_partition(''%s_fdw'',''%s'');',
+			 		fdws, node.id, part.part_name, part.part_name);
+			ELSE
+				fdws := format('%s%s:UPDATE pg_foreign_table SET ftserver = (SELECT oid FROM pg_foreign_server WHERE srvname = ''node_%s'') WHERE ftrelid = (SELECT oid FROM pg_class WHERE relname=''%s_fdw'');',
+		   			fdws, node.id, new_master_id, part.part_name);
+			END IF;
+		END LOOP;
+	END LOOP;
+
+	PERFORM sharman.broadcast(fdws, ignore_errors:=true);
+
+	DELETE from shardman.nodes where id=rm_node_id CASCADE;
 END
 $$ LANGUAGE plpgsql;
 
@@ -367,3 +439,8 @@ CREATE FUNCTION alter_system_c(opt text, val text) RETURNS void
 -- Ask shardlord to perform a command if we're but a worker node.
 CREATE FUNCTION execute_on_lord_c(cmd_type text, cmd_opts text[]) RETURNS text
 	AS 'pg_shardman' LANGUAGE C STRICT;
+
+CREATE FUNCTION broadcast(commands cstring, ignore_errors boolean default false, two_phase boolean default false) RETURNS text
+	AS 'broadcast' LANGUAGE C STRICT;
+
+
