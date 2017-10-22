@@ -19,6 +19,7 @@ PG_MODULE_MAGIC;
 
 /* GUC variables */
 static bool is_shardlord;
+static bool sync_replication;
 static char *shardlord_connstring;
 
 /*
@@ -27,10 +28,19 @@ static char *shardlord_connstring;
 void
 _PG_init()
 {
+	DefineCustomBoolVariable("shardman.sync_replication",
+							 "Toggle synchronous replication",
+							 NULL,
+							 &sync_replication,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("shardman.shardlord",
 							 "This node is the shardlord?",
 							 NULL,
-							 &isshardlord,
+							 &is_shardlord,
 							 false,
 							 PGC_POSTMASTER,
 							 0,
@@ -53,6 +63,12 @@ Datum
 shardlord_connection_string(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_CSTRING(shardlod_connstring);
+}
+
+Datum
+synchronour_replication(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(sync_replication);
 }
 
 Datum
@@ -253,7 +269,6 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	char pg_dump_path[MAXPGPATH];
 	/* let the mmgr free that */
 	char *relation = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char *connstring =  text_to_cstring(PG_GETARG_TEXT_PP(1));
 	const size_t chunksize = 5; /* read max that bytes at time */
 	/* how much already allocated *including header* */
 	size_t pallocated = VARHDRSZ + chunksize;
@@ -277,7 +292,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	canonicalize_path(pg_dump_path);
 
 	cmd = psprintf("%s -t '%s' --schema-only --dbname='%s' 2>&1",
-				   pg_dump_path, relation, connstring);
+				   pg_dump_path, relation, sharlord_connstring);
 
 	if ((fp = popen(cmd, "r")) == NULL)
 	{
