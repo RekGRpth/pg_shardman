@@ -6,7 +6,7 @@ EXTENSION = pg_shardman
 DATA = pg_shardman--1.0.sql
 
 MODULE_big = pg_shardman
-OBJS = src/pg_shardman.o
+OBJS = pg_shardman.o
 PGFILEDESC = "pg_shardman - sharding for Postgres"
 
 PG_CPPFLAGS = -I$(libpq_srcdir)

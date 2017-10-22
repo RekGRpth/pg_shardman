@@ -101,13 +101,13 @@ broadcast(PG_FUNCTION_ARGS)
 
 		rc = sscanf(sql, "%d:%n", &node_id, &n);
 		if (rc != 1) {
-			elog(ERROR, "Invalid command string: %s", sql);
+			elog(ERROR, "SHARDMAN: Invalid command string: %s", sql);
 		}
 		sql += n;
 		fetch_node_connstr = psprintf("select connstring from nodes where id=%d", node_id);
 		if (SPI_exec(fetch_node_connstr, 0) < 0 || SPI_processed != 1)
 		{
-			elog(ERROR, "Failed ot fetch connection string for node %d", node_dsql);
+			elog(ERROR, "SHARDMAN: Failed ot fetch connection string for node %d", node_dsql);
 		}
 		pfree(fetch_node_connstr);
 
@@ -174,7 +174,7 @@ broadcast(PG_FUNCTION_ARGS)
 					if (ignore_error)
 					{
 						appendStringInfoString(&resp, "?;");
-						shmn_elog(WARNING, "Query '%s' doesn't return single tuple at node %d", sql, node_id);
+						elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d", sql, node_id);
 					}
 					else
 					{
@@ -217,7 +217,7 @@ broadcast(PG_FUNCTION_ARGS)
 			res = PQexec(conn[i], "ROLLBACK PREPARED 'shardlord'");
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			{
-				shmn_elog(WARNING, "Rollback of 2PC failed at node %d: %s", node_id, PQerrorMessage(conn[i]));
+				elog(WARNING, "SHARDMAN: Rollback of 2PC failed at node %d: %s", node_id, PQerrorMessage(conn[i]));
 			}
 			PQclear(res);
 		}
@@ -226,7 +226,7 @@ broadcast(PG_FUNCTION_ARGS)
 			res = PQexec(conn[i], "COMMIT PREPARED 'shardlord'");
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			{
-				shmn_elog(WARNING, "Commit of 2PC failed at node %d: %s", node_id, PQerrorMessage(conn[i]));
+				elog(WARNING, "SHARDMAN: Commit of 2PC failed at node %d: %s", node_id, PQerrorMessage(conn[i]));
 			}
 			PQclear(res);
 		}
@@ -238,11 +238,11 @@ broadcast(PG_FUNCTION_ARGS)
 		if (ignore_error)
 		{
 			appendStringInfo(&resp, "Error:%s", errmsg);
-			shmn_elog(WARNIGN, errmsg);
+			elog(WARNIGN, "SHARDMAN: %s" errmsg);
 		}
 		else
 		{
-			shmn_elog(ERROR, errmsg);
+			elog(ERROR, "SHARDMAN: %s", errmsg);
 		}
 	}
 
@@ -284,7 +284,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	SPI_connect();
 	if (SPI_execute("select setting from pg_config where name = 'BINDIR';",
 					true, 0) < 0)
-		elog(FATAL, "Failed to query pg_config");
+		elog(FATAL, "SHARDMAN: Failed to query pg_config");
 	strcpy(pg_dump_path,
 		   SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 	SPI_finish();
@@ -296,7 +296,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 
 	if ((fp = popen(cmd, "r")) == NULL)
 	{
-		elog(ERROR, "Failed to run pg_dump, cmd %s", cmd);
+		elog(ERROR, "SHARDMAN: Failed to run pg_dump, cmd %s", cmd);
 	}
 
 	while ((bytes_read = fread(ptr, sizeof(char), chunksize, fp)) != 0)
@@ -312,7 +312,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	}
 
 	if (pclose(fp))	{
-		elog(ERROR, "pg_dump exited with error status, output was\n%scmd was \n%s",
+		elog(ERROR, "SHARDMAN: pg_dump exited with error status, output was\n%scmd was \n%s",
 			 text_to_cstring(sql), cmd);
 	}
 
@@ -398,7 +398,7 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 		/* free malloced memory to avoid leakage */
 		errmsg_palloc = pstrdup(pqerrmsg);
 		PQfreemem((void *) pqerrmsg);
-		elog(ERROR, "PQconninfoParse failed: %s", errmsg_palloc);
+		elog(ERROR, "SHARDMAN: PQconninfoParse failed: %s", errmsg_palloc);
 	}
 
 	/* compute number of opts and allocate text ptrs */
