@@ -1,7 +1,7 @@
 /* ------------------------------------------------------------------------
  *
  * pg_shardman.sql
- *   Sharding and replication using pg_pathman, postres_fdw and logical replication
+ *   Sharding and replication using pg_pathman, postgres_fdw and logical replication
  *
  * Copyright (c) 2017, Postgres Professional
  *
@@ -23,54 +23,44 @@ CREATE TABLE nodes (
 -- Main partitions
 CREATE TABLE partitions (
 	part_name text PRIMARY KEY,
-	node int NOT NULL REFERENCES nodes(id), -- node on which partition lies
+	node int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, -- node on which partition lies
 	relation text NOT NULL
 );
 
 -- Partition replicas
 CREATE TABLE replicas (
-	part_name text NOT NULL REFERENCES parititions(part_name),
-	node int NOT NULL REFERENCES nodes(id), -- node on which partition lies
+	part_name text NOT NULL REFERENCES partitions(part_name) ON DELETE CASCADE,
+	node int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, -- node on which partition lies
 	PRIMARY KEY (part_name,node)
 );
-	   
 
 -- Shardman interface functions
 
-
 -- Add a node: adjust logical replication channels in replication group and create foreign servers
-CREATE FUNCTION add_node(conn_string text, repl_group text DEFAULT 'all') RETURNS void AS $$
+CREATE FUNCTION add_node(conn_string text, repl_group text = 'all') RETURNS void AS $$
 DECLARE
 	new_node_id int;
-    node nodes;
-	pubs text := '';
-	subs text := '';
-	sync text := '';
-	conf text := '';
-	fdws text := '';
-	usms text := '';
+    node shardman.nodes;
+	pubs text = '';
+	subs text = '';
+	sync text = '';
+	conf text = '';
+	fdws text = '';
+	usms text = '';
 	server_opts text;
 	um_opts text;
 	new_server_opts text;
 	new_um_opts text;
 	sync_standbys text;
 	shardlord_conn_string text;
-	sync_repl bool := shardman.synchronous_replication();
 BEGIN
 	-- Insert new node in nodes table
 	INSERT INTO shardman.nodes (connection_string,replication_group) VALUES (conn_string, repl_group) RETURNING id INTO new_node_id;
 
 	-- Construct list of synchronous standbyes (subscriptions have name node_$ID)
-	SELECT string_agg('node_'||id, ',') INTO sync_standbys from nodes;
-
+	SELECT string_agg('node_'||id, ',') INTO sync_standbys from shardman.nodes;
 	-- Construct foreign server options from connection string of new node
 	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(conn_string) INTO new_server_opts, new_um_opts;
-
-	-- Create shardlord publication for metadata if not exists
-	IF NOT EXISTS(SELECT * from pg_publication WHERE pubname='shardman_meta_pub') 
-	THEN
-		CREATE PUBLICATION shardman_meta_pub FOR TABLE shardman.nodes,shardman.partitions,shardman.replicas;
-	END IF;
 
 	-- Adjust replication channels within replication group.
 	-- We need all-to-all replication channels between all group members.
@@ -78,26 +68,25 @@ BEGIN
 	LOOP
 		-- Add to new node publications for all existed nodes and add publication for new node to all existed nodes
 		pubs := format('%s%s:CREATE PUBLICATION node_%s;
-			 			  %s:CREATE PUBLICATION node_%s;',
+			 			  %s:CREATE PUBLICATION node_%s;
+						  %s:SELECT pg_create_logical_replication_slot(''node_%s'', ''pgoutput'');
+						  %s:SELECT pg_create_logical_replication_slot(''node_%s'', ''pgoutput'');',
 			 pubs, node.id, new_node_id,
+			 	   new_node_id, node.id,
+			       node.id, new_node_id,
 			 	   new_node_id, node.id);
 		-- Add to new node subscriptions to existed nodes and add subscription to new node to all existed nodes
-		subs := format('%s%s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (synchronous_commit = local);
-			 			  %s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (synchronous_commit = local);',
-			 subs, node.id, new_node_id, conn_string, node.id,
-			 	   new_node_id, node.id, node.connection_string, new_node_id);
+		subs := format('%s%s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);
+			 			  %s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);',
+			 subs, node.id, new_node_id, conn_string, node.id, node.id,
+			 	   new_node_id, node.id, node.connection_string, new_node_id, new_node_id);
 
 		-- Adjust synchronous standby list at all nodes
-		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;', 
+		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
 		     sync, node.id, sync_standbys);
-	    conf := format('%s%s:SELECT pg_reload_conf();', 
+	    conf := format('%s%s:SELECT pg_reload_conf();',
 			 conf, node.id);
 	END LOOP;
-
-	-- Create subscription to shardlord for metadata
-	SELECT shardman.shardlord_connection_string() INTO shardlord_conn_string;
-	subs := format('%s%s:CREATE SUBSCRIPTION shardman_meta_sub CONNECTION %L PUBLICATION shardman_meta_pub with (synchronous_commit = local);',
-		 subs, new_node_id, shardlord_conn_string);
 
 	-- Broadcast create publication commands
     PERFORM shardman.broadcast(pubs);
@@ -105,12 +94,13 @@ BEGIN
 	PERFORM shardman.broadcast(subs);
 
 	-- In case of synchronous replication broadcast update synchronous standby list commands
-	IF sync_repl THEN
+	IF shardman.synchronous_replication()
+	THEN
 	    -- Adjust synchronous standby list at new nodes
-		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;', 
+		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
 			 sync, new_node_id, sync_stanbys);
 		-- Reload configuration at new node
-		conf := format('%s%s:SELECT pg_reload_conf();', 
+		conf := format('%s%s:SELECT pg_reload_conf();',
 		     conf, new_node_id);
 	    PERFORM shardman.broadcast(sync);
 	    PERFORM shardman.broadcast(conf);
@@ -125,19 +115,19 @@ BEGIN
 		-- Create foreign server for new node at all other nodes and servers at new node for all other nodes
 		fdws := format('%s%s:CREATE SERVER node_%s FOREIGN DATA WRAPPER postgres_fdw %s;
 			 			  %s:CREATE SERVER node_%s FOREIGN DATA WRAPPER postgres_fdw %s;',
-			 fdws, new_node_id, node.id, server_ops,
-			 	   node.id, new_node_id, new_server_ops);
-			 
+			 fdws, new_node_id, node.id, server_opts,
+			 	   node.id, new_node_id, new_server_opts);
+
 		-- Create user mapping for this servers
 		usms := format('%s%s:CREATE USER MAPPING FOR CURRENT_USER SERVER node_%s %s;
 			 			  %s:CREATE USER MAPPING FOR CURRENT_USER SERVER node_%s %s;',
-			 usms, new_node_id, node.id, um_ops,
-			      node.id, new_node_id, new_um_ops);
+			 usms, new_node_id, node.id, um_opts,
+			      node.id, new_node_id, new_um_opts);
 	END LOOP;
 
-	-- Broadcast command for creating foreign servers			 
+	-- Broadcast command for creating foreign servers
 	PERFORM shardman.broadcast(fdws);
-	-- Broadcast command for creating user mapping for this servers			 
+	-- Broadcast command for creating user mapping for this servers
 	PERFORM shardman.broadcast(usms);
 END
 $$ LANGUAGE plpgsql;
@@ -145,23 +135,24 @@ $$ LANGUAGE plpgsql;
 
 -- Remove node: try to choose alternative from one of replicas of this nodes, exclude node from replication channels and remove foreign servers.
 -- To remove node with existed partitions use force=true parameter
-CREATE FUNCTION rm_node(rm_node_id int, force bool DEFAULT false) RETURNS void AS $$
+CREATE FUNCTION rm_node(rm_node_id int, force bool = false) RETURNS void AS $$
 DECLARE
-	node nodes;
-	part partitions;
-	pubs text := '';
-	subs text := '';
-	fdws text := '';
+	node shardman.nodes;
+	part shardman.partitions;
+	repl shardman.replicas;
+	pubs text = '';
+	subs text = '';
+	fdws text = '';
+	sync text = '';
 	fdw_part_name text;
     new_master_id int;
 	sync_standbys text;
-	sync_repl bool := shardman.synchronous_replication();
 BEGIN
 	-- If it is not forced remove, check if there are no partitions at this node
 	IF NOT force THEN
 	   IF EXISTS (SELECT * FROM shardman.partitions WHERE node=rm_node_id)
 	   THEN
-	   	  RAISE ERROR 'Use force=true to remove non-empty node';
+	   	  RAISE EXCEPTION 'Use force=true to remove non-empty node';
 	   END IF;
     END IF;
 
@@ -179,13 +170,9 @@ BEGIN
 			 			  %s:DROP SUBSCRIPTION node_%s',
 			 subs, rm_node_id, node.id,
 			 	   node.id, rm_node_id);
-		sync := format('%s%s:SELECT shardman_set_sync_standbys(%L);', 
+		sync := format('%s%s:SELECT shardman_set_sync_standbys(%L);',
 			 sync, node.id, sync_standbys);
 	END LOOP;
-
-	-- Drop subscription for metadata
-    subs := format('%s%s:DROP SUBSCRIPTION shardman_meta_sub;',
-		 subs, rm_node_id);
 
 	-- Broadcast drop subscription commands, ignore errors because removed node may be not available
 	PERFORM shardman.broadcast(subs, ignore_errors:=true);
@@ -193,10 +180,10 @@ BEGIN
     PERFORM shardman.broadcast(pubs, ignore_errors:=true);
 
 	-- In case of synchronous replication update synchronous standbys list
-	IF sync_repl
+	IF shardman.synchronous_replication()
 	THEN
 		-- Update synchronous standbys list at the removed node
-		sync := format('%s%s:SELECT shardman_set_sync_standbys(%L);', 
+		sync := format('%s%s:SELECT shardman_set_sync_standbys(%L);',
 			 sync, rm_node_id, sync_standbys);
 	    PERFORM shardman.broadcast(sync, ignore_errors:=true);
 	END IF;
@@ -206,9 +193,9 @@ BEGIN
 	LOOP
 		-- Drop server for all nodes at the removed node and drop server at all nodes for the removed node
 		fdws := format('%s%s:DROP SERVER node_%s;
-			 			  %s:DROP SERVER node_%s;', 
+			 			  %s:DROP SERVER node_%s;',
 			 fdws, node.id, rm_node_id,
-			 	   rm_node_id, node.id);	
+			 	   rm_node_id, node.id);
 	END LOOP;
 
 	-- Broadcast drop server commands
@@ -270,7 +257,7 @@ BEGIN
 	PERFORM shardman.broadcast(fdws, ignore_errors:=true);
 
 	-- Finally delete node from nodes table and all dependent tables
-	DELETE from shardman.nodes WHERE id=rm_node_id CASCADE;
+	DELETE from shardman.nodes WHERE id=rm_node_id;
 END
 $$ LANGUAGE plpgsql;
 
@@ -279,38 +266,39 @@ $$ LANGUAGE plpgsql;
 -- Shard table with hash partitions. Parameters are the same as in pathman.
 -- It also scatter partitions through all nodes.
 -- This function expects that empty table is created at shardlord.
-CREATE FUNCTION create_hash_partitions(rel_name regclass, expr text, partitions_count int)
+CREATE FUNCTION create_hash_partitions(rel regclass, expr text, partitions_count int)
 RETURNS void AS $$
 DECLARE
 	create_table text;
-	node nodes;
+	node shardman.nodes;
 	node_ids int[];
 	node_id int;
 	part_name text;
 	fdw_part_name text;
 	table_attrs text;
 	srv_name text;
-	create_tables text := '';
-	create_partitions text := '';
-	create_fdws text := '';
-	replace_parts text := '';
+	create_tables text = '';
+	create_partitions text = '';
+	create_fdws text = '';
+	replace_parts text = '';
+	rel_name text = rel::text;
 	i int;
 	n_nodes int;
 BEGIN
-	IF EXISTS(SELECT relation from shardman.tables where relation = rel_name)
+	IF EXISTS(SELECT relation from shardman.partitions where relation = rel_name)
 	THEN
-		RAISE ERROR 'Table % is already sharded', rel_name;
+		RAISE EXCEPTION 'Table % is already sharded', rel_name;
 	END IF;
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
-	-- Create parent table and partitions at all nodes 
+	-- Create parent table and partitions at all nodes
 	FOR node IN SELECT * FROM shardman.nodes
 	LOOP
 		-- Create parent table at all nodes
-		create_tables := format('%s%s:%s;',
+		create_tables := format('%s{%s:%s}',
 			create_tables, node.id, create_table);
 		-- Create partitions using pathman at all nodes
-		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);', 
+		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
 			create_partitions, node.id, rel_name, expr, partitions_count);
 	END LOOP;
 
@@ -318,15 +306,15 @@ BEGIN
 	PERFORM shardman.broadcast(create_tables);
 	-- Broadcast create hash partitions command
 	PERFORM shardman.broadcast(create_partitions);
-	
+
 	-- Get list of nodes in random order
 	SELECT ARRAY(SELECT id from shardman.nodes ORDER BY random()) INTO node_ids;
 	n_nodes := array_length(node_ids, 1);
 
 	-- Reconstruct table attributes from parent table
-	SELECT shardman.reconstruct_table_attrs(rel_nam) INTO table_attr; 
+	SELECT shardman.reconstruct_table_attrs(rel_name) INTO table_attrs;
 
-	FOR i IN 1..partitions_count 
+	FOR i IN 0..partitions_count-1
 	LOOP
 		-- Choose location of new partition
 		node_id := node_ids[1 + (i % n_nodes)]; -- round robin
@@ -336,17 +324,17 @@ BEGIN
 		INSERT INTO shardman.partitions (part_name,node,relation) VALUES (part_name, node_id, rel_name);
 		-- Construct name of the servers where partition will be located
 		srv_name := format('node_%s', node_id);
-		
+
 		-- Replace local partition with foreign table at all nodes except owner
 		FOR node IN SELECT * from shardman.nodes WHERE id<>node_id
 		LOOP
 			-- Create foreign table for this partition
-			create_fdw := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L)',
+			create_fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
 				create_fdws, node.id, fdw_part_name, table_attrs, srv_name, part_name);
-			replace_parts := format('%s%s:SELECT replace_hash_partition(%L, %L);', 
-				replace_parts, node.id, part_name, fdw_part_name);				 
-		END LOOP;                                                          	
-	END LOOP;                                                          	
+			replace_parts := format('%s%s:SELECT replace_hash_partition(%L, %L);',
+				replace_parts, node.id, part_name, fdw_part_name);
+		END LOOP;
+	END LOOP;
 
 	-- Broadcast create foreign table commands
 	PERFORM shardman.broadcast(create_fdws);
@@ -357,42 +345,46 @@ $$ LANGUAGE plpgsql;
 
 -- Provide requested level of redundancy. 0 means no redundancy.
 -- If existed level of redundancy is greater than specified, then right now this function does nothing.
-CREATE FUNCTION set_redundancy(rel_name regclass, redundancy int)
+CREATE FUNCTION set_redundancy(rel regclass, redundancy int)
 RETURNS void AS $$
 DECLARE
-	part partitions;
+	part shardman.partitions;
 	n_replicas int;
 	repl_node int;
 	repl_group text;
-	pubs text := '';
-	subs text := '';
+	pubs text = '';
+	subs text = '';
+	rel_name text = rel::text;
 BEGIN
 	-- Loop though all partitions of this table
-	FOR part IN SELECT * from shardman.partitions where relation=rel_name 
+	FOR part IN SELECT * from shardman.partitions where relation=rel_name
 	LOOP
 		-- Count number of replicas of this partition
 		SELECT count(*) INTO n_replicas FROM shardman.replicas WHERE part_name=part.part_name;
 		IF n_replicas < redundancy
-		THEN -- If it is smaller than requested...		
+		THEN -- If it is smaller than requested...
 			SELECT replication_group INTO repl_group FROM shardman.nodes where id=part.node;
 			-- ...then add requested number of replicas in corresponding replication group
-			FOR repl_node IN SELECT id FROM shardman.nodes WHERE replication_group=repl_group AND NOT EXISTS(SELECT * FROM shardman.replicas WHERE node=id AND part_name=part.part_name ORDER by random() LIMIT redundancy-n_replicas
+			FOR repl_node IN SELECT id FROM shardman.nodes
+				WHERE replication_group=repl_group AND id<>part.node AND NOT EXISTS
+					(SELECT * FROM shardman.replicas WHERE node=id AND part_name=part.part_name)
+				ORDER by random() LIMIT redundancy-n_replicas
 			LOOP
 				-- Insert information about new replica in replicas table
-				INSERT INTO replicas (part_name,node) values (part.part_name,repl_node);
+				INSERT INTO shardman.replicas (part_name,node) VALUES (part.part_name,repl_node);
 				-- Establish publications and subscriptions for this partition
 				pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 					 pubs, part.node, repl_node, part.part_name);
-				subs := formt('%s%s:ALTER SUBSCRIPTION node_%s REFRESH PUBLICATION;',
+				subs := format('%s%s:ALTER SUBSCRIPTION node_%s REFRESH PUBLICATION;',
 					 subs, repl_node, part.node);
 			END LOOP;
 		END IF;
 	END LOOP;
 
-	-- Broadcast alter publication commands 
+	-- Broadcast alter publication commands
 	PERFORM shardman.broadcast(pubs);
 	-- Broadcast alter subscription commands
-	PERFORM shardman.broadcast(fdws);
+	PERFORM shardman.broadcast(subs);
 
 	-- This function doesn't wait completion of replication sync
 END
@@ -401,11 +393,11 @@ $$ LANGUAGE plpgsql;
 
 -- Utility functions
 
--- Generate based on information from catalog SQL statement creating this table 
-CREATE FUNCTION gen_create_table_sql(relation text) 
+-- Generate based on information from catalog SQL statement creating this table
+CREATE FUNCTION gen_create_table_sql(relation text)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
--- Reconstruct table attributes for foreign table 
+-- Reconstruct table attributes for foreign table
 CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
@@ -417,7 +409,7 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- or number of affected rows for other commands.
 -- If two_phase parameter is true, then each statement is wrapped in blocked and prepared with subsequent commit or rollback of prepared transaction
 -- at second phase of two phase commit.
-CREATE FUNCTION broadcast(cmds text, ignore_errors bool DEFAULT false, two_phase bool DEFAULT false) RETURNS text
+CREATE FUNCTION broadcast(cmds text, ignore_errors bool = false, two_phase bool = false)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Options to postgres_fdw are specified in two places: user & password in user
@@ -437,8 +429,8 @@ CREATE FUNCTION conninfo_to_postgres_fdw_opts(IN conn_string text,
 DECLARE
 	conn_string_keywords text[];
 	conn_string_vals text[];
-	server_opts_first_time_through bool DEFAULT true;
-	um_opts_first_time_through bool DEFAULT true;
+	server_opts_first_time_through bool = true;
+	um_opts_first_time_through bool = true;
 BEGIN
 	server_opts := '';
 	um_opts := '';
@@ -480,10 +472,10 @@ CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals te
 	RETURNS record AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Get shardlord connection string from configuration parameters
-CREATE FUNCTION shardload_connection_string()
+CREATE FUNCTION shardlord_connection_string()
 	RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
--- Check from configuration parameters is sycnhronous replixation mode was enabled
+-- Check from configuration parameters is synchronous replication mode was enabled
 CREATE FUNCTION synchronous_replication()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
 
