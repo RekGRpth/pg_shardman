@@ -13,11 +13,19 @@
 
 -- Shardman tables
 
--- list of nodes present in the cluster
+-- List of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
 	connection_string text UNIQUE NOT NULL,
 	replication_group text NOT NULL -- group of nodes within which shard replicas are allocated
+);
+
+-- List of sharded tables
+CREATE TABLE tables (
+	relation text PRIMARY KEY,     -- table name
+	sharding_key text NOT NULL,    -- expression by which table is sharded
+	partitions_count int NOT NULL, -- number of partitions
+	create_sql text NOT NULL       -- sql to create the table
 );
 
 -- Main partitions
@@ -41,6 +49,8 @@ CREATE FUNCTION add_node(conn_string text, repl_group text = 'all') RETURNS void
 DECLARE
 	new_node_id int;
     node shardman.nodes;
+    part shardman.partitions;
+	t shardman.tables;
 	pubs text = '';
 	subs text = '';
 	sync text = '';
@@ -53,6 +63,14 @@ DECLARE
 	new_um_opts text;
 	sync_standbys text;
 	shardlord_conn_string text;
+	create_table text;
+	create_tables text = '';
+	create_partitions text = '';
+	create_fdws text = '';
+	replace_parts text = '';
+	fdw_part_name text;
+	table_attrs text;
+	srv_name text;
 BEGIN
 	-- Insert new node in nodes table
 	INSERT INTO shardman.nodes (connection_string,replication_group) VALUES (conn_string, repl_group) RETURNING id INTO new_node_id;
@@ -129,6 +147,36 @@ BEGIN
 	PERFORM shardman.broadcast(fdws);
 	-- Broadcast command for creating user mapping for this servers
 	PERFORM shardman.broadcast(usms);
+
+	-- Create FDWs at new node for all existed partitions
+	FOR t IN SELECT * from shardman.tables
+	LOOP
+		create_tables := format('%s{%s:%s}',
+			create_tables, new_node_id, t.create_sql);
+		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
+			create_partitions, new_node_id, t.relation, t.sharding_key, t.partitions_count);
+		SELECT shardman.reconstruct_table_attrs(t.relation) INTO table_attrs;
+		FOR part IN SELECT * from shardman.partitions WHERE relation=t.relation
+	    LOOP
+			SELECT connection_string INTO conn_string from shardman.nodes WHERE id=part.node;
+		    SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(conn_str) INTO server_opts, um_opts;
+			srv_name := format('node_%s', part.node);
+			fdw_part_name := format('%s_fdw', part.part_name);
+			create_fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
+				create_fdws, new_node_id, fdw_part_name, table_attrs, srv_name, part.part_name);
+			replace_parts := format('%s%s:SELECT replace_hash_partition(%L, %L);',
+				replace_parts, new_node_id, part.part_name, fdw_part_name);
+		END LOOP;
+	END LOOP;
+
+	-- Broadcast create table commands
+	PERFORM shardman.broadcast(create_tables);
+	-- Broadcast create hash partitions command
+	PERFORM shardman.broadcast(create_partitions);
+	-- Broadcast create foreign table commands
+	PERFORM shardman.broadcast(create_fdws);
+	-- Broadcast replace hash partition commands
+	PERFORM shardman.broadcast(replace_parts);
 END
 $$ LANGUAGE plpgsql;
 
@@ -266,7 +314,7 @@ $$ LANGUAGE plpgsql;
 -- Shard table with hash partitions. Parameters are the same as in pathman.
 -- It also scatter partitions through all nodes.
 -- This function expects that empty table is created at shardlord.
-CREATE FUNCTION create_hash_partitions(rel regclass, expr text, partitions_count int)
+CREATE FUNCTION create_hash_partitions(rel regclass, expr text, part_count int)
 RETURNS void AS $$
 DECLARE
 	create_table text;
@@ -291,6 +339,8 @@ BEGIN
 	END IF;
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
+	INSERT INTO shardman.tables (relation,sharding_key,partitions_count,create_sql) values (rel_name,expr,part_count,create_table);
+
 	-- Create parent table and partitions at all nodes
 	FOR node IN SELECT * FROM shardman.nodes
 	LOOP
@@ -299,7 +349,7 @@ BEGIN
 			create_tables, node.id, create_table);
 		-- Create partitions using pathman at all nodes
 		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
-			create_partitions, node.id, rel_name, expr, partitions_count);
+			create_partitions, node.id, rel_name, expr, part_count);
 	END LOOP;
 
 	-- Broadcast create table commands
@@ -314,7 +364,7 @@ BEGIN
 	-- Reconstruct table attributes from parent table
 	SELECT shardman.reconstruct_table_attrs(rel_name) INTO table_attrs;
 
-	FOR i IN 0..partitions_count-1
+	FOR i IN 0..part_count-1
 	LOOP
 		-- Choose location of new partition
 		node_id := node_ids[1 + (i % n_nodes)]; -- round robin
@@ -390,6 +440,25 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Remove table from all nodes. All table partitions are removed.
+CREATE FUNCTION rm_table(rel regclass)
+RETURNS void AS $$
+DECLARE
+	rel_name text = rel::text;
+	node shardman.nodes;
+	drops text = '';
+BEGIN
+	-- Drop table at all nodes
+	FOR node IN SELECT * FROM shardman.nodes
+	LOOP
+		drops := format('%s%s:DROP TABLE %I CASCADE;',
+			drops, node.id, rel_name);
+	END LOOP;
+
+	-- Broadcast drop table commands
+	PERFORM shardman.broadcast(drops);
+END
+$$ LANGUAGE plpgsql;
 
 -- Utility functions
 
