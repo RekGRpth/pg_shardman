@@ -1,9 +1,6 @@
 /* -------------------------------------------------------------------------
  *
  * pg_shardman.c
- *		This module contains background worker accepting sharding tasks for
- *		execution, membership commands implementation and common routines for
- *		querying the metadata.
  *
  * Copyright (c) 2017, Postgres Professional
  *
@@ -31,14 +28,13 @@ PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
 PG_FUNCTION_INFO_V1(pq_conninfo_parse);
 
 /* GUC variables */
-static bool is_shardlord;
 static bool sync_replication;
 static char *shardlord_connstring;
 
 extern void _PG_init(void);
 
 /*
- * Entrypoint of the module. Define variables and register background worker.
+ * Entrypoint of the module. Define GUCs.
  */
 void
 _PG_init()
@@ -48,16 +44,6 @@ _PG_init()
 		"Toggle synchronous replication",
 		NULL,
 		&sync_replication,
-		false,
-		PGC_SUSET,
-		0,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"shardman.shardlord",
-		"This node is the shardlord?",
-		NULL,
-		&is_shardlord,
 		false,
 		PGC_SUSET,
 		0,
@@ -112,11 +98,14 @@ broadcast(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 
-	conn = (PGconn**)palloc(sizeof(PGconn*)*n_cons);
+	conn = (PGconn**) palloc(sizeof(PGconn*) * n_cons);
 	initStringInfo(&resp);
 
 	while ((sep = strchr(sql, *sql == '{' ? '}' : ';')) != NULL)
 	{
+		char *twopc_sql;
+		bool alter_system;
+
 		*sep = '\0';
 
 		if (*sql == '{')
@@ -129,7 +118,8 @@ broadcast(PG_FUNCTION_ARGS)
 		fetch_node_connstr = psprintf("select connection_string from shardman.nodes where id=%d", node_id);
 		if (SPI_exec(fetch_node_connstr, 0) < 0 || SPI_processed != 1)
 		{
-			elog(ERROR, "SHARDMAN: Failed ot fetch connection string for node %d", node_id);
+			elog(ERROR, "SHARDMAN: Failed to fetch connection string for node %d",
+				 node_id);
 		}
 		pfree(fetch_node_connstr);
 
@@ -137,7 +127,7 @@ broadcast(PG_FUNCTION_ARGS)
 
 		if (n_cmds >= n_cons)
 		{
-			conn = (PGconn**)repalloc(conn, sizeof(PGconn*)*(n_cons *= 2));
+			conn = (PGconn**) repalloc(conn, sizeof(PGconn*) * (n_cons *= 2));
 		}
 
 		conn[n_cmds] = PQconnectdb(conn_str);
@@ -145,37 +135,50 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Connection failure: %s;", errmsg ? errmsg : "", node_id, PQerrorMessage(conn[n_cmds-1]));
+				errmsg = psprintf("%s%d:Connection failure: %s;",
+								  errmsg ? errmsg : "", node_id,
+								  PQerrorMessage(conn[n_cmds-1]));
 				continue;
 			}
-			errmsg = psprintf("Failed to connect to node %d: %s", node_id, PQerrorMessage(conn[n_cmds-1]));
+			errmsg = psprintf("Failed to connect to node %d: %s", node_id,
+							  PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-		if (two_phase)
+		alter_system = strncmp("ALTER SYSTEM", sql, strlen("ALTER SYSTEM")) == 0;
+		if (!alter_system)
+			sql = psprintf("SET LOCAL synchronous_commit TO LOCAL; %s;",
+						   sql);
 		{
-			sql = psprintf("BEGIN; %s; PREPARE TRANSACTION 'shardlord';", sql);
+			if (two_phase)
+			{
+				twopc_sql = psprintf("BEGIN; %s; PREPARE TRANSACTION 'shardlord';", sql);
+				pfree(sql);
+				sql = twopc_sql;
+			}
 		}
 		elog(DEBUG1, "Send command '%s' to node %d", sql, node_id);
-		if (!PQsendQuery(conn[n_cmds-1], sql))
+		if (!PQsendQuery(conn[n_cmds - 1], sql))
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Failed to send query '%s': %s'", errmsg ? errmsg : "", node_id, sql, PQerrorMessage(conn[n_cmds-1]));
+				errmsg = psprintf("%s%d:Failed to send query '%s': %s'",
+								  errmsg ? errmsg : "", node_id, sql,
+								  PQerrorMessage(conn[n_cmds-1]));
 				continue;
 			}
-			errmsg = psprintf("Failed to send query '%s' to node %d: %s'", sql, node_id, PQerrorMessage(conn[n_cmds-1]));
+			errmsg = psprintf("Failed to send query '%s' to node %d: %s'", sql,
+							  node_id, PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-		if (two_phase)
-		{
+		if (!alter_system)
 			pfree(sql);
-		}
 		sql = sep + 1;
 	}
 	for (i = 0; i < n_cmds; i++)
 	{
 		PGresult* next_res;
 		PGresult* res = NULL;
+		ExecStatusType status;
 
 		while ((next_res = PQgetResult(conn[i])) != NULL)
 		{
@@ -185,49 +188,7 @@ broadcast(PG_FUNCTION_ARGS)
 			}
 			res = next_res;
 		}
-		if (res != NULL)
-		{
-			ExecStatusType status = PQresultStatus(res);
-			if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK)
-			{
-				if (ignore_errors)
-				{
-					errmsg = psprintf("%s%d:Command %s failed: %s", errmsg ? errmsg : "", node_id, sql, PQerrorMessage(conn[i]));
-					PQclear(res);
-					continue;
-				}
-				errmsg = psprintf("Command %s failed at node %d: %s", sql, node_id, PQerrorMessage(conn[i]));
-				PQclear(res);
-				goto cleanup;
-			}
-			if (status == PGRES_TUPLES_OK)
-			{
-				if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
-				{
-					if (ignore_errors)
-					{
-						appendStringInfoString(&resp, "?;");
-						elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d", sql, node_id);
-					}
-					else
-					{
-						errmsg = psprintf("Query '%s' doesn't return single tuple at node %d", sql, node_id);
-						PQclear(res);
-						goto cleanup;
-					}
-				}
-				else
-				{
-					appendStringInfo(&resp, "%s;", PQgetvalue(res, 0, 0));
-				}
-			}
-			else
-			{
-				appendStringInfo(&resp, "%d;", PQntuples(res));
-			}
-			PQclear(res);
-		}
-		else
+		if (res == NULL)
 		{
 			if (ignore_errors)
 			{
@@ -237,29 +198,73 @@ broadcast(PG_FUNCTION_ARGS)
 			errmsg = psprintf("Failed to receive response for query %s from node %d: %s", sql, node_id, PQerrorMessage(conn[i]));
 			goto cleanup;
 		}
+
+		/* Ok, result was successfully fetched */
+		status = PQresultStatus(res);
+		if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK)
+		{
+			if (ignore_errors)
+			{
+				errmsg = psprintf("%s%d:Command %s failed: %s", errmsg ? errmsg : "", node_id, sql, PQerrorMessage(conn[i]));
+				PQclear(res);
+				continue;
+			}
+			errmsg = psprintf("Command %s failed at node %d: %s", sql, node_id, PQerrorMessage(conn[i]));
+			PQclear(res);
+			goto cleanup;
+		}
+		if (status == PGRES_TUPLES_OK)
+		{
+			if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
+			{
+				if (ignore_errors)
+				{
+					appendStringInfoString(&resp, "?;");
+					elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d", sql, node_id);
+				}
+				else
+				{
+					errmsg = psprintf("Query '%s' doesn't return single tuple at node %d", sql, node_id);
+					PQclear(res);
+					goto cleanup;
+				}
+			}
+			else
+			{
+				appendStringInfo(&resp, "%s;", PQgetvalue(res, 0, 0));
+			}
+		}
+		else
+		{
+			appendStringInfo(&resp, "%d;", PQntuples(res));
+		}
+		PQclear(res);
 	}
   cleanup:
 	for (i = 0; i < n_cmds; i++)
 	{
-		if (conn[i])
-			continue;
-		if (errmsg)
+		if (two_phase)
 		{
-			res = PQexec(conn[i], "ROLLBACK PREPARED 'shardlord'");
-			if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			if (errmsg)
 			{
-				elog(WARNING, "SHARDMAN: Rollback of 2PC failed at node %d: %s", node_id, PQerrorMessage(conn[i]));
+				res = PQexec(conn[i], "ROLLBACK PREPARED 'shardlord'");
+				if (PQresultStatus(res) != PGRES_COMMAND_OK)
+				{
+					elog(WARNING, "SHARDMAN: Rollback of 2PC failed at node %d: %s",
+						 node_id, PQerrorMessage(conn[i]));
+				}
+				PQclear(res);
 			}
-			PQclear(res);
-		}
-		else
-		{
-			res = PQexec(conn[i], "COMMIT PREPARED 'shardlord'");
-			if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			else
 			{
-				elog(WARNING, "SHARDMAN: Commit of 2PC failed at node %d: %s", node_id, PQerrorMessage(conn[i]));
+				res = PQexec(conn[i], "COMMIT PREPARED 'shardlord'");
+				if (PQresultStatus(res) != PGRES_COMMAND_OK)
+				{
+					elog(WARNING, "SHARDMAN: Commit of 2PC failed at node %d: %s",
+						 node_id, PQerrorMessage(conn[i]));
+				}
+				PQclear(res);
 			}
-			PQclear(res);
 		}
 		PQfinish(conn[i]);
 	}
@@ -269,7 +274,7 @@ broadcast(PG_FUNCTION_ARGS)
 		if (ignore_errors)
 		{
 			appendStringInfo(&resp, "Error:%s", errmsg);
-			elog(WARNING, "SHARDMAN: %s",errmsg);
+			elog(WARNING, "SHARDMAN: %s", errmsg);
 		}
 		else
 		{
@@ -493,4 +498,3 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 	PQconninfoFree(opts);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
-

@@ -16,6 +16,7 @@ make install
 > $logfile
 
 stop_nodes
+pkill -9 postgres || true
 for datadir in $lord_datadir "${worker_datadirs[@]}"; do
     rm -rf "$datadir"
     mkdir -p "$datadir"

@@ -61,7 +61,7 @@ DECLARE
 	um_opts text;
 	new_server_opts text;
 	new_um_opts text;
-	sync_standbys text;
+	sync_standbys text[];
 	shardlord_conn_string text;
 	create_table text;
 	create_tables text = '';
@@ -71,20 +71,17 @@ DECLARE
 	fdw_part_name text;
 	table_attrs text;
 	srv_name text;
+	sync_standbyss text = 'haha';
 BEGIN
 	-- Insert new node in nodes table
 	INSERT INTO shardman.nodes (connection_string,replication_group) VALUES (conn_string, repl_group) RETURNING id INTO new_node_id;
 
-	-- Construct list of synchronous standbyes (subscriptions have name node_$ID)
-	SELECT string_agg('node_'||id, ',') INTO sync_standbys from shardman.nodes;
-	-- Construct foreign server options from connection string of new node
-	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(conn_string) INTO new_server_opts, new_um_opts;
-
 	-- Adjust replication channels within replication group.
 	-- We need all-to-all replication channels between all group members.
-	FOR node IN SELECT * FROM shardman.nodes WHERE replication_group=repl_group AND id<>new_node_id
+	FOR node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group AND id  <> new_node_id
 	LOOP
-		-- Add to new node publications for all existed nodes and add publication for new node to all existed nodes
+		-- Add to new node publications for all existing nodes and add
+		-- publication for new node to all existing nodes
 		pubs := format('%s%s:CREATE PUBLICATION node_%s;
 			 			  %s:CREATE PUBLICATION node_%s;
 						  %s:SELECT pg_create_logical_replication_slot(''node_%s'', ''pgoutput'');
@@ -93,17 +90,14 @@ BEGIN
 			 	   new_node_id, node.id,
 			       node.id, new_node_id,
 			 	   new_node_id, node.id);
-		-- Add to new node subscriptions to existed nodes and add subscription to new node to all existed nodes
-		subs := format('%s%s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);
-			 			  %s:CREATE SUBSCRIPTION node_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);',
-			 subs, node.id, new_node_id, conn_string, node.id, node.id,
-			 	   new_node_id, node.id, node.connection_string, new_node_id, new_node_id);
-
-		-- Adjust synchronous standby list at all nodes
-		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
-		     sync, node.id, sync_standbys);
-	    conf := format('%s%s:SELECT pg_reload_conf();',
-			 conf, node.id);
+		-- Add to new node subscriptions to existing nodes and add subscription
+		-- to new node to all existing nodes
+		-- sub name is node_pubnodeid_subnodeid to avoid application_name collision
+		subs := format('%s%s:CREATE SUBSCRIPTION node_%s_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);
+			 			  %s:CREATE SUBSCRIPTION node_%s_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);',
+						  subs,
+						  node.id, new_node_id, node.id, conn_string, node.id, node.id,
+			 			  new_node_id, node.id, new_node_id, node.connection_string, new_node_id, new_node_id);
 	END LOOP;
 
 	-- Broadcast create publication commands
@@ -112,19 +106,26 @@ BEGIN
 	PERFORM shardman.broadcast(subs);
 
 	-- In case of synchronous replication broadcast update synchronous standby list commands
-	IF shardman.synchronous_replication()
+	IF shardman.synchronous_replication() AND
+		(SELECT COUNT(*) FROM shardman.nodes WHERE replication_group = repl_group) > 1
 	THEN
-	    -- Adjust synchronous standby list at new nodes
-		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
-			 sync, new_node_id, sync_stanbys);
-		-- Reload configuration at new node
-		conf := format('%s%s:SELECT pg_reload_conf();',
-		     conf, new_node_id);
+		-- Take all nodes in replicationg group excluding myself
+		FOR node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group LOOP
+		sync_standbys :=
+			ARRAY(SELECT string_agg(format('node_%s_%s', node.id, id), ',') FROM shardman.nodes
+				   WHERE replication_group = repl_group AND id <> node.id);
+		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to ''FIRST %s (%s)'';',
+					   sync, node.id, array_length(sync_standbys, 1),
+					   array_to_string(sync_standbys, ','));
+		conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
+		END LOOP;
 	    PERFORM shardman.broadcast(sync);
 	    PERFORM shardman.broadcast(conf);
 	END IF;
 
 	-- Add foreign servers for connection to the new node and backward
+	-- Construct foreign server options from connection string of new node
+	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(conn_string) INTO new_server_opts, new_um_opts;
 	FOR node IN SELECT * FROM shardman.nodes WHERE id<>new_node_id
 	LOOP
 	    -- Construct foreign server options from connection string of this node
@@ -181,8 +182,9 @@ END
 $$ LANGUAGE plpgsql;
 
 
--- Remove node: try to choose alternative from one of replicas of this nodes, exclude node from replication channels and remove foreign servers.
--- To remove node with existed partitions use force=true parameter
+-- Remove node: try to choose alternative from one of replicas of this nodes,
+-- exclude node from replication channels and remove foreign servers.
+-- To remove node with existing partitions use force=true parameter.
 CREATE FUNCTION rm_node(rm_node_id int, force bool = false) RETURNS void AS $$
 DECLARE
 	node shardman.nodes;
@@ -198,14 +200,14 @@ DECLARE
 BEGIN
 	-- If it is not forced remove, check if there are no partitions at this node
 	IF NOT force THEN
-	   IF EXISTS (SELECT * FROM shardman.partitions WHERE node=rm_node_id)
+	   IF EXISTS (SELECT * FROM shardman.partitions parts WHERE parts.node = rm_node_id)
 	   THEN
 	   	  RAISE EXCEPTION 'Use force=true to remove non-empty node';
 	   END IF;
     END IF;
 
 	-- Construct new synchronous standby list
-	SELECT string_agg('node_'||id, ',') INTO sync_standbys from shardman.nodes WHERE id<>rm_node_id;
+	SELECT string_agg('node_' || id, ',') INTO sync_standbys from shardman.nodes WHERE id<>rm_node_id;
 
 	-- Remove all subscriptions and publications of this node
     FOR node IN SELECT * FROM shardman.nodes WHERE replication_group=repl_group AND id<>rm_node_id
@@ -333,7 +335,7 @@ DECLARE
 	i int;
 	n_nodes int;
 BEGIN
-	IF EXISTS(SELECT relation from shardman.partitions where relation = rel_name)
+	IF EXISTS(SELECT relation FROM shardman.partitions WHERE relation = rel_name)
 	THEN
 		RAISE EXCEPTION 'Table % is already sharded', rel_name;
 	END IF;
@@ -372,7 +374,7 @@ BEGIN
 		fdw_part_name := format('%s_fdw', part_name);
 		-- Insert information about new partition in partitions table
 		INSERT INTO shardman.partitions (part_name,node,relation) VALUES (part_name, node_id, rel_name);
-		-- Construct name of the servers where partition will be located
+		-- Construct name of the server where partition will be located
 		srv_name := format('node_%s', node_id);
 
 		-- Replace local partition with foreign table at all nodes except owner
@@ -394,7 +396,8 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Provide requested level of redundancy. 0 means no redundancy.
--- If existed level of redundancy is greater than specified, then right now this function does nothing.
+-- If existing level of redundancy is greater than specified, then right now this
+-- function does nothing.
 CREATE FUNCTION set_redundancy(rel regclass, redundancy int)
 RETURNS void AS $$
 DECLARE
@@ -406,7 +409,7 @@ DECLARE
 	subs text = '';
 	rel_name text = rel::text;
 BEGIN
-	-- Loop though all partitions of this table
+	-- Loop through all partitions of this table
 	FOR part IN SELECT * from shardman.partitions where relation=rel_name
 	LOOP
 		-- Count number of replicas of this partition
@@ -425,8 +428,8 @@ BEGIN
 				-- Establish publications and subscriptions for this partition
 				pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 					 pubs, part.node, repl_node, part.part_name);
-				subs := format('%s%s:ALTER SUBSCRIPTION node_%s REFRESH PUBLICATION;',
-					 subs, repl_node, part.node);
+				subs := format('%s%s:ALTER SUBSCRIPTION node_%s_%s REFRESH PUBLICATION;',
+					 subs, repl_node, part.node, repl_node);
 			END LOOP;
 		END IF;
 	END LOOP;
@@ -471,13 +474,22 @@ CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Broadcast SQL commands to nodes and wait their completion.
--- cmds is list of SQL commands separated by by semi-columns with node prefix: node-id:sql-statement;
--- By default functions throws error is execution is failed at some of the nodes, with ignore_errors=true errors are ignored
--- and function returns string with "Error:" prefix containing list of errors separated by semi-columns with nodes prefixes.
--- In case o normal completion this function return list with node prefixes separated by semi-columns with single result of select queries
--- or number of affected rows for other commands.
--- If two_phase parameter is true, then each statement is wrapped in blocked and prepared with subsequent commit or rollback of prepared transaction
--- at second phase of two phase commit.
+-- cmds is list of SQL commands separated by semi-columns with node
+-- prefix: node-id:sql-statement;
+-- To run multiple statements on node, wrap them in {}:
+-- {node-id:statement; statement;}
+-- Don't specify them separately with 2pc, we use only one prepared_xact name.
+-- No escaping is performed, so ';', '{' and '}' inside queries are not supported.
+-- By default functions throws error is execution is failed at some of the
+-- nodes, with ignore_errors=true errors are ignored and function returns string
+-- with "Error:" prefix containing list of errors separated by semicolons with
+-- nodes prefixes.
+-- In case of normal completion this function return list with node prefixes
+-- separated by semi-columns with single result for select queries or number of
+-- affected rows for other commands.
+-- If two_phase parameter is true, then each statement is wrapped in blocked and
+-- prepared with subsequent commit or rollback of prepared transaction at second
+-- phase of two phase commit.
 CREATE FUNCTION broadcast(cmds text, ignore_errors bool = false, two_phase bool = false)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
@@ -547,4 +559,3 @@ CREATE FUNCTION shardlord_connection_string()
 -- Check from configuration parameters is synchronous replication mode was enabled
 CREATE FUNCTION synchronous_replication()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
-

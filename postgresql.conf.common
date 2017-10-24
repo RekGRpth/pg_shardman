@@ -1,4 +1,4 @@
-shared_preload_libraries = 'pg_pathman, pg_shardman'
+shared_preload_libraries = 'pg_pathman'
 
 # We support printing node ids in log messages. For that, include '%z' in
 # log_line_prefix. This feature is only supported if there is one shardman
