@@ -79,6 +79,7 @@ broadcast(PG_FUNCTION_ARGS)
 	char* sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	bool  ignore_errors = PG_GETARG_BOOL(1);
 	bool  two_phase = PG_GETARG_BOOL(2);
+	bool  sync_commit = PG_GETARG_BOOL(3);
 	char* sep;
 	PGresult *res;
 	char* fetch_node_connstr;
@@ -103,9 +104,6 @@ broadcast(PG_FUNCTION_ARGS)
 
 	while ((sep = strchr(sql, *sql == '{' ? '}' : ';')) != NULL)
 	{
-		char *twopc_sql;
-		bool alter_system;
-
 		*sep = '\0';
 
 		if (*sql == '{')
@@ -137,23 +135,22 @@ broadcast(PG_FUNCTION_ARGS)
 			{
 				errmsg = psprintf("%s%d:Connection failure: %s;",
 								  errmsg ? errmsg : "", node_id,
-								  PQerrorMessage(conn[n_cmds-1]));
+								  PQerrorMessage(conn[n_cmds - 1]));
 				continue;
 			}
 			errmsg = psprintf("Failed to connect to node %d: %s", node_id,
 							  PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-		alter_system = strncmp("ALTER SYSTEM", sql, strlen("ALTER SYSTEM")) == 0;
-		if (!alter_system)
-			sql = psprintf("SET LOCAL synchronous_commit TO LOCAL; %s;",
-						   sql);
+		if (!sync_commit)
 		{
 			if (two_phase)
 			{
-				twopc_sql = psprintf("BEGIN; %s; PREPARE TRANSACTION 'shardlord';", sql);
-				pfree(sql);
-				sql = twopc_sql;
+				sql = psprintf("SET SESSION synchronous_commit TO local; BEGIN; %s; PREPARE TRANSACTION 'shardlord';", sql);
+			}
+			else
+			{
+				sql = psprintf("SET SESSION synchronous_commit TO local; %s", sql);
 			}
 		}
 		elog(DEBUG1, "Send command '%s' to node %d", sql, node_id);
@@ -170,10 +167,16 @@ broadcast(PG_FUNCTION_ARGS)
 							  node_id, PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-		if (!alter_system)
+		if (!sync_commit)
 			pfree(sql);
 		sql = sep + 1;
 	}
+
+	if (*sql != '\0')
+	{
+		elog(ERROR, "SHARDMAN: Junk at end of command list: %s", sql);
+	}
+
 	for (i = 0; i < n_cmds; i++)
 	{
 		PGresult* next_res;
