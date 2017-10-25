@@ -30,6 +30,10 @@ for worker_datadir in "${worker_datadirs[@]}"; do
     cat postgresql.conf.worker >> ${worker_datadir}/postgresql.conf
 done
 
+for datadir in $lord_datadir "${worker_datadirs[@]}"; do
+    cat pg_hba.conf > ${datadir}/pg_hba.conf
+done
+
 start_nodes
 for port in $lord_port "${worker_ports[@]}"; do
     createdb -p $port `whoami`
