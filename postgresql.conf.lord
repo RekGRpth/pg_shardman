@@ -1,2 +1,3 @@
 shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
+shardman.shardlord = on
 shardman.sync_replication = on

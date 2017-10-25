@@ -1,9 +1,9 @@
 pgpath=~/postgres/install/vanilla/
 pathmanpath=~/postgres/pg_pathman
 install_pathman=false
-logfile=$HOME/tmp/tmp/tmp.log
+logfile=/tmp/shmn.log
 
-lord_datadir=~/postgres/data1
+lord_datadir=/tmp/data1
 lord_port=5432
 
 # declare -a worker_datadirs=()
@@ -18,23 +18,51 @@ lord_port=5432
 # declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3" "${HOME}/postgres/data4")
 # declare -a worker_ports=("5433" "5434" "5435")
 
-declare -a worker_datadirs=("${HOME}/postgres/data2" "${HOME}/postgres/data3" "${HOME}/postgres/data4" "${HOME}/postgres/data5")
+declare -a worker_datadirs=("/tmp/data2" "/tmp/data3" "/tmp/data4" "/tmp/data5")
 declare -a worker_ports=("5433" "5434" "5435" "5436")
 
 function run_demo()
 {
     :
-    psql -p 5433 -c "drop table if exists pt cascade;"
-    psql -p 5433 -c "CREATE TABLE pt(id INT NOT NULL, payload REAL);"
-    psql -p 5433 -c "INSERT INTO pt SELECT generate_series(1, 10), random();"
-    psql -c "select shardman.add_node('port=5433');"
-    psql -c "select shardman.add_node('port=5434');"
-    psql -c "select shardman.add_node('port=5435');"
-    psql -c "select shardman.add_node('port=5436');"
-    sleep 5
-    psql -c "select shardman.create_hash_partitions(2, 'pt', 'id', 4, true);"
 
-    # psql -c "select shardman.create_replica('pt_0', 3);"
-    # psql -c "select shardman.create_replica('pt_0', 5);"
-    # psql -c "select shardman.move_part('pt_0', 4, 3);"
+for port in "${worker_ports[@]}" $lord_port; do
+    psql -p $port -c "set synchronous_commit to local; drop role if exists joe; create role joe login password '12345'; grant usage on FOREIGN DATA WRAPPER postgres_fdw to joe;"
+done
+
+    psql -c "drop table if exists t cascade;"
+    psql -c "CREATE TABLE t(i int);"
+    psql -c "drop table if exists t cascade;"
+    psql -c "CREATE TABLE t(i int);"
+
+
+    psql -c "drop table if exists pt cascade;"
+    psql -c "CREATE TABLE pt(id INT primary key, payload REAL);"
+    psql -c "INSERT INTO pt SELECT generate_series(1, 10), random();"
+
+    psql -c "select shardman.add_node('port=5433', conn_string => 'user=joe password=12345 dbname=ars port=5433');"
+    psql -c "select shardman.add_node('port=5434', conn_string => 'user=joe password=12345 dbname=ars port=5434');"
+    psql -c "select shardman.add_node('port=5435', conn_string => 'user=joe password=12345 dbname=ars port=5435');"
+    psql -c "select shardman.add_node('port=5436', conn_string => 'user=joe password=12345 dbname=ars port=5436');"
+
+    psql -c "select shardman.create_hash_partitions('pt', 'id', 4);"
+    psql -c "select shardman.set_redundancy('pt', 2);"
+
+    # psql -c "select shardman.create_hash_partitions(2, 'pt', 'id', 4, true);"
+    # psql -c "select shardman.set_replevel('pt', 1);"
+
+    # psql -c "drop table if exists pgbench_accounts cascade";
+    # psql -c "drop table if exists pgbench_tellers cascade";
+    # psql -c "drop table if exists pgbench_branches cascade";
+    # psql -c "drop table if exists pgbench_tellers cascade;"
+    # psql -c "drop table if exists pgbench_accounts cascade;"
+    # pgbench -s 5 -i
+    # psql -c "select shardman.create_hash_partitions(2, 'pgbench_accounts', 'aid', 4);"
+    # psql -c "select shardman.set_replevel('pgbench_accounts', 1);"
+    # psql -c "select shardman.create_hash_partitions(2, 'pgbench_tellers', 'tid', 10);"
+    # psql -c "select shardman.set_replevel('pgbench_tellers', 1);"
+    # psql -c "select shardman.create_hash_partitions(2, 'pgbench_branches', 'bid', 10);"
+    # psql -c "select shardman.set_replevel('pgbench_branches', 1);"
+    # for port in "${worker_ports[@]}"; do
+    # 	psql -p $port -f /home/ars/postgres/pg_shardman/bin/pgbench_history.sql
+    # done
 }
