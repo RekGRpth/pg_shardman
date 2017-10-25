@@ -11,12 +11,14 @@
 #include "miscadmin.h"
 #include "executor/spi.h"
 #include "funcapi.h"
+#include "pgstat.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "catalog/pg_type.h"
 #include "access/htup_details.h"
+#include "storage/latch.h"
 
 /* ensure that extension won't load against incompatible version of Postgres */
 PG_MODULE_MAGIC;
@@ -28,6 +30,7 @@ PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
 PG_FUNCTION_INFO_V1(pq_conninfo_parse);
 
 /* GUC variables */
+static bool is_shardlord;
 static bool sync_replication;
 static char *shardlord_connstring;
 
@@ -44,6 +47,16 @@ _PG_init()
 		"Toggle synchronous replication",
 		NULL,
 		&sync_replication,
+		false,
+		PGC_SUSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"shardman.shardlord",
+		"This node is the shardlord?",
+		NULL,
+		&is_shardlord,
 		false,
 		PGC_SUSET,
 		0,
@@ -73,6 +86,30 @@ synchronous_replication(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(sync_replication);
 }
 
+static bool
+wait_command_completion(PGconn* conn)
+{
+	while (PQisBusy(conn))
+	{
+		/* Sleep until there's something to do */
+		int wc = WaitLatchOrSocket(MyLatch,
+								   WL_LATCH_SET | WL_SOCKET_READABLE,
+								   PQsocket(conn),
+								   -1L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* Data available in socket? */
+		if (wc & WL_SOCKET_READABLE)
+		{
+			if (!PQconsumeInput(conn))
+				return false;
+		}
+	}
+	return  true;
+}
+
 Datum
 broadcast(PG_FUNCTION_ARGS)
 {
@@ -80,6 +117,7 @@ broadcast(PG_FUNCTION_ARGS)
 	bool  ignore_errors = PG_GETARG_BOOL(1);
 	bool  two_phase = PG_GETARG_BOOL(2);
 	bool  sync_commit = PG_GETARG_BOOL(3);
+	bool  sequential = PG_GETARG_BOOL(4);
 	char* sep;
 	PGresult *res;
 	char* fetch_node_connstr;
@@ -113,16 +151,22 @@ broadcast(PG_FUNCTION_ARGS)
 			elog(ERROR, "SHARDMAN: Invalid command string: %s", sql);
 		}
 		sql += n;
-		fetch_node_connstr = psprintf("select connection_string from shardman.nodes where id=%d", node_id);
-		if (SPI_exec(fetch_node_connstr, 0) < 0 || SPI_processed != 1)
+		if (node_id != 0)
 		{
-			elog(ERROR, "SHARDMAN: Failed to fetch connection string for node %d",
-				 node_id);
+			fetch_node_connstr = psprintf("select connection_string from shardman.nodes where id=%d", node_id);
+			if (SPI_exec(fetch_node_connstr, 0) < 0 || SPI_processed != 1)
+			{
+				elog(ERROR, "SHARDMAN: Failed to fetch connection string for node %d",
+					 node_id);
+			}
+			pfree(fetch_node_connstr);
+
+			conn_str = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 		}
-		pfree(fetch_node_connstr);
-
-		conn_str = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-
+		else
+		{
+			conn_str = shardlord_connstring;
+		}
 		if (n_cmds >= n_cons)
 		{
 			conn = (PGconn**) repalloc(conn, sizeof(PGconn*) * (n_cons *= 2));
@@ -154,7 +198,8 @@ broadcast(PG_FUNCTION_ARGS)
 			}
 		}
 		elog(DEBUG1, "Send command '%s' to node %d", sql, node_id);
-		if (!PQsendQuery(conn[n_cmds - 1], sql))
+		if (!PQsendQuery(conn[n_cmds - 1], sql)
+			|| (sequential && !wait_command_completion(conn[n_cmds - 1])))
 		{
 			if (ignore_errors)
 			{
@@ -169,6 +214,7 @@ broadcast(PG_FUNCTION_ARGS)
 		}
 		if (!sync_commit)
 			pfree(sql);
+
 		sql = sep + 1;
 	}
 

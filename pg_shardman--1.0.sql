@@ -115,14 +115,15 @@ BEGIN
 	THEN
 		-- Take all nodes in replicationg group excluding myself
 		FOR node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group LOOP
-		sync_standbys :=
-			coalesce(ARRAY(SELECT format('sub_%s_%s', id, node.id) FROM shardman.nodes
+			-- Construct list of synchronous standbyes=subscriptions to this node
+			sync_standbys :=
+				 coalesce(ARRAY(SELECT format('sub_%s_%s', id, node.id) FROM shardman.nodes
 				   WHERE replication_group = repl_group AND id <> node.id), '{}'::text[]);
-		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to ''FIRST %s (%s)'';',
-					   sync, node.id, array_length(sync_standbys, 1),
-					   array_to_string(sync_standbys, ','));
-		conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
-	END LOOP;
+			sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to ''FIRST %s (%s)'';',
+				 sync, node.id, array_length(sync_standbys, 1),
+				 array_to_string(sync_standbys, ','));
+			conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
+		END LOOP;
 
 	    PERFORM shardman.broadcast(sync, sync_commit => true);
 	    PERFORM shardman.broadcast(conf);
@@ -299,7 +300,7 @@ BEGIN
 			    pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 				     pubs, new_master_id, repl.node_id, part.part_name);
 				-- And refresh subscriptions and replicas
-				subs := format('%s%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;',
+				subs := format('%s%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION WITH (copy_data=false);',
 					 subs, repl.node_id, repl.node_id, new_master_id);
 			END LOOP;
 
@@ -343,7 +344,7 @@ $$ LANGUAGE plpgsql;
 -- It also scatter partitions through all nodes.
 -- This function expects that empty table is created at shardlord.
 -- So it can be executed only at shardlord and there is no need to redirect this function to shardlord.
-CREATE FUNCTION create_hash_partitions(rel regclass, expr text, part_count int)
+CREATE FUNCTION create_hash_partitions(rel regclass, expr text, part_count int, redundancy int = 0)
 RETURNS void AS $$
 DECLARE
 	create_table text;
@@ -362,7 +363,7 @@ DECLARE
 	i int;
 	n_nodes int;
 BEGIN
-	IF EXISTS(SELECT relation FROM shardman.partitions WHERE relation = rel_name)
+	IF EXISTS(SELECT relation FROM shardman.tables WHERE relation = rel_name)
 	THEN
 		RAISE EXCEPTION 'Table % is already sharded', rel_name;
 	END IF;
@@ -419,13 +420,18 @@ BEGIN
 	PERFORM shardman.broadcast(create_fdws);
 	-- Broadcast replace hash partition commands
 	PERFORM shardman.broadcast(replace_parts);
+
+	IF redundancy <> 0
+	THEN
+		PERFORM shardman.set_redundancy(rel, redundancy, copy_data => false);
+	END IF;
 END
 $$ LANGUAGE plpgsql;
 
 -- Provide requested level of redundancy. 0 means no redundancy.
 -- If existing level of redundancy is greater than specified, then right now this
 -- function does nothing.
-CREATE FUNCTION set_redundancy(rel regclass, redundancy int)
+CREATE FUNCTION set_redundancy(rel regclass, redundancy int, copy_data bool = true)
 RETURNS void AS $$
 DECLARE
 	part shardman.partitions;
@@ -435,10 +441,15 @@ DECLARE
 	pubs text = '';
 	subs text = '';
 	rel_name text = rel::text;
+	sub_options text = '';
 BEGIN
 	IF shardman.redirect_to_shardlord(format('set_redundancy(%L, %L)', rel_name, redundancy))
 	THEN
 		RETURN;
+	END IF;
+
+	IF NOT copy_data THEN
+	    sub_options := ' WITH (copy_data=false)';
 	END IF;
 
 	-- Loop through all partitions of this table
@@ -460,8 +471,8 @@ BEGIN
 				-- Establish publications and subscriptions for this partition
 				pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 					 pubs, part.node_id, repl_node, part.part_name);
-				subs := format('%s%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;',
-					 subs, repl_node, repl_node, part.node_id);
+				subs := format('%s%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION%s;',
+					 subs, repl_node, repl_node, part.node_id, sub_options);
 			END LOOP;
 		END IF;
 	END LOOP;
@@ -469,7 +480,7 @@ BEGIN
 	-- Broadcast alter publication commands
 	PERFORM shardman.broadcast(pubs);
 	-- Broadcast alter subscription commands
-	PERFORM shardman.broadcast(subs);
+	PERFORM shardman.broadcast(subs, synchronous => copy_data);
 
 	-- This function doesn't wait completion of replication sync
 END
@@ -585,8 +596,8 @@ BEGIN
 			 			  %s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 			 pubs, src_node_id, repl_node_id, mv_part_name,
 			 	   dst_node_id, repl_node_id, mv_part_name);
-		subs := format('%s%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;
-			 			  %s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;',
+		subs := format('%s%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION WITH (copy_data=false);
+			 			  %s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION WITH (copy_data=false);',
 			 subs, repl_node_id, repl_node_id, src_node_id,
 			 	   repl_node_id, repl_node_id, dst_node_id);
 	END LOOP;
@@ -691,8 +702,11 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- prepared with subsequent commit or rollback of prepared transaction at second
 -- phase of two phase commit.
 -- If sync_commit is false, we do set session synchronous_commit to local;
-CREATE FUNCTION broadcast(cmds text, ignore_errors bool = false,
-						  two_phase bool = false, sync_commit bool = false)
+CREATE FUNCTION broadcast(cmds text,
+						  ignore_errors bool = false,
+						  two_phase bool = false,
+						  sync_commit bool = false,
+						  synchronous bool = false)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Options to postgres_fdw are specified in two places: user & password in user
