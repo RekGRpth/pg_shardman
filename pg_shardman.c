@@ -25,12 +25,13 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(shardlord_connection_string);
 PG_FUNCTION_INFO_V1(synchronous_replication);
+PG_FUNCTION_INFO_V1(is_shardlord);
 PG_FUNCTION_INFO_V1(broadcast);
 PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
 PG_FUNCTION_INFO_V1(pq_conninfo_parse);
 
 /* GUC variables */
-static bool is_shardlord;
+static bool is_lord;
 static bool sync_replication;
 static char *shardlord_connstring;
 
@@ -56,7 +57,7 @@ _PG_init()
 		"shardman.shardlord",
 		"This node is the shardlord?",
 		NULL,
-		&is_shardlord,
+		&is_lord,
 		false,
 		PGC_SUSET,
 		0,
@@ -84,6 +85,12 @@ Datum
 synchronous_replication(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_BOOL(sync_replication);
+}
+
+Datum
+is_shardlord(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(is_lord);
 }
 
 static bool

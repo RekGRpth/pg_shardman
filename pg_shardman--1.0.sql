@@ -662,12 +662,10 @@ $$ LANGUAGE sql;
 
 -- Execute command at shardlord
 CREATE FUNCTION redirect_to_shardlord(cmd text) RETURNS bool AS $$
-DECLARE
-	am_shardlord bool;
 BEGIN
-	SELECT setting::bool INTO am_shardlord FROM pg_settings WHERE name = 'shardman.shardlord';
-	IF NOT am_shardlord THEN
-		PERFORM shardman.broadcast(format('0:SELECT %s;', cmd));
+	IF NOT shardman.is_shardlord() THEN
+	    RAISE NOTICE 'Redirect command "%" to shardlord',cmd;
+		PERFORM shardman.broadcast(format('0:SELECT shardman.%s;', cmd));
 		RETURN true;
 	ELSE
 		RETURN false;
@@ -772,8 +770,12 @@ CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals te
 CREATE FUNCTION shardlord_connection_string()
 	RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
--- Check from configuration parameters is synchronous replication mode was enabled
+-- Check from configuration parameters if synchronous replication mode was enabled
 CREATE FUNCTION synchronous_replication()
+	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
+
+-- Check from configuration parameters if node plays role of shardlord
+CREATE FUNCTION is_shardlord()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Wait completion of partition copy using LR
