@@ -664,14 +664,37 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Get redundancy of the particular partition
+-- This command can be executed only at shardlord.
 CREATE FUNCTION get_redundancy_of_partition(pname text) returns bigint AS $$
 	SELECT count(*) FROM shardman.replicas where part_name=pname;
 $$ LANGUAGE sql;
 
--- Get minimal redundancy of the specified relation
+-- Get minimal redundancy of the specified relation.
+-- This command can be executed only at shardlord.
 CREATE FUNCTION get_min_redundancy(rel regclass) returns bigint AS $$
 	SELECT min(redundancy) FROM (SELECT count(*) redundancy FROM shardman.replicas WHERE relation=rel::text GROUP BY part_name) s;
 $$ LANGUAGE sql;
+
+-- Execute command at all shardman nodes.
+-- It can be used to perform DDL at all nodes.
+CREATE FUNCTION forall(sql text, use_2pc bool = false) returns void AS $$
+DECLARE
+	node_id integer;
+	cmds text = '';
+BEGIN
+	IF shardman.redirect_to_shardlord(format('forall(%L, %L)', sql, use_2pc))
+	THEN
+		RETURN;
+	END IF;
+
+	-- Loop through all nodes
+	FOR node_id IN SELECT * from shardman.nodes
+	LOOP
+		cmds := format('%s%s:%s;', cmds, node_id, sql);
+	END LOOP;
+	PERFORM shardman.broadcast(cmds, two_phase => use_2pc);
+END
+$$ LANGUAGE plpgsql;
 
 ---------------------------------------------------------------------
 -- Utility functions
