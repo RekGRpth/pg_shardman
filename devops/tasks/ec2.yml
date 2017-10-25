@@ -1,0 +1,13 @@
+---
+
+  - name: start {{ count }} {{ instance_type }} instances
+    ec2:
+      key_name: "{{ key_name }}"
+      instance_type: "{{ instance_type }}"
+      image: "{{ image }}"
+      group: "{{ security_group }}"
+      count: "{{ count }}"
+      vpc_subnet_id: "{{ vpc_subnet_id }}"
+      region: "{{ region }}"
+      wait: yes
+      assign_public_ip: yes

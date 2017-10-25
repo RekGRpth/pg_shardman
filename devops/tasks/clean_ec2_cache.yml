@@ -1,0 +1,5 @@
+---
+
+- name: clean ec2 cache
+  local_action: shell rm -rf ~/.ansible/tmp/ansible-ec2-*
+  run_once: True

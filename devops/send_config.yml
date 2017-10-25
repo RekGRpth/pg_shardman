@@ -1,0 +1,38 @@
+### send configs and restart nodes
+# Templates in the root of the project are copied automatically. You can append
+# something to them by creating same-titled in this (devops/) directory, they
+# are not tracked by git.
+# BTW, you can refer to ansible vars there.
+# The only guc we manage dynamically by default is shardlord_connstring, it
+# requires inventory knowledge
+
+---
+- hosts: shardlord
+  tasks:
+  - name: copy postgresql.conf to shardlord
+    template:
+      src=templates/postgresql.conf.lord.j2
+      dest="{{ pg_conffile }}"
+
+- hosts: workers
+  tasks:
+  - name: copy postgresql.conf to workers
+    template:
+      src=templates/postgresql.conf.worker.j2
+      dest="{{ pg_conffile }}"
+
+- import_playbook: pg_ctl.yml pg_ctl_action=restart
+
+- hosts: workers
+  tasks:
+  - name: copy pgbouncer.conf to workers
+    template:
+      src=templates/pgbouncer.conf.j2
+      dest="{{ pgbouncer_conf }}"
+    tags:
+      - pgbouncer
+
+  - name: start pgbouncer
+    command: pgbouncer --daemon "{{ pgbouncer_conf }}"
+    tags:
+     - pgbouncer

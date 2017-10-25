@@ -1,0 +1,112 @@
+### Run pgbench benchmark.
+# Controlling vars: tmstmp (true/false), tname, pgbench_opts
+
+
+# set global var to use in all plays, oh my
+- hosts: nodes:localhost
+  vars:
+    tmstmp: True
+    tname: pgbench
+  tasks:
+  - name: gen test date
+    local_action: command date "+%Y-%m-%d-%H-%M"
+    run_once: true
+    register: now
+
+  - set_fact: test_id="{{ tname }}"
+  - set_fact: test_id="{{ test_id }}-{{ now.stdout }}"
+    when: tmstmp
+
+# run pgbench on active_workers workers, by default all of them.
+- hosts: workers[0:{{ (active_workers | int ) - 1 }}]
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ fg_path }}:{{ ansible_env.PATH }}"
+  vars:
+    active_workers: "{{ groups['workers'] | length }}"
+    pgbench_opts: ""
+
+  tasks:
+  - name: vacuum
+    command: >
+      psql -p {{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }} -U {{ ansible_user }} -c "VACUUM;"
+
+  - name: run pgbench -p {{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }} --report-latencies --no-vacuum {{ pgbench_opts }}
+    shell: >
+      pgbench -p {{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }} --report-latencies --no-vacuum
+      {{ pgbench_opts }} 2>&1 > "{{ test_id }}.out"
+
+  - name: clear log dir
+    local_action: file path="res/{{ test_id }}/" state=absent
+    run_once: true
+
+  - name: fetch pgbench exec times
+    fetch:
+      src: "{{ test_id }}.out"
+      dest: res/{{ test_id }}/pgbench/{{ inventory_hostname }}.out
+      flat: yes
+
+  - name: grep tps
+    local_action: >
+      shell grep -h -R "tps.*including" res/{{ test_id }}/pgbench/ |
+      awk '{print $3}' > res/{{ test_id }}/tps.txt
+    run_once: true
+
+  - name: calc sum tps
+    local_action: >
+      shell echo -e "sum: \n`awk '{ sum += $1 } END { print sum }'
+      res/{{ test_id }}/tps.txt`" >> res/{{test_id}}/tps.txt
+    run_once: true
+
+  - name: collect worker conf
+    fetch:
+      src: "{{ pg_conffile }}"
+      dest: res/{{ test_id }}/postgresql.conf.worker
+      flat: yes
+    run_once: true
+    tags:
+      - dump
+
+  - name: collect pg_config
+    shell: pg_config > "pg_config.out"
+    run_once: true
+    tags:
+      - dump
+
+  - name: collect pg_config
+    fetch:
+      src: "pg_config.out"
+      dest: res/{{ test_id }}/pg_config.out
+      flat: yes
+    run_once: true
+    tags:
+      - dump
+
+- import_playbook: logs.yml logs=res/{{ test_id }}/logs
+  tags:
+    - logs
+    - dump
+
+- hosts: shardlord
+  tasks:
+  - name: collect shardlord conf
+    fetch:
+      src: "{{ pg_conffile }}"
+      dest: res/{{ test_id }}/postgresql.conf.lord
+      flat: yes
+    run_once: true
+    tags:
+      - dump
+
+- hosts: localhost
+  tasks:
+  - name: Dump all vars
+    action: template src=templates/dumpallvars.j2 dest=res/{{ test_id }}/allvars.txt
+    tags:
+      - dump
+
+  - name: print tps
+    local_action: shell cat res/{{ test_id }}/tps.txt
+    register: tps
+    run_once: true
+
+  - debug: msg="{{ tps.stdout_lines }}. test_id is {{ test_id }}"

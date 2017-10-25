@@ -52,3 +52,6 @@ effective_cache_size = 512MB
 work_mem = 4MB
 max_connections = 1000
 max_wal_size = 5GB
+
+postgres_fdw.use_2pc = on
+postgres_fdw.use_repeatable_read = off

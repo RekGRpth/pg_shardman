@@ -1,0 +1,14 @@
+*.retry
+inventory_manual/manual
+logs/
+res/
+tester_res.csv*
+wal_lag.txt
+
+/postgresql.conf.common
+/postgresql.conf.lord
+/postgresql.conf.worker
+
+# vagrant stuff
+*.log
+.vagrant/

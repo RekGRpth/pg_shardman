@@ -1,0 +1,77 @@
+### initdb, send configs and add all workers.
+
+---
+- hosts: nodes
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: pkill pg
+    shell: 'pkill -9 postgres || true'
+    tags:
+      - initdb
+
+  - name: kill bouncer
+    shell: 'pkill -SIGINT pgbouncer || true'
+
+  - name: remove datadirs on datanodes
+    file: path={{pg_datadir}} state=absent
+    tags:
+      - initdb
+
+  - name: create datadirs on datanodes
+    command: "initdb {{pg_datadir}}"
+    tags:
+      - initdb
+
+  - import_tasks: tasks/pg_ctl.yml pg_ctl_action=start
+    tags:
+      - initdb
+
+  - name: create whoami database
+    command: "createdb {{ ansible_user }}"
+    tags:
+      - initdb
+
+  - name: enable blind trust
+    lineinfile:
+      dest: "{{pg_datadir}}/pg_hba.conf"
+      line: "{{item}}"
+      state: present
+    with_items:
+      - "host all all 0.0.0.0/0 trust"
+      - "host replication all 0.0.0.0/0 trust"
+      - "local replication all trust"
+
+- import_playbook: send_config.yml
+
+- hosts: nodes
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: create extension pg_shardman
+    command: psql -p {{ pg_port }} -c "create extension pg_shardman cascade;"
+    tags:
+      - create_ext
+
+- hosts: shardlord
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+
+  tasks:
+  - name: add ec2 workers
+    command: >
+      psql -p {{ pg_port }} -c "select shardman.add_node(
+      'hostaddr={{ hostvars[item]['ec2_private_ip_address'] }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}')"
+    with_items: "{{ groups.ec2_workers }}"
+    tags:
+      - add_nodes
+
+  - name: add manual workers
+    command: >
+      psql -p {{ pg_port }} -c "select shardman.add_node(
+      'hostaddr={{ item }} port={{ pg_port }}')"
+    with_items: "{{ groups.manual_workers }}"
+    tags:
+      - add_nodes
