@@ -11,6 +11,9 @@
     tags:
       - initdb
 
+  - name: kill bouncer
+    shell: 'pkill -SIGINT pgbouncer || true'
+
   - name: remove datadirs on datanodes
     file: path={{pg_datadir}} state=absent
     tags:
@@ -60,7 +63,7 @@
   - name: add ec2 workers
     command: >
       psql -p {{ pg_port }} -c "select shardman.add_node(
-      'hostaddr={{ hostvars[item]['ec2_private_ip_address'] }} port={{ pg_port }}')"
+      'hostaddr={{ hostvars[item]['ec2_private_ip_address'] }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}')"
     with_items: "{{ groups.ec2_workers }}"
     tags:
       - add_nodes

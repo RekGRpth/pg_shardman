@@ -32,6 +32,13 @@ pg_logfile="{{pg_datadir}}/pg.log"
 pg_conffile="{{pg_datadir}}/postgresql.conf"
 pg_port=5432
 
+pgbouncer_src = "{{ pg_prefix }}/pgbouncer-1.7.2"
+pgbouncer_dst = "{{ pg_prefix }}/pgbouncer_install"
+pgbouncer_conf = "/home/{{ ansible_user }}/pgbouncer.conf"
+pgbouncer_port = 6543
+pgbouncer_logfile = /tmp/pgbouncer.log
+use_pgbouncer = False
+
 pathman_repo=https://github.com/postgrespro/pg_pathman.git
 pathman_src="{{pg_prefix}}/pg_pathman"
 pathman_version_tag=master

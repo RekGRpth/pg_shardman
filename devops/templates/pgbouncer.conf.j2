@@ -1,0 +1,10 @@
+[databases]
+{{ ansible_user }} = host=127.0.0.1 user={{ ansible_user }} port = {{ pg_port }}
+
+[pgbouncer]
+pool_mode = session
+listen_port = {{ pgbouncer_port }}
+listen_addr = *
+auth_type = any
+logfile = {{ pgbouncer_logfile }}
+pidfile = pgbouncer.pid

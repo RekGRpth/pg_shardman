@@ -1,8 +1,8 @@
 ### create pgbench_history everywhere, create pgbench tables on init node,
 # shard them. TODO: drop sharded tables.
-# Controlling vars: scale, nparts, repfactor
+# Controlling vars: scale, nparts, repfactor, use_pgbouncer
 
-# This is useful since we don't drop tables yet
+# We need this since we don't drop tables yet
 - import_playbook: init.yml
   tags:
     - init

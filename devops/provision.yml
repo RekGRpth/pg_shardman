@@ -21,7 +21,7 @@
   - name: mount tmpfs as /tmp
     mount: >
       name=/tmp src='tmpfs' fstype=tmpfs
-      opts='size={{ (ansible_memtotal_mb * 0.75) | int }}m' state=mounted
+      opts='size={{ (ansible_memtotal_mb * 0.5) | int }}m' state=mounted
     become: yes
     tags:
       - tmpfs
@@ -31,6 +31,11 @@
     become: yes
     tags:
       - apt_cache
+
+  - name: create pg dir
+    file: path="{{ pg_prefix }}" state=directory
+    tags:
+      - always
 
   - name: ensure dependencies (Debian)
     apt: name={{item}} state=installed
@@ -44,9 +49,11 @@
     - libreadline-dev
     - zlib1g-dev
     - gdb
+    - libevent-dev # for pgbouncer
     when: ansible_os_family == "Debian"
     become: yes
     tags:
+      - ensure_deps
       - build_pg
 
   - name: clone postgres sources {{ pg_repo }}/{{ pg_version_tag }}
@@ -110,6 +117,21 @@
     tags:
       - build_shardman
 
+  - name: download & unpack pgbouncer
+    unarchive:
+      src: https://pgbouncer.github.io/downloads/files/1.7.2/pgbouncer-1.7.2.tar.gz
+      dest: "{{ pg_prefix }}"
+      remote_src: yes
+    tags:
+      - pgbouncer
+
+  - name: build & install pgbouncer
+    shell: ./configure --prefix={{pgbouncer_dst}} --without-openssl && make clean && make -j {{makejobs}} && make install
+    args:
+      chdir: "{{ pgbouncer_src }}"
+    tags:
+      - pgbouncer
+
   # to run something iff tags were specified
   - shell: /bin/true
     register: tags_not_specified
@@ -154,7 +176,7 @@
 
   - name: set PATH to pg binaries in .bashrc.
     # It is important to insert at the beginning, otherwise non-interactive shells won't read this.
-    lineinfile: dest=~/.bashrc insertbefore=BOF line="export PATH={{ pg_dst }}/bin:$PATH"
+    lineinfile: dest=~/.bashrc insertbefore=BOF line="export PATH={{ pg_dst }}/bin:{{ pgbouncer_dst }}/bin:$PATH"
     tags:
       - set_path
       - ars

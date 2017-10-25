@@ -22,3 +22,17 @@
       dest="{{ pg_conffile }}"
 
 - import_playbook: pg_ctl.yml pg_ctl_action=restart
+
+- hosts: workers
+  tasks:
+  - name: copy pgbouncer.conf to workers
+    template:
+      src=templates/pgbouncer.conf.j2
+      dest="{{ pgbouncer_conf }}"
+    tags:
+      - pgbouncer
+
+  - name: start pgbouncer
+    command: pgbouncer --daemon "{{ pgbouncer_conf }}"
+    tags:
+     - pgbouncer

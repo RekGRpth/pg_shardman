@@ -28,11 +28,11 @@
   tasks:
   - name: vacuum
     command: >
-      psql -p {{ pg_port }} -U {{ ansible_user }} -c "VACUUM;"
+      psql -p {{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }} -U {{ ansible_user }} -c "VACUUM;"
 
-  - name: run pgbench --report-latencies --no-vacuum {{ pgbench_opts }}
+  - name: run pgbench -p {{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }} --report-latencies --no-vacuum {{ pgbench_opts }}
     shell: >
-      pgbench -p {{ pg_port }} --report-latencies --no-vacuum
+      pgbench -p {{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }} --report-latencies --no-vacuum
       {{ pgbench_opts }} 2>&1 > "{{ test_id }}.out"
 
   - name: clear log dir
