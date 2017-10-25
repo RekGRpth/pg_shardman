@@ -16,6 +16,7 @@
 -- List of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
+	super_connection_string text UNIQUE NOT NULL,
 	connection_string text UNIQUE NOT NULL,
 	replication_group text NOT NULL -- group of nodes within which shard replicas are allocated
 );
@@ -45,8 +46,17 @@ CREATE TABLE replicas (
 
 -- Shardman interface functions
 
--- Add a node: adjust logical replication channels in replication group and create foreign servers
-CREATE FUNCTION add_node(conn_string text, repl_group text = 'all') RETURNS void AS $$
+-- Add a node: adjust logical replication channels in replication group and
+-- create foreign servers.
+-- 'super_conn_string' is connection string to the node which allows to login to
+-- the node as superuser, and 'conn_string' can be some other connstring.
+-- The former is used for configuring logical replication, the latter for DDL
+-- and for setting up FDW. This separation serves two purposes:
+-- * It allows to access data without requiring superuser priviliges;
+-- * It allows to set up pgbouncer, as replication can't go through it.
+-- If conn_string is null, super_conn_string is used everywhere.
+CREATE FUNCTION add_node(super_conn_string text, conn_string text = NULL,
+						 repl_group text = 'all') RETURNS void AS $$
 DECLARE
 	new_node_id int;
     node shardman.nodes;
@@ -71,14 +81,18 @@ DECLARE
 	fdw_part_name text;
 	table_attrs text;
 	srv_name text;
+	conn_string_effective text = COALESCE(conn_string, super_conn_string);
 BEGIN
-	IF shardman.redirect_to_shardlord(format('add_node(%L, %L)', conn_string, repl_group))
+	IF shardman.redirect_to_shardlord(
+		format('add_node(%L, %L, %L)', super_conn_string, conn_string, repl_group))
 	THEN
 		RETURN;
 	END IF;
 
 	-- Insert new node in nodes table
-	INSERT INTO shardman.nodes (connection_string,replication_group) VALUES (conn_string, repl_group) RETURNING id INTO new_node_id;
+	INSERT INTO shardman.nodes (super_connection_string, connection_string, replication_group)
+	VALUES (super_conn_string, conn_string_effective, repl_group)
+		   RETURNING id INTO new_node_id;
 
 	-- Adjust replication channels within replication group.
 	-- We need all-to-all replication channels between all group members.
@@ -100,14 +114,14 @@ BEGIN
 		subs := format('%s%s:CREATE SUBSCRIPTION sub_%s_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);
 			 			  %s:CREATE SUBSCRIPTION sub_%s_%s CONNECTION %L PUBLICATION node_%s with (create_slot=false, slot_name=''node_%s'', synchronous_commit=local);',
 						  subs,
-						  node.id, node.id, new_node_id, conn_string, node.id, node.id,
-			 			  new_node_id, new_node_id, node.id, node.connection_string, new_node_id, new_node_id);
+						  node.id, node.id, new_node_id, super_conn_string, node.id, node.id,
+			 			  new_node_id, new_node_id, node.id, node.super_connection_string, new_node_id, new_node_id);
 	END LOOP;
 
 	-- Broadcast create publication commands
-    PERFORM shardman.broadcast(pubs);
+    PERFORM shardman.broadcast(pubs, super_connstr => true);
 	-- Broadcast create subscription commands
-	PERFORM shardman.broadcast(subs);
+	PERFORM shardman.broadcast(subs, super_connstr => true);
 
 	-- In case of synchronous replication broadcast update synchronous standby list commands
 	IF shardman.synchronous_replication() AND
@@ -125,8 +139,8 @@ BEGIN
 			conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
 		END LOOP;
 
-	    PERFORM shardman.broadcast(sync, sync_commit => true);
-	    PERFORM shardman.broadcast(conf);
+	    PERFORM shardman.broadcast(sync, sync_commit_on => true, super_connstr => true);
+	    PERFORM shardman.broadcast(conf, super_connstr => true);
 	END IF;
 
 	-- Add foreign servers for connection to the new node and backward
@@ -251,9 +265,10 @@ BEGIN
 	END LOOP;
 
 	-- Broadcast drop subscription commands, ignore errors because removed node may be not available
-	PERFORM shardman.broadcast(subs, ignore_errors:=true, sync_commit => true);
+	PERFORM shardman.broadcast(subs, ignore_errors:=true, sync_commit_on => true,
+							   super_connst => true);
 	-- Broadcast drop replication commands
-    PERFORM shardman.broadcast(pubs, ignore_errors:=true);
+    PERFORM shardman.broadcast(pubs, ignore_errors:=true, super_connstr => true);
 
 	-- In case of synchronous replication update synchronous standbys list
 	IF shardman.synchronous_replication()
@@ -261,8 +276,9 @@ BEGIN
 		-- On removed node, reset synchronous standbys list
 		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to '''';',
 			 sync, rm_node_id, sync_standbys);
-	    PERFORM shardman.broadcast(sync, ignore_errors => true, sync_commit => true);
-	    PERFORM shardman.broadcast(conf, ignore_errors:=true);
+	    PERFORM shardman.broadcast(sync, ignore_errors => true,
+								   sync_commit_on => true, super_connstr => true);
+	    PERFORM shardman.broadcast(conf, ignore_errors:=true, super_connstr => true);
 	END IF;
 
 	-- Remove foreign servers at all nodes for the removed node
@@ -305,9 +321,9 @@ BEGIN
 			END LOOP;
 
 			-- Broadcast alter publication commands
-			PERFORM shardman.broadcast(pubs);
+			PERFORM shardman.broadcast(pubs, super_connstr => true);
 			-- Broadcast refresh alter subscription commands
-			PERFORM shardman.broadcast(subs);
+			PERFORM shardman.broadcast(subs, super_connstr => true);
 		ELSE -- there is no replica: we have to create new empty partition at random mode and redirect all FDWs to it
 			SELECT id INTO new_master_id FROM shardman.nodes WHERE id<>rm_node_id ORDER BY random() LIMIT 1;
 		    INSERT INTO shardman.partitions (part_name,node_id,relation) VALUES (part.part.name,new_master_id,part.relation);
@@ -478,15 +494,16 @@ BEGIN
 	END LOOP;
 
 	-- Broadcast alter publication commands
-	PERFORM shardman.broadcast(pubs);
+	PERFORM shardman.broadcast(pubs, super_connstr => true);
 	-- Broadcast alter subscription commands
-	PERFORM shardman.broadcast(subs, synchronous => copy_data);
+	PERFORM shardman.broadcast(subs, synchronous => copy_data, super_connstr => true);
 
 	-- This function doesn't wait completion of replication sync
 END
 $$ LANGUAGE plpgsql;
 
--- Remove table from all nodes. All table partitions are removed.
+-- Remove table from all nodes. All table partitions are removed, but replicas
+-- and logical stuff not.
 CREATE FUNCTION rm_table(rel regclass)
 RETURNS void AS $$
 DECLARE
@@ -547,7 +564,7 @@ BEGIN
 	END IF;
 	src_node_id := part.node_id;
 
-	SELECT replication_group,connection_string INTO src_repl_group,conn_string FROM shardman.nodes WHERE id=src_node_id;
+	SELECT replication_group, super_connection_string INTO src_repl_group, conn_string FROM shardman.nodes WHERE id=src_node_id;
 	SELECT replication_group INTO dst_repl_group FROM shardman.nodes WHERE id=dst_node_id;
 
 	IF src_node_id = dst_node_id THEN
@@ -576,8 +593,8 @@ BEGIN
 		 dst_node_id, mv_part_name, conn_string, mv_part_name, mv_part_name);
 
 	-- Create publication and slot for copying
-	PERFORM shardman.broadcast(pubs);
-	PERFORM shardman.broadcast(subs);
+	PERFORM shardman.broadcast(pubs, super_connstr => true);
+	PERFORM shardman.broadcast(subs, super_connstr => true);
 
 	-- Wait completion of partition copy and prohibit access to this partition
 	PERFORM shardman.wait_copy_completion(src_node_id, mv_part_name);
@@ -603,12 +620,12 @@ BEGIN
 	END LOOP;
 
 	-- Broadcast alter publication commands
-	PERFORM shardman.broadcast(pubs);
+	PERFORM shardman.broadcast(pubs, super_connstr => true);
 	-- Broadcast alter subscription commands
-	PERFORM shardman.broadcast(subs);
+	PERFORM shardman.broadcast(subs, super_connstr => true);
 	-- Drop copy subscription
 	PERFORM shardman.broadcast(format('%s:DROP SUBSCRIPTION copy_%s;',
-		 dst_node_id, mv_part_name), sync_commit:=true);
+		 dst_node_id, mv_part_name), sync_commit_on => true, super_connstr => true);
 
     -- Update owner of this partition
 	UPDATE shardman.partitions SET node_id=dst_node_id WHERE part_name=mv_part_name;
@@ -687,6 +704,7 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- prefix: node-id:sql-statement;
 -- To run multiple statements on node, wrap them in {}:
 -- {node-id:statement; statement;}
+-- Node id '0' means shardlord, shardlord_connstring guc is used.
 -- Don't specify them separately with 2pc, we use only one prepared_xact name.
 -- No escaping is performed, so ';', '{' and '}' inside queries are not supported.
 -- By default functions throws error is execution is failed at some of the
@@ -699,12 +717,15 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- If two_phase parameter is true, then each statement is wrapped in blocked and
 -- prepared with subsequent commit or rollback of prepared transaction at second
 -- phase of two phase commit.
--- If sync_commit is false, we do set session synchronous_commit to local;
+-- If sync_commit_on is false, we set session synchronous_commit to local.
+-- If super_connstr is true, super connstring is used everywhere, usual
+-- connstr otherwise.
 CREATE FUNCTION broadcast(cmds text,
 						  ignore_errors bool = false,
 						  two_phase bool = false,
-						  sync_commit bool = false,
-						  synchronous bool = false)
+						  sync_commit_on bool = false,
+						  synchronous bool = false,
+						  super_connstr bool = false)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Options to postgres_fdw are specified in two places: user & password in user

@@ -123,8 +123,9 @@ broadcast(PG_FUNCTION_ARGS)
 	char* sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	bool  ignore_errors = PG_GETARG_BOOL(1);
 	bool  two_phase = PG_GETARG_BOOL(2);
-	bool  sync_commit = PG_GETARG_BOOL(3);
+	bool  sync_commit_on = PG_GETARG_BOOL(3);
 	bool  sequential = PG_GETARG_BOOL(4);
+	bool  super_connstr = PG_GETARG_BOOL(5);
 	char* sep;
 	PGresult *res;
 	char* fetch_node_connstr;
@@ -160,7 +161,14 @@ broadcast(PG_FUNCTION_ARGS)
 		sql += n;
 		if (node_id != 0)
 		{
-			fetch_node_connstr = psprintf("select connection_string from shardman.nodes where id=%d", node_id);
+			if (super_connstr)
+				fetch_node_connstr = psprintf(
+					"select super_connection_string from shardman.nodes where id=%d",
+					node_id);
+			else
+				fetch_node_connstr = psprintf(
+					"select connection_string from shardman.nodes where id=%d",
+					node_id);
 			if (SPI_exec(fetch_node_connstr, 0) < 0 || SPI_processed != 1)
 			{
 				elog(ERROR, "SHARDMAN: Failed to fetch connection string for node %d",
@@ -193,7 +201,7 @@ broadcast(PG_FUNCTION_ARGS)
 							  PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-		if (!sync_commit)
+		if (!sync_commit_on)
 		{
 			if (two_phase)
 			{
@@ -219,7 +227,7 @@ broadcast(PG_FUNCTION_ARGS)
 							  node_id, PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-		if (!sync_commit)
+		if (!sync_commit_on)
 			pfree(sql);
 
 		sql = sep + 1;
