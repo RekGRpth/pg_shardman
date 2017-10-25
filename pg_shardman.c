@@ -113,7 +113,8 @@ wait_command_completion(PGconn* conn)
 Datum
 broadcast(PG_FUNCTION_ARGS)
 {
-	char* sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *sql_full = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char* sql = pstrdup(sql_full);
 	bool  ignore_errors = PG_GETARG_BOOL(1);
 	bool  two_phase = PG_GETARG_BOOL(2);
 	bool  sync_commit_on = PG_GETARG_BOOL(3);
@@ -196,6 +197,7 @@ broadcast(PG_FUNCTION_ARGS)
 		}
 		if (!sync_commit_on)
 		{
+			/* mem freed with context */
 			if (two_phase)
 			{
 				sql = psprintf("SET SESSION synchronous_commit TO local; BEGIN; %s; PREPARE TRANSACTION 'shardlord';", sql);
@@ -220,8 +222,6 @@ broadcast(PG_FUNCTION_ARGS)
 							  node_id, PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-		if (!sync_commit_on)
-			pfree(sql);
 
 		sql = sep + 1;
 	}
@@ -249,10 +249,10 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Failed to received response for '%s': %s", errmsg ? errmsg : "", node_id, sql, PQerrorMessage(conn[i]));
+				errmsg = psprintf("%s%d:Failed to received response for '%s': %s", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
 				continue;
 			}
-			errmsg = psprintf("Failed to receive response for query %s from node %d: %s", sql, node_id, PQerrorMessage(conn[i]));
+			errmsg = psprintf("Failed to receive response for query %s from node %d: %s", sql_full, node_id, PQerrorMessage(conn[i]));
 			goto cleanup;
 		}
 
@@ -262,11 +262,11 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Command %s failed: %s", errmsg ? errmsg : "", node_id, sql, PQerrorMessage(conn[i]));
+				errmsg = psprintf("%s%d:Command %s failed: %s", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
 				PQclear(res);
 				continue;
 			}
-			errmsg = psprintf("Command %s failed at node %d: %s", sql, node_id, PQerrorMessage(conn[i]));
+			errmsg = psprintf("Command %s failed at node %d: %s", sql_full, node_id, PQerrorMessage(conn[i]));
 			PQclear(res);
 			goto cleanup;
 		}
@@ -277,11 +277,11 @@ broadcast(PG_FUNCTION_ARGS)
 				if (ignore_errors)
 				{
 					appendStringInfoString(&resp, "?;");
-					elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d", sql, node_id);
+					elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d", sql_full, node_id);
 				}
 				else
 				{
-					errmsg = psprintf("Query '%s' doesn't return single tuple at node %d", sql, node_id);
+					errmsg = psprintf("Query '%s' doesn't return single tuple at node %d", sql_full, node_id);
 					PQclear(res);
 					goto cleanup;
 				}
@@ -384,7 +384,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	join_path_components(pg_dump_path, pg_dump_path, "pg_dump");
 	canonicalize_path(pg_dump_path);
 
-	cmd = psprintf("%s -t '%s' --schema-only --dbname='%s' 2>&1",
+	cmd = psprintf("%s -t '%s' --no-owner --schema-only --dbname='%s' 2>&1",
 				   pg_dump_path, relation, shardlord_connstring);
 
 	if ((fp = popen(cmd, "r")) == NULL)
