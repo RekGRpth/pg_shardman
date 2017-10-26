@@ -702,9 +702,12 @@ CREATE FUNCTION get_node_partitions_count(node int) returns bigint AS $$
    SELECT count(*) from shardman.partitions WHERE node_id=node;
 $$ LANGUAGE sql;
 
--- Rebalance partitions between nodes. This function tries to evenly redistribute partition between all nodes of replication groups.
+-- Rebalance partitions between nodes. This function tries to evenly
+-- redistribute partitions of tables which names match LIKE 'pattern'
+-- between all nodes of replication groups.
 -- It is not able to move partition between replication groups.
--- This function intentionally move one partition per time to minimize influence on system performance.
+-- This function intentionally moves one partition per time to minimize
+-- influence on system performance.
 CREATE FUNCTION rebalance(table_pattern text = '%') RETURNS void AS $$
 DECLARE
 	dst_node int;
@@ -726,7 +729,7 @@ BEGIN
 		FOR repl_group IN SELECT DISTINCT replication_group FROM shardman.nodes
 		LOOP
 			-- Select node in this group with minimal number of partitions
-			SELECT node_id, count(*) n_parts INTO dst_node,min_count
+			SELECT node_id, count(*) n_parts INTO dst_node, min_count
 				FROM shardman.partitions p JOIN shardman.nodes n ON p.node_id=n.id
 			    WHERE n.replication_group=repl_group AND p.relation LIKE table_pattern
 				GROUP BY node_id
@@ -737,7 +740,8 @@ BEGIN
 				WHERE n.replication_group=repl_group AND p.relation LIKE table_pattern
 				GROUP BY node_id
 				ORDER BY n_parts DESC LIMIT 1;
-			-- If difference of number of partitions on this nodes is greater than 1, then move random partition
+			-- If difference of number of partitions on this nodes is greater
+			-- than 1, then move random partition
 			IF max_count - min_count > 1 THEN
 			    SELECT p.part_name INTO mv_part_name
 				FROM shardman.partitions p
@@ -897,7 +901,7 @@ BEGIN
 
 		RAISE DEBUG 'Replication lag %', lag;
 		IF locked THEN
-		    IF lag<=0 THEN
+		    IF lag <= 0 THEN
 			    RETURN;
 			END IF;
 		ELSIF lag < caughtup_threshold THEN
