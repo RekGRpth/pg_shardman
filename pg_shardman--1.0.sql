@@ -24,9 +24,11 @@ CREATE TABLE nodes (
 -- List of sharded tables
 CREATE TABLE tables (
 	relation text PRIMARY KEY,     -- table name
-	sharding_key text NOT NULL,    -- expression by which table is sharded
+	sharding_key text,             -- expression by which table is sharded
+	master_node integer REFERENCES nodes(id) ON DELETE CASCADE,
 	partitions_count int NOT NULL, -- number of partitions
-	create_sql text NOT NULL       -- sql to create the table
+	create_sql text NOT NULL,      -- sql to create the table
+	create_rules_sql text          -- sql to create rules for shared table
 );
 
 -- Main partitions
@@ -77,11 +79,13 @@ DECLARE
 	create_tables text = '';
 	create_partitions text = '';
 	create_fdws text = '';
+	create_rules text = '';
 	replace_parts text = '';
 	fdw_part_name text;
 	table_attrs text;
 	srv_name text;
-	conn_string_effective text = COALESCE(conn_string, super_conn_string);
+	rules text = '';
+conn_string_effective text = COALESCE(conn_string, super_conn_string);
 BEGIN
 	IF shardman.redirect_to_shardlord(
 		format('add_node(%L, %L, %L)', super_conn_string, conn_string, repl_group))
@@ -170,7 +174,7 @@ BEGIN
 	PERFORM shardman.broadcast(usms);
 
 	-- Create FDWs at new node for all existed partitions
-	FOR t IN SELECT * from shardman.tables
+	FOR t IN SELECT * from shardman.tables WHERE sharding_key IS NOT NULL
 	LOOP
 		create_tables := format('%s{%s:%s}',
 			create_tables, new_node_id, t.create_sql);
@@ -190,6 +194,24 @@ BEGIN
 		END LOOP;
 	END LOOP;
 
+	-- Create subscriptions for all shared tables
+	subs := '';
+	FOR t IN SELECT * from shardman.tables WHERE master_node IS NOT NULL
+	LOOP
+		SELECT connection_string INTO conn_string from shardman.nodes WHERE id=t.master_node;
+		create_tables := format('%s{%s:%s}',
+			create_tables, new_node_id, t.create_sql);
+		SELECT shardman.reconstruct_table_attrs(t.relation) INTO table_attrs;
+		srv_name := format('node_%s', t.master_node);
+		fdw_part_name := format('%s_fdw', t.relation);
+		create_fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
+			create_fdws, new_node_id, fdw_part_name, table_attrs, srv_name, t.relation);
+		subs := format('%s%s:CREATE SUBSCRIPTION share_%s CONNECTION %L PUBLICATION share_%s with (create_slot=false, copy_data=false, slot_name=''share_%s'', synchronous_commit=local);',
+			 subs, new_node_id, t.relation, conn_string, t.relation, t.relation);
+		create_rules :=  format('%s{%s:%s}',
+			 create_rules, new_node_id, t.create_rules_sql);
+	END LOOP;
+
 	-- Broadcast create table commands
 	PERFORM shardman.broadcast(create_tables);
 	-- Broadcast create hash partitions command
@@ -198,6 +220,10 @@ BEGIN
 	PERFORM shardman.broadcast(create_fdws);
 	-- Broadcast replace hash partition commands
 	PERFORM shardman.broadcast(replace_parts);
+	-- Broadcast create subscriptions for shared tables
+	PERFORM shardman.broadcast(subs);
+	-- Broadcast create rules for shared tables
+	PERFORM shardman.broadcast(create_rules);
 END
 $$ LANGUAGE plpgsql;
 
@@ -210,6 +236,7 @@ DECLARE
 	node shardman.nodes;
 	part shardman.partitions;
 	repl shardman.replicas;
+	t shardman.tables;
 	pubs text = '';
 	subs text = '';
 	fdws text = '';
@@ -243,6 +270,7 @@ BEGIN
 	-- Remove all subscriptions and publications of this node
     FOR node IN SELECT * FROM shardman.nodes WHERE replication_group=repl_group AND id<>rm_node_id
 	LOOP
+		-- Drop publication and subscriptions for replicas
 		pubs := format('%s%s:DROP PUBLICATION node_%s;
 			 			  %s:DROP PUBLICATION node_%s;',
 			 pubs, node.id, rm_node_id,
@@ -262,6 +290,13 @@ BEGIN
 					   sync, node.id, array_length(sync_standbys, 1),
 					   array_to_string(sync_standbys, ','));
 		conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
+	END LOOP;
+
+	-- Drop shared tables subscriptions
+	FOR t IN SELECT * from shardman.tables WHERE master_node IS NOT NULL
+	LOOP
+		subs := format('%s%s:DROP SUBSCRIPTION share_%s;',
+			 subs, rm_node_id, t.relation);
 	END LOOP;
 
 	-- Broadcast drop subscription commands, ignore errors because removed node may be not available
@@ -383,6 +418,8 @@ BEGIN
 	THEN
 		RAISE EXCEPTION 'Table % is already sharded', rel_name;
 	END IF;
+
+	-- Generate SQL statement creating this table
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
 	INSERT INTO shardman.tables (relation,sharding_key,partitions_count,create_sql) values (rel_name,expr,part_count,create_table);
@@ -758,6 +795,101 @@ BEGIN
 	END LOOP;
 END
 $$ LANGUAGE plpgsql;
+
+-- Share table between all nodes. This function should be executed at shardlord. The empty table should be present at shardlord,
+-- but not at nodes.
+CREATE FUNCTION create_shared_table(rel regclass, master_node_id int) RETURNS void AS $$
+DECLARE
+	node shardman.nodes;
+	subs text = '';
+	fdws text = '';
+	rules text = '';
+	conn_string text;
+	create_table text;
+	create_tables text;
+	create_rules text;
+	table_attrs text;
+	rel_name text = rel::text;
+	fdw_name text = format('%s_fdw', rel_name);
+	srv_name text = format('node_%s', master_node_id);
+	pk text;
+	dst text;
+	src text;
+BEGIN
+	-- Check if valid node ID is passed and get connectoin string of this node
+	SELECT connection_string INTO conn_string FROM shardman.nodes WHERE id=master_node_id;
+	IF conn_string IS NULL THEN
+	    RAISE EXCEPTION 'There is no node with ID % in the cluster',master_node_id;
+	END IF;
+
+	-- Generate SQL statement creating this table
+	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
+
+	create_rules := format('CREATE RULE on_update_to_%s AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
+		 	                CREATE RULE on_insert_to_%s AS ON INSERT TO %I DO INSTEAD INSERT INTO %I (%s) VALUES (%s);
+		 	                CREATE RULE on_delete_from_%s AS ON DELETE TO %I DO INSTEAD DELETE FROM %I WHERE %s;',
+        rel_name, rel_name, fdw_rel_name, dst, src, pk,
+		rel_name, rel_name, fdw_rel_name, dst, src,
+		rel_name, rel_name, fdw_rel_name, pk);
+
+	INSERT INTO shardman.tables (relation,master_node,create_sql,create_rules_sql) values (rel_name,master_node_id,create_table,create_rules);
+
+	FOR node IN SELECT * FROM shardman.nodes
+	LOOP
+		create_tables := format('%s{%s:%s}',
+			create_tables, node.id, create_table);
+	END LOOP;
+
+	-- Broadcast create table command
+	PERFORM shardman.broadcast(create_tables);
+
+	-- Create publication at master node
+	PERFORM shardman.broadcast(format('%s:CREATE PUBLICATION share_%s FOR TABLE %I;
+		 							   %s:SELECT pg_create_logical_replication_slot(''share_%s'', ''pgoutput'');',
+		master_node_id, rel_name, rel_name,
+		master_node_id, rel_name));
+
+	-- Construct list of attributes of the table for update/insert
+	SELECT INTO dst, src
+          string_agg(quote_ident(attname), ', '),
+		  string_agg('NEW.' || quote_ident(attname), ', ')
+    FROM   pg_attribute
+    WHERE  attrelid = rel
+    AND    NOT attisdropped   -- no dropped (dead) columns
+    AND    attnum > 0;
+
+	-- Construct primary key condition for update
+	SELECT INTO pk
+          string_agg(quote_ident(a.attname) || '=NEW.'|| quote_ident(a.attname), ' AND ')
+	FROM   pg_index i
+	JOIN   pg_attribute a ON a.attrelid = i.indrelid
+                     AND a.attnum = ANY(i.indkey)
+    WHERE  i.indrelid = rel
+    AND    i.indisprimary;
+
+	-- Construct table attributes for create foreign table
+	SELECT shardman.reconstruct_table_attrs(rel) INTO table_attrs;
+
+	-- Create subscriptions, foreign tables and rules at all nodes
+	FOR node IN SELECT * FROM shardman.nodes WHERE id<>master_node_id
+	LOOP
+		subs := format('%s%s:CREATE SUBSCRIPTION share_%s CONNECTION %L PUBLICATION share_%s with (create_slot=false, copy_data=false, slot_name=''share_%s'', synchronous_commit=local);',
+			 subs, node.id, rel_name, conn_string, rel_name, rel_name);
+		fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
+			 fdws, node.id, fdw_rel_name, table_attrs, srv_name, rel_name);
+		rules := format('%s{%s:%s}',
+			 rules, node.id, create_rules);
+	END LOOP;
+
+	-- Create subscriptions at all nodes
+	PERFORM shardman.broadcast(subs);
+	-- Create foreign tables at all nodes
+	PERFORM shardman.broadcast(fdws);
+	-- Create redirect rules at all nodes
+	PERFORM shardman.broadcast(rules);
+END
+$$ LANGUAGE plpgsql;
+
 
 ---------------------------------------------------------------------
 -- Utility functions
