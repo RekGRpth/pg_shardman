@@ -597,7 +597,7 @@ BEGIN
 	PERFORM shardman.broadcast(subs, super_connstr => true);
 
 	-- Wait completion of partition copy and prohibit access to this partition
-	PERFORM shardman.wait_copy_completion(src_node_id, mv_part_name);
+	PERFORM shardman.wait_copy_completion(src_node_id, dst_node_id, mv_part_name);
 
 	RAISE NOTICE 'Copy of partition % from node % to % is completed',
 		 mv_part_name, src_node_id, dst_node_id;
@@ -659,7 +659,7 @@ BEGIN
 	PERFORM shardman.broadcast(drop_fdws);
 
 	-- Truncate partition table and restore access to it at source node
-	PERFORM shardman.complete_partition_move(src_node_id, mv_part_name);
+	PERFORM shardman.complete_partition_move(src_node_id, dst_node_id, mv_part_name);
 END
 $$ LANGUAGE plpgsql;
 
@@ -886,7 +886,7 @@ CREATE FUNCTION is_shardlord()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Wait completion of partition copy using LR
-CREATE FUNCTION wait_copy_completion(src_node_id int, part_name text) RETURNS void AS $$
+CREATE FUNCTION wait_copy_completion(src_node_id int, dst_node_id int, part_name text) RETURNS void AS $$
 DECLARE
 	slot text = format('copy_%s', part_name);
 	lag bigint;
@@ -894,32 +894,58 @@ DECLARE
 	caughtup_threshold bigint = 1024*1024;
 	timeout_sec int = 1;
     locked bool = false;
+	synced bool = false;
+	wal_lsn text;
 BEGIN
 	LOOP
-		response := shardman.broadcast(format('%s:SELECT confirmed_flush_lsn - pg_current_wal_lsn() FROM pg_replication_slots WHERE slot_name=%L;', src_node_id, slot));
-		lag := response::bigint;
-
-		RAISE DEBUG 'Replication lag %', lag;
-		IF locked THEN
-		    IF lag <= 0 THEN
-			    RETURN;
+		IF NOT synced
+		THEN
+		    response := shardman.broadcast(format(
+				'%s:SELECT srsubstate FROM pg_subscription_rel srel
+				    JOIN pg_subscription s on srel.srsubid = s.oid where subname=%L;',
+				 dst_node_id, slot));
+			IF response='r' THEN
+			    synced := true;
+				RAISE DEBUG 'Table % sync completed', part_name;
+				CONTINUE;
 			END IF;
-		ELSIF lag < caughtup_threshold THEN
-	   	    PERFORM shardman.broadcast(format('%s:REVOKE SELECT,INSERT,UPDATE,DELETE ON %I FROM PUBLIC;',
-				src_node_id, part_name));
-			locked := true;
-			CONTINUE;
+	    ELSE
+    	    IF NOT locked THEN
+			    response := shardman.broadcast(format('%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=%L;', src_node_id, slot));
+			ELSE
+				response := shardman.broadcast(format('%s:SELECT %L - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=%L;', src_node_id, wal_lsn, slot));
+			END IF;
+			lag := response::bigint;
+
+			RAISE DEBUG 'Replication lag %', lag;
+			IF locked THEN
+		        IF lag<=0 THEN
+			   	    RETURN;
+			    END IF;
+			ELSIF lag < caughtup_threshold THEN
+	   	        PERFORM shardman.broadcast(format('%s:CREATE TRIGGER write_protection BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH STATEMENT EXECUTE PROCEDURE shardman.deny_access();',
+					src_node_id, part_name));
+				SELECT shardman.broadcast(format('%s:SELECT pg_current_wal_lsn();', src_node_id)) INTO wal_lsn;
+				locked := true;
+				CONTINUE;
+			END IF;
 		END IF;
 		PERFORM pg_sleep(timeout_sec);
 	END LOOP;
 END
 $$ LANGUAGE plpgsql;
 
-CREATE FUNCTION complete_partition_move(src_node_id int, part_name text) RETURNS void AS $$
+CREATE FUNCTION complete_partition_move(src_node_id int, dst_node_id int, part_name text) RETURNS void AS $$
 BEGIN
 	PERFORM shardman.broadcast(format('%s:TRUNCATE TABLE %I;',
 		src_node_id, part_name));
-	PERFORM shardman.broadcast(format('%s:GRANT SELECT,INSERT,UPDATE,DELETE ON %I TO PUBLIC;',
+	PERFORM shardman.broadcast(format('%s:DROP TRIGGER write_protection ON %I;',
 		src_node_id, part_name));
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION deny_access() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Access to moving parition is temporary denied';
 END
 $$ LANGUAGE plpgsql;
