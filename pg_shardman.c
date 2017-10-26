@@ -162,14 +162,9 @@ broadcast(PG_FUNCTION_ARGS)
 		sql += n;
 		if (node_id != 0)
 		{
-			if (super_connstr)
-				fetch_node_connstr = psprintf(
-					"select super_connection_string from shardman.nodes where id=%d",
-					node_id);
-			else
-				fetch_node_connstr = psprintf(
-					"select connection_string from shardman.nodes where id=%d",
-					node_id);
+			fetch_node_connstr = psprintf(
+				"select %sconnection_string from shardman.nodes where id=%d",
+				super_connstr ? "super_" : "", node_id);
 			if (SPI_exec(fetch_node_connstr, 0) < 0 || SPI_processed != 1)
 			{
 				elog(ERROR, "SHARDMAN: Failed to fetch connection string for node %d",
@@ -181,6 +176,10 @@ broadcast(PG_FUNCTION_ARGS)
 		}
 		else
 		{
+			if (shardlord_connstring == NULL || *shardlord_connstring == '\0')
+			{
+				elog(ERROR, "SHARDMAN: Shardlord connection string was not specified in configuration file");
+			}
 			conn_str = shardlord_connstring;
 		}
 		if (n_cmds >= n_cons)
@@ -193,7 +192,7 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Connection failure: %s;",
+				errmsg = psprintf("%s%d:Connection failure: %s.",
 								  errmsg ? errmsg : "", node_id,
 								  PQerrorMessage(conn[n_cmds - 1]));
 				continue;
@@ -220,7 +219,7 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Failed to send query '%s': %s'",
+				errmsg = psprintf("%s%d:Failed to send query '%s': %s'.",
 								  errmsg ? errmsg : "", node_id, sql,
 								  PQerrorMessage(conn[n_cmds-1]));
 				continue;
@@ -256,7 +255,7 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Failed to received response for '%s': %s", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
+				errmsg = psprintf("%s%d:Failed to received response for '%s': %s.", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
 				continue;
 			}
 			errmsg = psprintf("Failed to receive response for query %s from node %d: %s", sql_full, node_id, PQerrorMessage(conn[i]));
@@ -269,7 +268,7 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Command %s failed: %s", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
+				errmsg = psprintf("%s%d:Command %s failed: %s.", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
 				PQclear(res);
 				continue;
 			}
@@ -277,13 +276,17 @@ broadcast(PG_FUNCTION_ARGS)
 			PQclear(res);
 			goto cleanup;
 		}
+		if (i != 0)
+		{
+			appendStringInfoChar(&resp, ',');
+		}
 		if (status == PGRES_TUPLES_OK)
 		{
 			if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
 			{
 				if (ignore_errors)
 				{
-					appendStringInfoString(&resp, "?;");
+					appendStringInfoString(&resp, "?");
 					elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d", sql_full, node_id);
 				}
 				else
@@ -295,12 +298,12 @@ broadcast(PG_FUNCTION_ARGS)
 			}
 			else
 			{
-				appendStringInfo(&resp, "%s;", PQgetvalue(res, 0, 0));
+				appendStringInfo(&resp, "%s", PQgetvalue(res, 0, 0));
 			}
 		}
 		else
 		{
-			appendStringInfo(&resp, "%d;", PQntuples(res));
+			appendStringInfo(&resp, "%d", PQntuples(res));
 		}
 		PQclear(res);
 	}

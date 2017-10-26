@@ -52,11 +52,11 @@ CREATE TABLE replicas (
 -- the node as superuser, and 'conn_string' can be some other connstring.
 -- The former is used for configuring logical replication, the latter for DDL
 -- and for setting up FDW. This separation serves two purposes:
--- * It allows to access data without requiring superuser priviliges;
+-- * It allows to access data without requiring superuser privileges;
 -- * It allows to set up pgbouncer, as replication can't go through it.
 -- If conn_string is null, super_conn_string is used everywhere.
 CREATE FUNCTION add_node(super_conn_string text, conn_string text = NULL,
-						 repl_group text = 'all') RETURNS void AS $$
+						 repl_group text = 'default') RETURNS void AS $$
 DECLARE
 	new_node_id int;
     node shardman.nodes;
@@ -127,7 +127,7 @@ BEGIN
 	IF shardman.synchronous_replication() AND
 		(SELECT COUNT(*) FROM shardman.nodes WHERE replication_group = repl_group) > 1
 	THEN
-		-- Take all nodes in replicationg group excluding myself
+		-- Take all nodes in replication group excluding myself
 		FOR node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group LOOP
 			-- Construct list of synchronous standbyes=subscriptions to this node
 			sync_standbys :=
@@ -145,7 +145,7 @@ BEGIN
 
 	-- Add foreign servers for connection to the new node and backward
 	-- Construct foreign server options from connection string of new node
-	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(conn_string) INTO new_server_opts, new_um_opts;
+	SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(conn_string_effective) INTO new_server_opts, new_um_opts;
 	FOR node IN SELECT * FROM shardman.nodes WHERE id<>new_node_id
 	LOOP
 	    -- Construct foreign server options from connection string of this node
@@ -696,6 +696,65 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Count number of partitions at particular node.
+-- This command can be executed only at shardlord.
+CREATE FUNCTION get_node_partitions_count(node int) returns bigint AS $$
+   SELECT count(*) from shardman.partitions WHERE node_id=node;
+$$ LANGUAGE sql;
+
+-- Rebalance partitions between nodes. This function tries to evenly redistribute partition between all nodes of replication groups.
+-- It is not able to move partition between replication groups.
+-- This function intentionally move one partition per time to minimize influence on system performance.
+CREATE FUNCTION rebalance(table_pattern text = '%') RETURNS void AS $$
+DECLARE
+	dst_node int;
+	src_node int;
+	min_count bigint;
+	max_count bigint;
+	mv_part_name text;
+	repl_group text;
+	done bool;
+BEGIN
+	IF shardman.redirect_to_shardlord(format('rebalance(%L)', table_pattern))
+	THEN
+		RETURN;
+	END IF;
+
+	LOOP
+		done := true;
+		-- Repeat for all replication groups
+		FOR repl_group IN SELECT DISTINCT replication_group FROM shardman.nodes
+		LOOP
+			-- Select node in this group with minimal number of partitions
+			SELECT node_id, count(*) n_parts INTO dst_node,min_count
+				FROM shardman.partitions p JOIN shardman.nodes n ON p.node_id=n.id
+			    WHERE n.replication_group=repl_group AND p.relation LIKE table_pattern
+				GROUP BY node_id
+				ORDER BY n_parts ASC LIMIT 1;
+			-- Select node in this group with maximal number of partitions
+			SELECT node_id, count(*) n_parts INTO src_node,max_count
+			    FROM shardman.partitions p JOIN shardman.nodes n ON p.node_id=n.id
+				WHERE n.replication_group=repl_group AND p.relation LIKE table_pattern
+				GROUP BY node_id
+				ORDER BY n_parts DESC LIMIT 1;
+			-- If difference of number of partitions on this nodes is greater than 1, then move random partition
+			IF max_count - min_count > 1 THEN
+			    SELECT p.part_name INTO mv_part_name
+				FROM shardman.partitions p
+				WHERE p.node_id=src_node AND p.relation LIKE table_pattern AND
+				    NOT EXISTS(SELECT * from shardman.replicas r
+							   WHERE r.node_id=dst_node AND r.part_name=p.part_name)
+				ORDER BY random() LIMIT 1;
+				PERFORM shardman.mv_partition(mv_part_name, dst_node);
+				done := false;
+			END IF;
+		END LOOP;
+
+		EXIT WHEN done;
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
 ---------------------------------------------------------------------
 -- Utility functions
 ---------------------------------------------------------------------
@@ -723,7 +782,7 @@ CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Broadcast SQL commands to nodes and wait their completion.
--- cmds is list of SQL commands separated by semi-columns with node
+-- cmds is list of SQL commands terminated by semi-columns with node
 -- prefix: node-id:sql-statement;
 -- To run multiple statements on node, wrap them in {}:
 -- {node-id:statement; statement;}
@@ -732,10 +791,10 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- No escaping is performed, so ';', '{' and '}' inside queries are not supported.
 -- By default functions throws error is execution is failed at some of the
 -- nodes, with ignore_errors=true errors are ignored and function returns string
--- with "Error:" prefix containing list of errors separated by semicolons with
+-- with "Error:" prefix containing list of errors terminated by dots with
 -- nodes prefixes.
 -- In case of normal completion this function return list with node prefixes
--- separated by semi-columns with single result for select queries or number of
+-- separated by columns with single result for select queries or number of
 -- affected rows for other commands.
 -- If two_phase parameter is true, then each statement is wrapped in blocked and
 -- prepared with subsequent commit or rollback of prepared transaction at second
@@ -834,9 +893,9 @@ DECLARE
 BEGIN
 	LOOP
 		response := shardman.broadcast(format('%s:SELECT confirmed_flush_lsn - pg_current_wal_lsn() FROM pg_replication_slots WHERE slot_name=%L;', src_node_id, slot));
-		lag := trim(trailing ';' from response)::bigint;
+		lag := response::bigint;
 
-		RAISE NOTICE 'Replication lag %', lag;
+		RAISE DEBUG 'Replication lag %', lag;
 		IF locked THEN
 		    IF lag<=0 THEN
 			    RETURN;
