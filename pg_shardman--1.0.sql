@@ -245,8 +245,10 @@ DECLARE
 	pubs text = '';
 	subs text = '';
 	fdws text = '';
+	prts text = '';
 	sync text = '';
 	conf text = '';
+	alts text = '';
 	fdw_part_name text;
     new_master_id int;
 	sync_standbys text[];
@@ -278,13 +280,20 @@ BEGIN
 	LOOP
 		-- Drop publication and subscriptions for replicas
 		pubs := format('%s%s:DROP PUBLICATION node_%s;
-			 			  %s:DROP PUBLICATION node_%s;',
+			 			  %s:DROP PUBLICATION node_%s;
+						  %s:SELECT pg_drop_replication_slot(''node_%s'');
+						  %s:SELECT pg_drop_replication_slot(''node_%s'');',
 			 pubs, node.id, rm_node_id,
-			 	   rm_node_id, node.id);
+			 	   rm_node_id, node.id,
+				   node.id, rm_node_id,
+				   rm_node_id, node.id);
+		alts := format('%s{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}',
+			 alts, rm_node_id, rm_node_id, node.id, rm_node_id, node.id,
+			       node.id, node.id, rm_node_id, node.id, rm_node_id);
 		subs := format('%s%s:DROP SUBSCRIPTION sub_%s_%s;
-			 			  %s:DROP SUBSCRIPTION sub_%s_%s',
+			 			  %s:DROP SUBSCRIPTION sub_%s_%s;',
 			 subs, rm_node_id, rm_node_id, node.id,
-			 node.id, node.id, rm_node_id);
+			       node.id, node.id, rm_node_id);
 
 		-- Construct new synchronous standby list
 		sync_standbys :=
@@ -301,15 +310,25 @@ BEGIN
 	-- Drop shared tables subscriptions
 	FOR master_node_id IN SELECT DISTINCT master_node from shardman.tables WHERE master_node IS NOT NULL
 	LOOP
+		alts := format('%s{%s:ALTER SUBSCRIPTION share_%s_%s DISABLE;ALTER SUBSCRIPTION share_%s_%s SET (slot_name=NONE)}',
+			 alts, rm_node_id, rm_node_id, master_node_id, rm_node_id, master_node_id);
 		subs := format('%s%s:DROP SUBSCRIPTION share_%s_%s;',
 			 subs, rm_node_id, rm_node_id, master_node_id);
+		pubs := format('%s%s:SELECT pg_drop_replication_slot(''share_%s_%s'');',
+			 pubs, master_node_id, rm_node_id, master_node_id);
 	END LOOP;
 
+	-- Broadcast alter subscription commands, ignore errors because removed node may be not available
+	PERFORM shardman.broadcast(alts,
+							   ignore_errors => true,
+							   super_connstr => true);
 	-- Broadcast drop subscription commands, ignore errors because removed node may be not available
-	PERFORM shardman.broadcast(subs, ignore_errors:=true, sync_commit_on => true,
-							   super_connst => true);
-	-- Broadcast drop replication commands
-    PERFORM shardman.broadcast(pubs, ignore_errors:=true, super_connstr => true);
+	PERFORM shardman.broadcast(subs,
+							   ignore_errors => true,
+							   super_connstr => true);
+
+    -- Broadcast drop replication commands
+    PERFORM shardman.broadcast(pubs, ignore_errors => true, super_connstr => true);
 
 	-- In case of synchronous replication update synchronous standbys list
 	IF shardman.synchronous_replication()
@@ -317,11 +336,14 @@ BEGIN
 		-- On removed node, reset synchronous standbys list
 		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to '''';',
 			 sync, rm_node_id, sync_standbys);
-	    PERFORM shardman.broadcast(sync, ignore_errors => true,
-								   sync_commit_on => true, super_connstr => true);
+	    PERFORM shardman.broadcast(sync,
+								   ignore_errors => true,
+								   sync_commit_on => true,
+								   super_connstr => true);
 	    PERFORM shardman.broadcast(conf, ignore_errors:=true, super_connstr => true);
 	END IF;
-
+/* To correctly remove foreign servers we need to update pf_depend table, otherwise
+ * our hack with direct update pg_foreign_table leaves deteriorated dependencies 
 	-- Remove foreign servers at all nodes for the removed node
     FOR node IN SELECT * FROM shardman.nodes WHERE id<>rm_node_id
 	LOOP
@@ -330,14 +352,14 @@ BEGIN
 			 			  %s:DROP SERVER node_%s;',
 			 fdws, node.id, rm_node_id,
 			 	   rm_node_id, node.id);
+		drps := format('%s%s:DROP USER MAPPING FOR CURRENT_USER SERVER node_%s;
+			 			  %s:DROP USER MAPPING FOR CURRENT_USER SERVER node_%s;',
+			 drps, node.id, rm_node_id,
+			 	   rm_node_id, node.id);
 	END LOOP;
-
-	-- Broadcast drop server commands
-    PERFORM shardman.broadcast(fdws, ignore_errors:=true);
-	fdws := '';
-
+*/
 	-- Exclude partitions of removed node
-	FOR part in SELECT * from shardman.partitions where node=rm_node_id
+	FOR part in SELECT * from shardman.partitions where node_id=rm_node_id
 	LOOP
 		-- Is there some replica of this node?
 		SELECT node_id INTO new_master_id FROM shardman.replicas WHERE part_name=part.part_name ORDER BY random() LIMIT 1;
@@ -346,7 +368,7 @@ BEGIN
 			-- Update partitions table: now replica is promoted to master...
 		    UPDATE shardman.partitions SET node_id=new_master_id WHERE part_name=part.part_name;
 			-- ... and is not a replica any more
-			DELETE FROM sharaman.replicas WHERE part_name=part.part_name AND node_id=new_master_id;
+			DELETE FROM shardman.replicas WHERE part_name=part.part_name AND node_id=new_master_id;
 
 			pubs := '';
 			subs := '';
@@ -376,19 +398,23 @@ BEGIN
 			fdw_part_name := format('%s_fdw', part.part_name);
 			IF node.id=new_master_id THEN
 			    -- At new master node replace foreign link with local partition
-			    fdws := format('%s%d:SELECT replace_hash_partition(%L,%L);',
-			 		fdws, node.id, fdw_part_name, part.part_name);
+			    prts := format('%s%s:SELECT replace_hash_partition(%L,%L);',
+			 		prts, node.id, fdw_part_name, part.part_name);
+				fdws := format('%s%s:DROP FOREIGN TABLE %I;',
+					fdws, node.id, fdw_part_name);
 			ELSE
 				-- At all other nodes adjust foreign server for foreign table to refer to new master node.
 				-- It is not possible to alter foreign server for foreign table so we have to do it in such "hackers" way:
-				fdws := format('%s%s:UPDATE pg_foreign_table SET ftserver = (SELECT oid FROM pg_foreign_server WHERE srvname = ''node_%s'') WHERE ftrelid = (SELECT oid FROM pg_class WHERE relname=%L);',
-		   			fdws, node.id, new_master_id, fdw_part_name);
+				prts := format('%s%s:UPDATE pg_foreign_table SET ftserver = (SELECT oid FROM pg_foreign_server WHERE srvname = ''node_%s'') WHERE ftrelid = (SELECT oid FROM pg_class WHERE relname=%L);',
+		   			prts, node.id, new_master_id, fdw_part_name);
 			END IF;
 		END LOOP;
 	END LOOP;
 
 	-- Broadcast changes of pathman mapping
-	PERFORM shardman.broadcast(fdws, ignore_errors:=true);
+	PERFORM shardman.broadcast(prts, ignore_errors:=true);
+	-- Broadcast drop server commands
+    PERFORM shardman.broadcast(fdws, ignore_errors:=true);
 
 	-- Finally delete node from nodes table and all dependent tables
 	DELETE from shardman.nodes WHERE id=rm_node_id;
