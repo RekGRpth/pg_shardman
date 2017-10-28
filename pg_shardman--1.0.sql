@@ -966,15 +966,15 @@ BEGIN
 	END IF;
 
 	-- Check if there is such replica at source node
-	IF EXISTS(SELECT * FROM shardman.replicas WHERE part_name=mv_part_name AND node_id=src_node_id)
+	IF NOT EXISTS(SELECT * FROM shardman.replicas WHERE part_name=mv_part_name AND node_id=src_node_id)
 	THEN
-	    RAISE EXCEPTION 'Replica of & does not exist on node %', mv_part_name, src_node_id;
+	    RAISE EXCEPTION 'Replica of % does not exist on node %', mv_part_name, src_node_id;
 	END IF;
 
 	-- Check if destination belongs to the same replication group as source
 	SELECT replication_group INTO src_repl_group FROM shardman.nodes WHERE id=src_node_id;
 	SELECT replication_group INTO dst_repl_group FROM shardman.nodes WHERE id=dst_node_id;
-	IF dst_repl_group<>src_repl_group 
+	IF dst_repl_group<>src_repl_group
 	THEN
 	    RAISE EXCEPTION 'Can not move replica % from replication group % to %', mv_part_name, src_repl_group, dst_repl_group;
 	END IF;
@@ -983,30 +983,35 @@ BEGIN
 	IF EXISTS(SELECT * FROM shardman.replicas WHERE part_name=mv_part_name AND node_id=dst_node_id)
 	THEN
 	    RAISE EXCEPTION 'Can not move replica % to node % with existed replica', mv_part_name, dst_node_id;
-	END 
-	
+	END IF;
+
 	-- Get node ID of primary partition
 	SELECT node_id INTO master_node_id FROM shardman.partitions WHERE part_name=mv_part_name;
 
+	IF master_node_id=dst_node_id
+	THEN
+		RAISE EXCEPTION 'Can not move replica of partition % to primary node %', mv_part_name, dst_node_id;
+	END IF;
+
 	-- Alter publications at master node
 	PERFORM shardman.broadcast(format('%s:ALTER PUBLICATION node_%s ADD TABLE %I;%s:ALTER PUBLICATION node_%s DROP TABLE %I;',
-		dst_node_id, mv_part_name, src_node_id, mv_part_name));
+		master_node_id, dst_node_id, mv_part_name, master_node_id, src_node_id, mv_part_name));
 
 	-- Refresh subscriptions
 	PERFORM shardman.broadcast(format('%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION WITH (copy_data=false);'
 									  '%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;',
-									  src_node_id, src_node_id, master_node_id,												
+									  src_node_id, src_node_id, master_node_id,
 									  dst_node_id, dst_node_id, master_node_id),
 							   super_connstr => true);
 
-	-- Wait completion of initial table sync																
+	-- Wait completion of initial table sync
 	PERFORM shardman.wait_sync_completion(master_node_id, dst_node_id);
 
 	-- Update metadata
 	UPDATE shardman.replicas SET node_id=dst_node_id WHERE node_id=src_node_id AND part_name=mv_part_name;
 
 	-- Truncate original table
-	PERFORM shardman.broadcast(format('%s:TRUNCATE TABLE %L;', src_node_id, mv_part_name);
+	PERFORM shardman.broadcast(format('%s:TRUNCATE TABLE %I;', src_node_id, mv_part_name));
 END
 $$ LANGUAGE plpgsql;
 
@@ -1054,10 +1059,13 @@ BEGIN
 			IF max_count - min_count > 1 THEN
 			    SELECT src.part_name INTO mv_part_name
 				FROM shardman.replicas src
-				WHERE src.node_id=src_node AND src.relation LIKE table_pattern AND
-				    NOT EXISTS(SELECT * FROM shardman.replicas dst
+				WHERE src.node_id=src_node AND src.relation LIKE table_pattern
+				    AND NOT EXISTS(SELECT * FROM shardman.replicas dst
 							   WHERE dst.node_id=dst_node AND dst.part_name=src.part_name)
+				    AND NOT EXISTS(SELECT * FROM shardman.partitions p
+							   WHERE p.node_id=dst_node AND p.part_name=src.part_name)
 				ORDER BY random() LIMIT 1;
+				RAISE NOTICE 'Move replica of % from node % to %', mv_part_name, src_node, dst_node;
 				PERFORM shardman.mv_replica(mv_part_name, src_node, dst_node);
 				done := false;
 			END IF;
@@ -1197,7 +1205,7 @@ CREATE FUNCTION is_shardlord()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Get subscription status 
-CREATE FUNCTION get_subscription_status(sname text) RETURNS char AS $$
+CREATE FUNCTION get_subscription_status(sname text) RETURNS "char" AS $$
 	SELECT srsubstate FROM pg_subscription_rel srel
 		JOIN pg_subscription s on srel.srsubid = s.oid where subname=sname;
 $$ LANGUAGE sql;
