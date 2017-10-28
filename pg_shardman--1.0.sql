@@ -287,6 +287,9 @@ BEGIN
 			 	   rm_node_id, node.id,
 				   node.id, rm_node_id,
 				   rm_node_id, node.id);
+		-- Subscription with associated slot can not be droped inside block, but if we do not override syncronous_commit policy,
+		-- then this command will be blocked waiting for sync replicas. So we need first do unbound slot from subscription.
+		-- But it is possible only for disabled subscriptions. So we have to perform three steps: disable subscription, unbound slot, drop subscription.
 		alts := format('%s{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}',
 			 alts, rm_node_id, rm_node_id, node.id, rm_node_id, node.id,
 			       node.id, node.id, rm_node_id, node.id, rm_node_id);
@@ -642,7 +645,7 @@ BEGIN
 		RETURN;
 	END IF;
 
-	-- Check if destination belong to the same replication group as source
+	-- Check if destination belongs to the same replication group as source
 	IF dst_repl_group<>src_repl_group AND shardman.get_redundancy_of_partition(mv_part_name)>0
 	THEN
 	    RAISE EXCEPTION 'Can not move partition % to different replication group', mv_part_name;
@@ -940,6 +943,133 @@ END
 $$ LANGUAGE plpgsql;
 
 
+-- Move replica to other node. This function is able to move replica only within replication group.
+-- It initiates copying data to new replica, disables logical replication to original replica, 
+-- waits completion of initial table sync and then removes old replca.
+CREATE FUNCTION mv_replica(mv_part_name text, src_node_id int, dst_node_id int)
+RETURNS void AS $$
+DECLARE
+	src_repl_group text;
+	dst_repl_group text;
+	master_node_id int;
+BEGIN
+	IF shardman.redirect_to_shardlord(format('mv_replica(%L, %L, %L)', mv_part_name, src_node_id, dst_node_id))
+	THEN
+		RETURN;
+	END IF;
+
+	IF src_node_id = dst_node_id
+    THEN
+	    -- Nothing to do: replica is already here
+		RAISE NOTICE 'Replica % is already located at node %', mv_part_name,dst_node_id;
+		RETURN;
+	END IF;
+
+	-- Check if there is such replica at source node
+	IF EXISTS(SELECT * FROM shardman.replicas WHERE part_name=mv_part_name AND node_id=src_node_id)
+	THEN
+	    RAISE EXCEPTION 'Replica of & does not exist on node %', mv_part_name, src_node_id;
+	END IF;
+
+	-- Check if destination belongs to the same replication group as source
+	SELECT replication_group INTO src_repl_group FROM shardman.nodes WHERE id=src_node_id;
+	SELECT replication_group INTO dst_repl_group FROM shardman.nodes WHERE id=dst_node_id;
+	IF dst_repl_group<>src_repl_group 
+	THEN
+	    RAISE EXCEPTION 'Can not move replica % from replication group % to %', mv_part_name, src_repl_group, dst_repl_group;
+	END IF;
+
+	-- Check if there is no replica of this partition at the destination node
+	IF EXISTS(SELECT * FROM shardman.replicas WHERE part_name=mv_part_name AND node_id=dst_node_id)
+	THEN
+	    RAISE EXCEPTION 'Can not move replica % to node % with existed replica', mv_part_name, dst_node_id;
+	END 
+	
+	-- Get node ID of primary partition
+	SELECT node_id INTO master_node_id FROM shardman.partitions WHERE part_name=mv_part_name;
+
+	-- Alter publications at master node
+	PERFORM shardman.broadcast(format('%s:ALTER PUBLICATION node_%s ADD TABLE %I;%s:ALTER PUBLICATION node_%s DROP TABLE %I;',
+		dst_node_id, mv_part_name, src_node_id, mv_part_name));
+
+	-- Refresh subscriptions
+	PERFORM shardman.broadcast(format('%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION WITH (copy_data=false);'
+									  '%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;',
+									  src_node_id, src_node_id, master_node_id,												
+									  dst_node_id, dst_node_id, master_node_id),
+							   super_connstr => true);
+
+	-- Wait completion of initial table sync																
+	PERFORM shardman.wait_sync_completion(master_node_id, dst_node_id);
+
+	-- Update metadata
+	UPDATE shardman.replicas SET node_id=dst_node_id WHERE node_id=src_node_id AND part_name=mv_part_name;
+
+	-- Truncate original table
+	PERFORM shardman.broadcast(format('%s:TRUNCATE TABLE %L;', src_node_id, mv_part_name);
+END
+$$ LANGUAGE plpgsql;
+
+
+-- Rebalance replicas between nodes. This function tries to evenly
+-- redistribute replicas of partitions of tables which names match LIKE 'pattern'
+-- between all nodes of replication groups.
+-- It is not able to move replica between replication groups.
+-- This function intentionally moves one replica per time to minimize
+-- influence on system performance.
+CREATE FUNCTION rebalance_replicas(table_pattern text = '%') RETURNS void AS $$
+DECLARE
+	dst_node int;
+	src_node int;
+	min_count bigint;
+	max_count bigint;
+	mv_part_name text;
+	repl_group text;
+	done bool;
+BEGIN
+	IF shardman.redirect_to_shardlord(format('rebalance_replicas(%L)', table_pattern))
+	THEN
+		RETURN;
+	END IF;
+
+	LOOP
+		done := true;
+		-- Repeat for all replication groups
+		FOR repl_group IN SELECT DISTINCT replication_group FROM shardman.nodes
+		LOOP
+			-- Select node in this group with minimal number of replicas
+			SELECT node_id, count(*) n_parts INTO dst_node, min_count
+				FROM shardman.replicas r JOIN shardman.nodes n ON r.node_id=n.id
+			    WHERE n.replication_group=repl_group AND r.relation LIKE table_pattern
+				GROUP BY node_id
+				ORDER BY n_parts ASC LIMIT 1;
+			-- Select node in this group with maximal number of partitions
+			SELECT node_id, count(*) n_parts INTO src_node,max_count
+			    FROM shardman.replicas r JOIN shardman.nodes n ON r.node_id=n.id
+				WHERE n.replication_group=repl_group AND r.relation LIKE table_pattern
+				GROUP BY node_id
+				ORDER BY n_parts DESC LIMIT 1;
+			-- If difference of number of replicas on this nodes is greater
+			-- than 1, then move random partition
+			IF max_count - min_count > 1 THEN
+			    SELECT src.part_name INTO mv_part_name
+				FROM shardman.replicas src
+				WHERE src.node_id=src_node AND src.relation LIKE table_pattern AND
+				    NOT EXISTS(SELECT * FROM shardman.replicas dst
+							   WHERE dst.node_id=dst_node AND dst.part_name=src.part_name)
+				ORDER BY random() LIMIT 1;
+				PERFORM shardman.mv_replica(mv_part_name, src_node, dst_node);
+				done := false;
+			END IF;
+		END LOOP;
+
+		EXIT WHEN done;
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+
+
 ---------------------------------------------------------------------
 -- Utility functions
 ---------------------------------------------------------------------
@@ -1066,6 +1196,28 @@ CREATE FUNCTION synchronous_replication()
 CREATE FUNCTION is_shardlord()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
 
+-- Get subscription status 
+CREATE FUNCTION get_subscription_status(sname text) RETURNS char AS $$
+	SELECT srsubstate FROM pg_subscription_rel srel
+		JOIN pg_subscription s on srel.srsubid = s.oid where subname=sname;
+$$ LANGUAGE sql;
+
+-- Wait initial sync completion
+CREATE FUNCTION wait_sync_completion(src_node_id int, dst_node_id int) RETURNS void AS $$
+DECLARE
+	timeout_sec int = 1;
+	response text;
+BEGIN
+	LOOP
+	    response := shardman.broadcast(format('%s:SELECT shardman.get_subscription_status(''sub_%s_%s'');',
+			dst_node_id, dst_node_id, src_node_id));
+		EXIT WHEN response='r';
+		PERFORM pg_sleep(timeout_sec);
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+
 -- Wait completion of partition copy using LR
 CREATE FUNCTION wait_copy_completion(src_node_id int, dst_node_id int, part_name text) RETURNS void AS $$
 DECLARE
@@ -1081,9 +1233,7 @@ BEGIN
 	LOOP
 		IF NOT synced
 		THEN
-		    response := shardman.broadcast(format(
-				'%s:SELECT srsubstate FROM pg_subscription_rel srel
-				    JOIN pg_subscription s on srel.srsubid = s.oid where subname=%L;',
+		    response := shardman.broadcast(format('%s:SELECT shardman.get_subscription_status(%L);',
 				 dst_node_id, slot));
 			IF response='r' THEN
 			    synced := true;
