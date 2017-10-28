@@ -46,6 +46,13 @@ CREATE TABLE replicas (
 	PRIMARY KEY (part_name,node_id)
 );
 
+-- View for monitoring replication lag
+CREATE VIEW replication_lag(pubnode, subnode, lag) AS
+	SELECT src.id AS srcnode, dst.id AS dstnode,
+		shardman.broadcast(format('%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=''node_%s'';',
+						   src.id, dst.id))::bigint AS lag
+	FROM shardman.nodes src, shardman.nodes dst WHERE src.id<>dst.id;
+
 -- Shardman interface functions
 
 -- Add a node: adjust logical replication channels in replication group and
@@ -1075,8 +1082,6 @@ BEGIN
 	END LOOP;
 END
 $$ LANGUAGE plpgsql;
-
-
 
 ---------------------------------------------------------------------
 -- Utility functions
