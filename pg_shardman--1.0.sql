@@ -294,7 +294,7 @@ BEGIN
 			 	   rm_node_id, node.id,
 				   node.id, rm_node_id,
 				   rm_node_id, node.id);
-		-- Subscription with associated slot can not be droped inside block, but if we do not override syncronous_commit policy,
+		-- Subscription with associated slot can not be dropped inside block, but if we do not override synchronous_commit policy,
 		-- then this command will be blocked waiting for sync replicas. So we need first do unbound slot from subscription.
 		-- But it is possible only for disabled subscriptions. So we have to perform three steps: disable subscription, unbound slot, drop subscription.
 		alts := format('%s{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}',
@@ -860,7 +860,7 @@ DECLARE
 	src text;
 	new_master bool;
 BEGIN
-	-- Check if valid node ID is passed and get connectoin string for this node
+	-- Check if valid node ID is passed and get connection string for this node
 	SELECT connection_string INTO conn_string FROM shardman.nodes WHERE id=master_node_id;
 	IF conn_string IS NULL THEN
 	    RAISE EXCEPTION 'There is no node with ID % in the cluster', master_node_id;
@@ -952,7 +952,7 @@ $$ LANGUAGE plpgsql;
 
 -- Move replica to other node. This function is able to move replica only within replication group.
 -- It initiates copying data to new replica, disables logical replication to original replica, 
--- waits completion of initial table sync and then removes old replca.
+-- waits completion of initial table sync and then removes old replica.
 CREATE FUNCTION mv_replica(mv_part_name text, src_node_id int, dst_node_id int)
 RETURNS void AS $$
 DECLARE
@@ -1290,6 +1290,6 @@ $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION deny_access() RETURNS trigger AS $$
 BEGIN
-    RAISE EXCEPTION 'Access to moving parition is temporary denied';
+    RAISE EXCEPTION 'Access to moving partition is temporary denied';
 END
 $$ LANGUAGE plpgsql;
