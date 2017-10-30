@@ -16,7 +16,8 @@
 -- List of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
-	super_connection_string text UNIQUE NOT NULL,
+	system_id bigint NOT NULL,
+    super_connection_string text UNIQUE NOT NULL,
 	connection_string text UNIQUE NOT NULL,
 	replication_group text NOT NULL -- group of nodes within which shard replicas are allocated
 );
@@ -46,13 +47,6 @@ CREATE TABLE replicas (
 	PRIMARY KEY (part_name,node_id)
 );
 
--- View for monitoring replication lag
-CREATE VIEW replication_lag(pubnode, subnode, lag) AS
-	SELECT src.id AS srcnode, dst.id AS dstnode,
-		shardman.broadcast(format('%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=''node_%s'';',
-						   src.id, dst.id))::bigint AS lag
-	FROM shardman.nodes src, shardman.nodes dst WHERE src.id<>dst.id;
-
 -- Shardman interface functions
 
 -- Add a node: adjust logical replication channels in replication group and
@@ -68,6 +62,7 @@ CREATE FUNCTION add_node(super_conn_string text, conn_string text = NULL,
 						 repl_group text = 'default') RETURNS void AS $$
 DECLARE
 	new_node_id int;
+	system_id bigint;
     node shardman.nodes;
     part shardman.partitions;
 	t shardman.tables;
@@ -93,6 +88,7 @@ DECLARE
 	srv_name text;
 	rules text = '';
 	master_node_id int;
+	sys_id bigint;
 conn_string_effective text = COALESCE(conn_string, super_conn_string);
 BEGIN
 	IF shardman.redirect_to_shardlord(
@@ -102,9 +98,13 @@ BEGIN
 	END IF;
 
 	-- Insert new node in nodes table
-	INSERT INTO shardman.nodes (super_connection_string, connection_string, replication_group)
-	VALUES (super_conn_string, conn_string_effective, repl_group)
-		   RETURNING id INTO new_node_id;
+	INSERT INTO shardman.nodes (system_id, super_connection_string, connection_string, replication_group)
+	VALUES (0, super_conn_string, conn_string_effective, repl_group)
+	RETURNING id INTO new_node_id;
+
+	-- We have to update system_id after insert, because otherwise broadcast will not work
+	sys_id := shardman.broadcast(format('%s:SELECT shardman.get_system_identifier();', new_node_id))::bigint;
+	UPDATE shardman.nodes SET system_id=sys_id WHERE id=new_node_id;
 
 	-- Adjust replication channels within replication group.
 	-- We need all-to-all replication channels between all group members.
@@ -269,15 +269,15 @@ BEGIN
 
 	IF NOT EXISTS(SELECT * from shardman.nodes WHERE id=rm_node_id)
 	THEN
-	   	  RAISE EXCEPTION 'Node % does not exist', rm_node_id;
+	   	RAISE EXCEPTION 'Node % does not exist', rm_node_id;
  	END IF;
 
 	-- If it is not forced remove, check if there are no partitions at this node
 	IF NOT force THEN
-	   IF EXISTS (SELECT * FROM shardman.partitions WHERE node_id = rm_node_id)
-	   THEN
-	   	  RAISE EXCEPTION 'Use force=true to remove non-empty node';
-	   END IF;
+	    IF EXISTS (SELECT * FROM shardman.partitions WHERE node_id = rm_node_id)
+	    THEN
+	   	    RAISE EXCEPTION 'Use force=true to remove non-empty node';
+	    END IF;
     END IF;
 
 	SELECT replication_group INTO repl_group FROM shardman.nodes WHERE id=rm_node_id;
@@ -1293,3 +1293,20 @@ BEGIN
     RAISE EXCEPTION 'Access to moving partition is temporary denied';
 END
 $$ LANGUAGE plpgsql;
+
+-- Returns PostgreSQL system identifier (written in control file)
+CREATE FUNCTION get_system_identifier()
+    RETURNS bigint AS 'pg_shardman' LANGUAGE C STRICT;
+
+-- View for monitoring replication lag
+CREATE VIEW replication_lag(pubnode, subnode, lag) AS
+	SELECT src.id AS srcnode, dst.id AS dstnode,
+		shardman.broadcast(format('%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=''node_%s'';',
+						   src.id, dst.id))::bigint AS lag
+    FROM shardman.nodes src, shardman.nodes dst WHERE src.id<>dst.id;
+
+-- Get self node identifier
+CREATE FUNCTION get_my_id() RETURNS int AS $$
+	SELECT id FROM shardman.nodes WHERE system_id=shardman.get_system_identifier();
+$$ LANGUAGE sql;
+

@@ -18,6 +18,7 @@
 #include "utils/lsyscache.h"
 #include "catalog/pg_type.h"
 #include "access/htup_details.h"
+#include "access/xlog.h"
 #include "storage/latch.h"
 
 /* ensure that extension won't load against incompatible version of Postgres */
@@ -29,6 +30,7 @@ PG_FUNCTION_INFO_V1(is_shardlord);
 PG_FUNCTION_INFO_V1(broadcast);
 PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
 PG_FUNCTION_INFO_V1(pq_conninfo_parse);
+PG_FUNCTION_INFO_V1(get_system_identifier);
 
 /* GUC variables */
 static bool is_lord;
@@ -564,4 +566,10 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 
 	PQconninfoFree(opts);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+Datum
+get_system_identifier(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(GetSystemIdentifier());
 }
