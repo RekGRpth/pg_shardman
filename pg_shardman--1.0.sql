@@ -1083,6 +1083,16 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Get self node identifier
+CREATE FUNCTION get_my_id() RETURNS int AS $$
+DECLARE 
+    node_id int;
+BEGIN
+	SELECT shardman.broadcast(format('0:SELECT id FROM shardman.nodes WHERE system_id=%s;', shardman.get_system_identifier()))::int INTO node_id;
+	RETURN node_id;
+END
+$$ LANGUAGE plpgsql;
+
 ---------------------------------------------------------------------
 -- Utility functions
 ---------------------------------------------------------------------
@@ -1304,9 +1314,4 @@ CREATE VIEW replication_lag(pubnode, subnode, lag) AS
 		shardman.broadcast(format('%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=''node_%s'';',
 						   src.id, dst.id))::bigint AS lag
     FROM shardman.nodes src, shardman.nodes dst WHERE src.id<>dst.id;
-
--- Get self node identifier
-CREATE FUNCTION get_my_id() RETURNS int AS $$
-	SELECT id FROM shardman.nodes WHERE system_id=shardman.get_system_identifier();
-$$ LANGUAGE sql;
 
