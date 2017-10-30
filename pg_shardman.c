@@ -146,10 +146,10 @@ broadcast(PG_FUNCTION_ARGS)
 
 	elog(DEBUG1, "Broadcast commmand '%s'",  sql);
 
-	SPI_connect();
-
-	conn = (PGconn**) palloc(sizeof(PGconn*) * n_cons);
 	initStringInfo(&resp);
+
+	SPI_connect();
+	conn = (PGconn**) palloc(sizeof(PGconn*) * n_cons);
 
 	while ((sep = strchr(sql, *sql == '{' ? '}' : ';')) != NULL)
 	{
