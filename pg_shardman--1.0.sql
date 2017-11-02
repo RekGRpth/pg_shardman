@@ -36,14 +36,14 @@ CREATE TABLE tables (
 CREATE TABLE partitions (
 	part_name text PRIMARY KEY,
 	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, -- node on which partition lies
-	relation text NOT NULL
+	relation text NOT NULL REFERENCES tables(relation) ON DELETE CASCADE
 );
 
 -- Partition replicas
 CREATE TABLE replicas (
 	part_name text NOT NULL REFERENCES partitions(part_name) ON DELETE CASCADE,
 	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, -- node on which partition lies
-	relation text NOT NULL,
+	relation text NOT NULL REFERENCES tables(relation) ON DELETE CASCADE,
 	PRIMARY KEY (part_name,node_id)
 );
 
@@ -581,14 +581,15 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Remove table from all nodes. All table partitions are removed, but replicas
--- and logical stuff not.
+-- Remove table from all nodes.
 CREATE FUNCTION rm_table(rel regclass)
 RETURNS void AS $$
 DECLARE
 	rel_name text = rel::text;
-	node shardman.nodes;
-	drops text = '';
+	node_id int;
+	pname text;
+	drop1 text = '';
+	drop2 text = '';
 BEGIN
 	IF shardman.redirect_to_shardlord(format('rm_table(%L)', rel_name))
 	THEN
@@ -596,14 +597,25 @@ BEGIN
 	END IF;
 
 	-- Drop table at all nodes
-	FOR node IN SELECT * FROM shardman.nodes
+	FOR node_id IN SELECT id FROM shardman.nodes
 	LOOP
-		drops := format('%s%s:DROP TABLE %I CASCADE;',
-			drops, node.id, rel_name);
+		-- Drop parent table. It will also delete all its partitions.
+		drop1 := format('%s%s:DROP TABLE %I CASCADE;',
+			  drop1, node_id, rel_name);
+		-- Drop replicas and stub tables (which are replaced with foreign tables)
+		FOR pname IN SELECT part_name FROM shardman.partitions WHERE relation=rel_name
+		LOOP
+			drop2 := format('%s%s:DROP TABLE IF EXISTS %I CASCADE;',
+			  	  drop2, node_id, pname);
+		END LOOP;
 	END LOOP;
 
 	-- Broadcast drop table commands
-	PERFORM shardman.broadcast(drops);
+	PERFORM shardman.broadcast(drop1);
+	PERFORM shardman.broadcast(drop2);
+
+	-- Update metadata
+	DELETE FROM shardman.tables WHERE relation=rel_name;
 END
 $$ LANGUAGE plpgsql;
 
