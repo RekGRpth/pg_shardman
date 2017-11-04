@@ -577,9 +577,42 @@ BEGIN
 	-- Broadcast alter subscription commands
 	PERFORM shardman.broadcast(subs, synchronous => copy_data, super_connstr => true);
 
-	-- This function doesn't wait completion of replication sync
+	-- This function doesn't wait completion of replication sync. 
+	-- Use wait ensure_redundancy function to wait until sync is completed
 END
 $$ LANGUAGE plpgsql;
+
+-- Wait completion of initial table sync for all replication subscriptions.
+-- This function can be used after set_redundancy to ensure that partitions are copied to replicas.
+CREATE FUNCTION ensure_redundancy() RETURNS void AS $$
+DECLARE
+	src_node_id int;
+	dst_node_id int;
+	timeout_sec int = 1;
+	sub_name text;
+	poll text;
+	response text;
+BEGIN
+	LOOP
+		poll := ''	
+		FOR src_node_id IN SELECT id FROM shardman.nodes
+		LOOP	
+			FOR dst_node_id IN SELECT id FROM shardman.nodes WHERE id<>src_node_id
+			LOOP	
+				sub_name := format('sub_%s_%s', dst_node_id, src_node_id);
+		    	poll := format('%s%s:SELECT shardman.is_subscription_ready(%L);',
+					 poll, dst_node_id, sub_name);
+			END LOOP;
+		END LOOP;
+		
+		response := shardman.broadcast(poll);
+		EXIT WHEN POSITION('f' IN response)=0;
+
+		PERFORM pg_sleep(timeout_sec);
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;				
+
 
 -- Remove table from all nodes.
 CREATE FUNCTION rm_table(rel regclass)
@@ -1537,10 +1570,15 @@ CREATE FUNCTION is_shardlord()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Get subscription status 
-CREATE FUNCTION get_subscription_status(sname text) RETURNS "char" AS $$
-	SELECT srsubstate FROM pg_subscription_rel srel
-		JOIN pg_subscription s on srel.srsubid = s.oid where subname=sname;
-$$ LANGUAGE sql;
+CREATE FUNCTION is_subscription_ready(sname text) RETURNS bool AS $$
+DECLARE
+	n_not_ready bigint;
+BEGIN
+	SELECT count(*) INTO n_not_ready FROM pg_subscription_rel srel
+		JOIN pg_subscription s ON srel.srsubid = s.oid WHERE subname=sname AND srsubstate<>'r';
+	RETURN n_not_ready=0;
+END
+$$ LANGUAGE plpgsql;
 
 -- Wait initial sync completion
 CREATE FUNCTION wait_sync_completion(src_node_id int, dst_node_id int) RETURNS void AS $$
@@ -1549,9 +1587,9 @@ DECLARE
 	response text;
 BEGIN
 	LOOP
-	    response := shardman.broadcast(format('%s:SELECT shardman.get_subscription_status(''sub_%s_%s'');',
+	    response := shardman.broadcast(format('%s:SELECT shardman.is_subscription_ready(''sub_%s_%s'');',
 			dst_node_id, dst_node_id, src_node_id));
-		EXIT WHEN response='r';
+		EXIT WHEN response::bool;
 		PERFORM pg_sleep(timeout_sec);
 	END LOOP;
 END
@@ -1573,9 +1611,9 @@ BEGIN
 	LOOP
 		IF NOT synced
 		THEN
-		    response := shardman.broadcast(format('%s:SELECT shardman.get_subscription_status(%L);',
+		    response := shardman.broadcast(format('%s:SELECT shardman.is_subscription_ready(%L);',
 				 dst_node_id, slot));
-			IF response='r' THEN
+			IF response::bool THEN
 			    synced := true;
 				RAISE DEBUG 'Table % sync completed', part_name;
 				CONTINUE;
