@@ -593,25 +593,34 @@ DECLARE
 	poll text;
 	response text;
 BEGIN
+	IF shardman.redirect_to_shardlord('ensure_redundancy()')
+	THEN
+		RETURN;
+	END IF;
+
+	-- Wait until all subscritpion switch to ready state
 	LOOP
-		poll := ''	
+		poll := '';
 		FOR src_node_id IN SELECT id FROM shardman.nodes
-		LOOP	
+		LOOP
 			FOR dst_node_id IN SELECT id FROM shardman.nodes WHERE id<>src_node_id
-			LOOP	
+			LOOP
 				sub_name := format('sub_%s_%s', dst_node_id, src_node_id);
 		    	poll := format('%s%s:SELECT shardman.is_subscription_ready(%L);',
 					 poll, dst_node_id, sub_name);
 			END LOOP;
 		END LOOP;
-		
+
+		-- Poll subsciption statuses at all nodes
 		response := shardman.broadcast(poll);
+
+		-- Check if all are ready
 		EXIT WHEN POSITION('f' IN response)=0;
 
 		PERFORM pg_sleep(timeout_sec);
 	END LOOP;
 END
-$$ LANGUAGE plpgsql;				
+$$ LANGUAGE plpgsql;
 
 
 -- Remove table from all nodes.
