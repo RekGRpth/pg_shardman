@@ -53,11 +53,9 @@ ansible-playbook -i inventory_ec2 pg_ctl.yml -e "pg_ctl_action=restart"
 
 Read cmd log on shardlord:
 ansible-playbook -i inventory_ec2/ psql.yml --limit 'shardlord' -e "cmd='\'table shardman.cmd_log\''"
-Read nodes table on workers:
-nodes': ansible-playbook -i inventory_ec2/ psql.yml --limit 'workers' -e "cmd='\'table shardman.nodes\''"
 
 Create, fill and shard pgbench tables:
-ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=3 repfactor=0 rebalance=true"
+ansible-playbook -i inventory_ec2/ pgbench_prepare.yml -e "scale=10 nparts=3 redundancy=0"
 Run pgbench test:
 ansible-playbook -i inventory_ec2/ pgbench_run.yml -e 'tmstmp=false tname=t pgbench_opts="-c 1 -T 5"'
 Run pgbench only on node:
@@ -75,14 +73,14 @@ ansible-playbook -i inventory_ec2/ ec2.yml --tags "terminate"
 
 Ubuntu images EC2 locator:
 https://cloud-images.ubuntu.com/locator/ec2/
-We need ami-4199282e.
+We use ami-4199282e.
 
 Other hints:
 Currently pgbench exits on first error. postgres_fdw currently supports only
 repeatable read / serializable isolation levels which immediately leads to
 serialization errors, so you should use either patched postgres_fdw or pgbench.
 
-If you don't want to measure the dist performance, keep data dir on tmpfs or
+If you don't want to measure the disk performance, keep data dir on tmpfs or
 turn of fsync, the effect it similar.
 
 Things that made me wonder during writing this:

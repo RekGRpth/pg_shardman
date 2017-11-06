@@ -1,12 +1,30 @@
-# On worker node 'A', this must be at least 'mrs':
-# mrs = 1
-# for each sharded table t
-#   for each replica shard of t lying on A
-#     mrs++
-#
-# So it is 1 + 1 = 2 for node A from example in postgresql.conf.common
-max_logical_replication_workers = 50
+# We use logical replication for data replication.
+wal_level = logical # necessary for logical replication
+# On worker node from replication group with n nodes, 'max_replication_slots'
+# must be at least 2n + 1 (+ 1 for moving parts/replicas)
+max_replication_slots = 101
+# On worker node from replication group with n nodes, 'max_replication_slots'
+# must be at least n + 1
+max_wal_senders = 51
+# On worker node from replication group with n nodes, 'max_replication_slots'
+# must be at least n + 1
+max_logical_replication_workers = 51
 # At least max_logical_replication_workers + 1
 max_worker_processes = 60
-# Logical worker dies if it hadn't receive anything new during wal_receiver_timeout
+# Logical worker dies if it hadn't receive anything new during
+# wal_receiver_timeout
 wal_receiver_timeout = 60s
+
+# set this to 'on' on for synchronous replication between shards and their
+# replicas, otherwise to 'local'.
+synchronous_commit = on
+
+# for 2pc
+max_prepared_transactions = 1000
+postgres_fdw.use_2pc = on
+# only for testing performace; setting this to 'on' violates visibilitys
+postgres_fdw.use_repeatable_read = off
+
+shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
+# This node is shardlord?
+shardman.shardlord = off

@@ -1,3 +1,5 @@
 shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
+# This node is shardlord?
 shardman.shardlord = on
+# While creating replicas, configure sync or async replication?
 shardman.sync_replication = on
