@@ -1,4 +1,5 @@
-### initdb, send configs and add all workers.
+### initdb, send configs, create extension and add all workers.
+# controlling vars: use_pgbouncer, nodes_in_repgroup
 
 ---
 - hosts: nodes
@@ -10,9 +11,6 @@
     shell: 'pkill -9 postgres || true'
     tags:
       - initdb
-
-  - name: kill bouncer
-    shell: 'pkill -SIGINT pgbouncer || true'
 
   - name: remove datadirs on datanodes
     file: path={{pg_datadir}} state=absent
@@ -56,22 +54,30 @@
       - create_ext
 
 - hosts: shardlord
+  vars:
+    nodes_in_repgroup: 999999
+
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
   tasks:
-  - name: add ec2 workers
+  - name: add ec2 workers, nodes_in_repgroup is {{ nodes_in_repgroup }}
     command: >
       psql -p {{ pg_port }} -c "select shardman.add_node(
-      'hostaddr={{ hostvars[item]['ec2_private_ip_address'] }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}')"
-    with_items: "{{ groups.ec2_workers }}"
+      'hostaddr={{ hostvars[item.1]['ec2_private_ip_address'] }} port={{ pg_port }}',
+      'hostaddr={{ hostvars[item.1]['ec2_private_ip_address'] }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}',
+      'group_{{ item.0 // (nodes_in_repgroup | int) }}')
+      "
+    with_indexed_items: "{{ groups.ec2_workers }}"
     tags:
       - add_nodes
 
-  - name: add manual workers
+  - name: add manual workers, nodes_in_repgroup is {{ nodes_in_repgroup }}
     command: >
       psql -p {{ pg_port }} -c "select shardman.add_node(
-      'hostaddr={{ item }} port={{ pg_port }}')"
-    with_items: "{{ groups.manual_workers }}"
+      'hostaddr={{ item.1 }} port={{ pg_port }}',
+      'hostaddr={{ item.1 }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}',
+      'group_{{ item.0 // (nodes_in_repgroup | int) }}')"
+    with_indexed_items: "{{ groups.manual_workers }}"
     tags:
       - add_nodes

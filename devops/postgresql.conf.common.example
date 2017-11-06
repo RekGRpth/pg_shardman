@@ -3,9 +3,11 @@ log_timezone = 'Europe/Moscow'
 
 listen_addresses = '*'
 
-log_min_messages = NOTICE
+log_min_messages = WARNING
 client_min_messages = NOTICE
 log_replication_commands = on
+log_line_prefix = '%m [%r][%p]'
+# log_statement = 'all'
 
 # log_statement = 'all'
 # logging_collector = on
@@ -30,10 +32,7 @@ fsync = on
 autovacuum = off
 synchronous_commit = on
 # synchronous_commit = local
-shardman.sync_replicas = on
-
-shardman.shardlord_dbname = ubuntu
-shardman.poll_interval = 500 # long operations poll frequency in milliseconds
+shardman.sync_replication = on
 
 max_prepared_transactions = 100000
 postgres_fdw.use_2pc = on

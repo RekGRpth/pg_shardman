@@ -1,0 +1,39 @@
+[
+    {
+	"instance_type": ["c3.2xlarge"],
+	"nodes": [3, 6, 9],
+
+	"sync_replication": [false],
+	"fdw_2pc": [true],
+	"nparts_per_node": [10],
+	"redundancy": [0],
+	"scale": [1300],
+	"use_pgbouncer": [false],
+	"pgbouncer_pool_mode": "transaction",
+	"pgbouncer_pool_size": 8,
+
+	"duration": [30],
+	"test": ["pgbench -N"],
+	"active_nodes": ["all"],
+	"clients": [16, 32, 64]
+    },
+    {
+	"instance_type": ["c3.2xlarge"],
+	"nodes": [3, 6, 9],
+
+	"sync_replication": [false, true],
+	"fdw_2pc": [true],
+	"nparts_per_node": [10],
+	"redundancy": [1],
+	"scale": [1300],
+	"use_pgbouncer": [false],
+	"pgbouncer_pool_mode": "transaction",
+	"pgbouncer_pool_size": 8,
+
+	"duration": [30],
+	"test": ["pgbench -N"],
+	"active_nodes": ["all"],
+	"clients": [16, 32, 64]
+    }
+
+]

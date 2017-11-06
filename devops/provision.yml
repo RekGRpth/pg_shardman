@@ -26,6 +26,10 @@
     tags:
       - tmpfs
 
+  - name: chown {{ ansible_user }} /mnt
+    shell: sudo chown -R {{ ansible_user }} /mnt/
+    become: yes
+
   - name: update apt cache (Debian)
     apt: update_cache=yes
     become: yes
@@ -68,7 +72,7 @@
   - name: build and install pg
     shell: ./configure --prefix={{pg_dst}} --enable-debug && make clean && make -j {{makejobs}} && make install
     args:
-      chdir: "{{pg_src}}"
+      chdir: "{{ pg_src }}"
     tags:
       - build_pg
 
@@ -136,6 +140,33 @@
   - shell: /bin/true
     register: tags_not_specified
 
+  - name: send built pg to nodes for debugging
+    synchronize:
+      src=/home/ars/postgres/install/vanilla/
+      dest="{{ pg_dst }}"
+    when: tags_not_specified is not defined
+    tags: copy_pg
+
+  - name: send libreadline 7, as xenial uses 6
+    synchronize:
+      src=/lib/x86_64-linux-gnu/libhistory.so.7
+      dest="{{ pg_dst }}/lib"
+      copy_links=yes
+    when: tags_not_specified is not defined
+    tags: copy_pg
+
+  - name: send libreadline 7, as xenial uses 6
+    synchronize:
+      src=/lib/x86_64-linux-gnu/libreadline.so.7
+      dest="{{ pg_dst }}/lib"
+      copy_links=yes
+    when: tags_not_specified is not defined
+    tags: copy_pg
+
+  - import_tasks: tasks/pg_ctl.yml pg_ctl_action=restart
+    when: tags_not_specified is not defined
+    tags: copy_pg
+
   - name: clone repo with Arseny's conf
     git: repo=https://github.com/arssher/conf.git
       dest="{{ ars_conf }}"
@@ -181,6 +212,13 @@
       - set_path
       - ars
 
+  - name: set LD_LIBRARY_PATH to pg libraries in .bashrc.
+    # It is important to insert at the beginning, otherwise non-interactive shells won't read this.
+    lineinfile: dest=~/.bashrc insertbefore=BOF line="export LD_LIBRARY_PATH={{ pg_dst }}/lib:$LD_LIBRARY_PATH"
+    tags:
+      - set_path
+      - ars
+
   - name: allow ptrace for non-root users
     lineinfile: dest=/etc/sysctl.d/10-ptrace.conf
       regexp='^kernel.yama.ptrace_scope'
@@ -195,6 +233,12 @@
     become: yes
     tags:
       - allow_ptrace
+
+  - name: dump cores in sane places
+    shell: echo '/tmp/core.%e.%p.%t' | sudo tee /proc/sys/kernel/core_pattern
+    become: yes
+    tags:
+      - dump_core
 
   - name: install perf for xenial
     apt: name=linux-tools-4.4.0-1022-aws state=installed

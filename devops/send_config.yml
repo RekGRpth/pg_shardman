@@ -25,14 +25,22 @@
 
 - hosts: workers
   tasks:
-  - name: copy pgbouncer.conf to workers
+  - name: copy pgbouncer.conf to workers, pgbouncer_pool_mode is {{ pgbouncer_pool_mode }}, pgbouncer_pool_size is {{ pgbouncer_pool_size }}
     template:
       src=templates/pgbouncer.conf.j2
       dest="{{ pgbouncer_conf }}"
     tags:
       - pgbouncer
+    when: use_pgbouncer | bool
+
+  - name: kill bouncer
+    shell: 'pkill -SIGINT pgbouncer || true'
+    tags:
+      - pgbouncer
+    when: use_pgbouncer | bool
 
   - name: start pgbouncer
     command: pgbouncer --daemon "{{ pgbouncer_conf }}"
     tags:
      - pgbouncer
+    when: use_pgbouncer | bool

@@ -2,7 +2,11 @@
 {{ ansible_user }} = host=127.0.0.1 user={{ ansible_user }} port = {{ pg_port }}
 
 [pgbouncer]
-pool_mode = session
+pool_mode = {{ pgbouncer_pool_mode }}
+max_client_conn = 1500
+default_pool_size = {{ pgbouncer_pool_size }}
+min_pool_size = {{ pgbouncer_pool_size }}
+
 listen_port = {{ pgbouncer_port }}
 listen_addr = *
 auth_type = any

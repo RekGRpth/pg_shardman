@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-app_name=`psql -qtA -c "select application_name from pg_stat_replication where application_name ~ '.*accounts.*' limit 1;"`
+app_name=$(psql -qtA -c "select application_name from pg_stat_replication where application_name ~ '.*sub_[0-9]+_[0-9]+.*' limit 1;")
 
 > wal_lag.txt
 while true; do

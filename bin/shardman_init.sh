@@ -37,6 +37,7 @@ done
 start_nodes
 for port in $lord_port "${worker_ports[@]}"; do
     createdb -p $port `whoami`
+    echo "creating pg_shardman extension..."
     psql -p $port -c "create extension pg_shardman cascade;"
 done
 

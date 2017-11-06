@@ -1,5 +1,5 @@
 ### Run pgbench benchmark.
-# Controlling vars: tmstmp (true/false), tname, pgbench_opts
+# Controlling vars: tmstmp (true/false), tname, pgbench_opts, active_workers
 
 
 # set global var to use in all plays, oh my

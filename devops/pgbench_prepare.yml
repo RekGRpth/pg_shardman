@@ -1,8 +1,8 @@
-### create pgbench_history everywhere, create pgbench tables on init node,
-# shard them. TODO: drop sharded tables.
-# Controlling vars: scale, nparts, repfactor, use_pgbouncer
+### create pgbench_history everywhere, create pgbench tables,
+# shard them.
+# Controlling vars: scale, nparts, redundancy, use_pgbouncer, pgbouncer_pool_mode,
+# nodes_in_repgroup
 
-# We need this since we don't drop tables yet
 - import_playbook: init.yml
   tags:
     - init
@@ -12,93 +12,66 @@
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
   tasks:
-  - name: recreate pgbench_history on workers
+  - name: recreate pgbench_history on workers, drop other pgbench tables
     command: >
       psql -p {{ pg_port }} -c "drop table if exists pgbench_history;
+      do $$
+      declare
+      rname text;
+      begin
+      for rname in (select relname from pg_class where relname ~ 'pgbench_.*' and relkind = 'r') loop
+      execute format('drop table if exists %I cascade', rname);
+      end loop;
+      end
+      $$ LANGUAGE 'plpgsql';
+      drop table if exists pgbench_accounts cascade;
+      drop table if exists pgbench_tellers cascade;
+      drop table if exists pgbench_branches cascade;
       create table pgbench_history (tid int, bid int, aid int,
       delta int, mtime timestamp, filler char(22));"
     tags:
       - pgbench_history
 
-  - name: initialize pgbench everywhere to avoid count(*) failure, scale {{ scale }}
-    command: >
-      pgbench -p {{ pg_port }} -s {{ scale }} -i
-    tags:
-      - pgbench_init
+- hosts: shardlord
+  vars:
+    nparts: 10
+    redundancy: 0
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
+  tasks:
+  - name: copy pgbench_ddl.sql
+    copy:
+      src: pgbench_ddl.sql
+      dest: "/home/{{ ansible_user }}/pgbench_ddl.sql"
+
+  - name: create pgbench tables on shardlord
+    command: >
+      psql -p {{ pg_port }} -f pgbench_ddl.sql
+
+  - name: create_hash_partitions for pgbench_accounts, nparts {{ nparts }}, redundancy {{ redundancy }}
+    command: >
+      psql -p {{ pg_port }} -c "
+      select shardman.create_hash_partitions('pgbench_accounts', 'aid', {{ nparts }}, {{ redundancy }});
+      select shardman.create_hash_partitions('pgbench_tellers', 'tid', {{ nparts }}, {{ redundancy }});
+      select shardman.create_hash_partitions('pgbench_branches', 'bid', {{ nparts }}, {{ redundancy }});
+      "
+    tags:
+      - create_hash_partitions
 
 - hosts: init_node
   vars:
     scale: 10
     nparts: 10
-    repfactor: 0
+    redundancy: 0
     rebalance: true
-    tellers_branches: true
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
   tasks:
-  - name: drop old pgbench tables with deps
-    command: >
-      psql -p {{ pg_port }} -c "
-      drop table if exists pgbench_accounts cascade;
-      drop table if exists pgbench_tellers cascade;
-      drop table if exists pgbench_branches cascade;
-      drop table if exists pgbench_tellers cascade;
-      drop table if exists pgbench_accounts cascade;
-      "
-    tags:
-      - pgbench_init
-
-  - name: learn init node id
-    command: >
-      psql -p {{ pg_port }} -qtA -c "select shardman.my_id();"
-    register: my_id
-    until: my_id.stdout != ""
-    retries: 19481948 # oh my
-    tags:
-      - pgbench_init
-
+    # requires patched pgbench
   - name: initialize pgbench, scale {{ scale }}
     command: >
-      pgbench -p {{ pg_port }} -s {{ scale }} -i
+      pgbench -p {{ pg_port }} -s {{ scale }} -i --no-ddl
     tags:
       - pgbench_init
-
-  - name: create_hash_partitions for pgbench_accounts, nparts {{ nparts }}
-    command: >
-      psql -p {{ pg_port }} -c "
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_accounts', 'aid', {{ nparts }}, {{ rebalance }});
-      select shardman.set_replevel('pgbench_accounts', {{ repfactor }});
-      "
-    tags:
-      - create_hash_partitions_accounts
-
-  - name: create_hash_partitions for branches & tellers, nparts {{ nparts }}, repfactor {{ repfactor }}
-    command: >
-      psql -p {{ pg_port }} -c "
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_tellers', 'tid', {{ nparts }}, {{ rebalance }});
-      select shardman.create_hash_partitions({{ my_id.stdout }}, 'pgbench_branches', 'bid', {{ nparts }}, {{ rebalance }});
-      select shardman.set_replevel('pgbench_tellers', {{ repfactor }});
-      select shardman.set_replevel('pgbench_branches', {{ repfactor }});
-      "
-    tags:
-      - create_hash_partitions_tellers_branches
-    when: tellers_branches | bool
-
-- hosts: shardlord
-  environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
-
-  tasks:
-  - name: wait for cmd finishing
-    command: >
-      psql -p {{ pg_port }} -qtA -c "
-      select count(*) from shardman.cmd_log
-      where status in ('waiting', 'in progress');
-      "
-    register: jobs_count
-    until: jobs_count.stdout == "0"
-    retries: 19481948 # oh my
-    tags:
-      - wait
