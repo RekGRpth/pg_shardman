@@ -89,7 +89,7 @@ DECLARE
 	rules text = '';
 	master_node_id int;
 	sys_id bigint;
-conn_string_effective text = COALESCE(conn_string, super_conn_string);
+	conn_string_effective text = COALESCE(conn_string, super_conn_string);
 BEGIN
 	IF shardman.redirect_to_shardlord(
 		format('add_node(%L, %L, %L)', super_conn_string, conn_string, repl_group))
@@ -828,6 +828,12 @@ BEGIN
 	PERFORM shardman.broadcast(cmds, two_phase => use_2pc);
 END
 $$ LANGUAGE plpgsql;
+
+-- Count number of replicas at particular node.
+-- This command can be executed only at shardlord.
+CREATE FUNCTION get_node_replicas_count(node int) returns bigint AS $$
+   SELECT count(*) from shardman.replicas WHERE node_id=node;
+$$ LANGUAGE sql;
 
 -- Count number of partitions at particular node.
 -- This command can be executed only at shardlord.
