@@ -51,7 +51,7 @@ shardman.sync_replication          Use synchronous replication: commit will wait
 
 2. Cluster configuration
 
-Shardman consists of several working nodes managed by "shardlord" - special  instance of postgres,
+Shardman cluster consists of several working nodes managed by "shardlord" - special  instance of postgres,
 which maintains cluster metadata. There is no data stored at shardlord, bit all tables, indexes,... should be created
 at shardlord and then will be broadcasted to working nodes by shardman.
 

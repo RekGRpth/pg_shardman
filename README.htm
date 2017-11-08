@@ -90,7 +90,7 @@ There are few shardman/postgres_fdw parameter you may need to specify:
 <li><a name="cluster_config">Cluster configuration</a></li>
 
 <p>
-Shardman consists of several working nodes managed by "shardlord" - special  instance of postgres,
+Shardman cluster consists of several working nodes managed by <i>shardlord</i> - special  instance of postgres,
 which maintains cluster metadata. There is no data stored at shardlord, bit all tables, indexes,... should be created
 at shardlord and then will be broadcasted to working nodes by shardman.
 </p>
@@ -299,13 +299,13 @@ If you want to wait it, to ensure that requested redundancy level is reached, th
 </p>
 
 <p>
-It is possible to remove table together with all its partitions and replicas using <code>sshardman.rm_table(rel regclass)</code>s function.
+It is possible to remove table together with all its partitions and replicas using <code>shardman.rm_table(rel regclass)</code>s function.
 Please be careful: it doesn't require any confirmation and data will be lost after successful completion of this command.
 </p>
 
 <p>
 If execution of shardlord command was interrupted or abnormally terminated, then cluster may leave in inconsistent state.
-Consistency can be restored using <code>sshardman.recovery()</code> command. It tries to reestablish FDW and logical replication channels according to metadata.
+Consistency can be restored using <code>shardman.recovery()</code> command. It tries to reestablish FDW and logical replication channels according to metadata.
 This command reports all performed recovery actions, so it can be used to check consistency of the cluster.
 If it reports nothing then no inconsistency is found in the cluster.
 </p>
