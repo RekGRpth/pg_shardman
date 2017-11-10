@@ -1438,7 +1438,9 @@ DECLARE
 	repl shardman.replicas;
 	create_table text;
 	create_rules text;
+	rules text = '';
 	alters text = '';
+	node_id int;
 BEGIN
 	IF shardman.redirect_to_shardlord(format('alter_table(%L,%L)', rel_name, alter_clause))
 	THEN
@@ -1452,6 +1454,12 @@ BEGIN
 	IF t.master_node IS NOT NULL
 	THEN
 		SELECT shardman.gen_create_rules_sql(t.relation, format('%s_fdw', t.relation)) INTO create_rules;
+		FOR node_id IN SELECT * FROM shardman.nodes WHERE id<>t.master_node
+		LOOP
+			rules :=  format('%s{%s:%s}',
+				  rules, node_id, create_rules);
+		END LOOP;
+		PERFORM shardman.broadcast(rules);
 	END IF;
 	UPDATE shardman.tables SET create_sql=create_table, create_rules_sql=create_rules WHERE relation=t.relation;
 
@@ -1493,9 +1501,9 @@ BEGIN
     WHERE  i.indrelid = rel_name::regclass
     AND    i.indisprimary;
 
-	RETURN format('CREATE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
-		           CREATE RULE on_insert AS ON INSERT TO %I DO INSTEAD INSERT INTO %I (%s) VALUES (%s);
-		           CREATE RULE on_delete AS ON DELETE TO %I DO INSTEAD DELETE FROM %I WHERE %s;',
+	RETURN format('CREATE OR REPLACE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
+		           CREATE OR REPLACE RULE on_insert AS ON INSERT TO %I DO INSTEAD INSERT INTO %I (%s) VALUES (%s);
+		           CREATE OR REPLACE RULE on_delete AS ON DELETE TO %I DO INSTEAD DELETE FROM %I WHERE %s;',
         rel_name, fdw_name, dst, src, pk,
 		rel_name, fdw_name, dst, src,
 		rel_name, fdw_name, pk);
