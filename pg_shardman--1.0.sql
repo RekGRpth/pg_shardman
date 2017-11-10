@@ -810,12 +810,13 @@ $$ LANGUAGE sql;
 
 -- Execute command at all shardman nodes.
 -- It can be used to perform DDL at all nodes.
-CREATE FUNCTION forall(sql text, use_2pc bool = false) returns void AS $$
+CREATE FUNCTION forall(sql text, use_2pc bool = false, including_shardlord bool = false)
+returns void AS $$
 DECLARE
 	node_id integer;
 	cmds text = '';
 BEGIN
-	IF shardman.redirect_to_shardlord(format('forall(%L, %L)', sql, use_2pc))
+	IF shardman.redirect_to_shardlord(format('forall(%L, %L, %L)', sql, use_2pc, including_shardlord))
 	THEN
 		RETURN;
 	END IF;
@@ -825,6 +826,13 @@ BEGIN
 	LOOP
 		cmds := format('%s%s:%s;', cmds, node_id, sql);
 	END LOOP;
+
+	-- Execute command also at shardlord
+	IF including_shardlord
+	THEN
+		cmds := format('%s0:%s;', cmds, sql);
+	END IF;
+
 	PERFORM shardman.broadcast(cmds, two_phase => use_2pc);
 END
 $$ LANGUAGE plpgsql;
@@ -915,9 +923,6 @@ DECLARE
 	rel_name text = rel::text;
 	fdw_name text = format('%s_fdw', rel_name);
 	srv_name text = format('node_%s', master_node_id);
-	pk text;
-	dst text;
-	src text;
 	new_master bool;
 BEGIN
 	-- Check if valid node ID is passed and get connection string for this node
@@ -926,37 +931,17 @@ BEGIN
 	    RAISE EXCEPTION 'There is no node with ID % in the cluster', master_node_id;
 	END IF;
 
-	-- Construct list of attributes of the table for update/insert
-	SELECT INTO dst, src
-          string_agg(quote_ident(attname), ', '),
-		  string_agg('NEW.' || quote_ident(attname), ', ')
-    FROM   pg_attribute
-    WHERE  attrelid = rel
-    AND    NOT attisdropped   -- no dropped (dead) columns
-    AND    attnum > 0;
+	-- Get information about relation attributes and primary keys needed to construct CREATE TABLE statement and 
+	PERFORM shardman.get_relation_metadata(rel, dst, src, pk);
 
-	-- Construct primary key condition for update
-	SELECT INTO pk
-          string_agg(quote_ident(a.attname) || '=OLD.'|| quote_ident(a.attname), ' AND ')
-	FROM   pg_index i
-	JOIN   pg_attribute a ON a.attrelid = i.indrelid
-                     AND a.attnum = ANY(i.indkey)
-    WHERE  i.indrelid = rel
-    AND    i.indisprimary;
-
-	-- Generate SQL statement creating this table
+    -- Generate SQL statement creating this table
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
 	-- Construct table attributes for create foreign table
 	SELECT shardman.reconstruct_table_attrs(rel) INTO table_attrs;
 
-	-- Create rules for redirecting updates
-	create_rules := format('CREATE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
-		 	                CREATE RULE on_insert AS ON INSERT TO %I DO INSTEAD INSERT INTO %I (%s) VALUES (%s);
-		 	                CREATE RULE on_delete AS ON DELETE TO %I DO INSTEAD DELETE FROM %I WHERE %s;',
-        rel_name, fdw_name, dst, src, pk,
-		rel_name, fdw_name, dst, src,
-		rel_name, fdw_name, pk);
+	-- Generatate SQL statements creating  instead rules for updates
+	SELECT shardman.gen_create_rules_sql(rel_name) INTO create_rules;
 
 	-- Create table at all nodes
 	FOR node IN SELECT * FROM shardman.nodes
@@ -1445,10 +1430,77 @@ END
 $$ LANGUAGE plpgsql;
 
 
+-- Alter table at sharload and all nodes
+CREATE FUNCTION alter_table(rel regclass, alter_clause text) RETURNS void AS $$
+DECLARE
+	rel_name text = rel::text;
+	t shardman.tables;
+	repl shardman.replicas;
+	create_table text;
+	create_rules text;
+	alters text = '';
+BEGIN
+	IF shardman.redirect_to_shardlord(format('alter_table(%L,%L)', rel_name, alter_clause))
+	THEN
+		RETURN;
+	END IF;
+
+	PERFORM shardman.forall(format('ALTER TABLE %I %s', rel_name, alter_clause), including_shardlord=>true);
+
+	SELECT * INTO t FROM shardman.tables WHERE relation=rel_name;
+	SELECT shardman.gen_create_table_sql(t.relation) INTO create_table;
+	IF t.master_node IS NOT NULL
+	THEN
+		SELECT shardman.gen_create_rules_sql(t.relation, format('%s_fdw', t.relation)) INTO create_rules;
+	END IF;
+	UPDATE shardman.tables SET create_sql=create_table, create_rules_sql=create_rules WHERE relation=t.relation;
+
+	FOR repl IN SELECT * FROM shardman.replicas
+	LOOP
+		alters := format('%s%s:ALTER TABLE %I %s;',
+			   alters, repl.node_id, repl.part_name, alter_clause);
+	END LOOP;
+	PERFORM shardman.broadcast(alters);
+END
+$$ LANGUAGE plpgsql;
 
 ---------------------------------------------------------------------
 -- Utility functions
 ---------------------------------------------------------------------
+
+-- Generate rules for redirecting updates for shared table
+CREATE FUNCTION gen_create_rules_sql(rel_name text, fdw_name text) RETURNS text AS $$
+DECLARE
+	pk text;
+	dst text;
+	src text;
+BEGIN
+	-- Construct list of attributes of the table for update/insert
+	SELECT INTO dst, src
+          string_agg(quote_ident(attname), ', '),
+		  string_agg('NEW.' || quote_ident(attname), ', ')
+    FROM   pg_attribute
+    WHERE  attrelid = rel_name::regclass
+    AND    NOT attisdropped   -- no dropped (dead) columns
+    AND    attnum > 0;
+
+	-- Construct primary key condition for update
+	SELECT INTO pk
+          string_agg(quote_ident(a.attname) || '=OLD.'|| quote_ident(a.attname), ' AND ')
+	FROM   pg_index i
+	JOIN   pg_attribute a ON a.attrelid = i.indrelid
+                     AND a.attnum = ANY(i.indkey)
+    WHERE  i.indrelid = rel_name::regclass
+    AND    i.indisprimary;
+
+	RETURN format('CREATE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
+		           CREATE RULE on_insert AS ON INSERT TO %I DO INSTEAD INSERT INTO %I (%s) VALUES (%s);
+		           CREATE RULE on_delete AS ON DELETE TO %I DO INSTEAD DELETE FROM %I WHERE %s;',
+        rel_name, fdw_name, dst, src, pk,
+		rel_name, fdw_name, dst, src,
+		rel_name, fdw_name, pk);
+END
+$$ LANGUAGE plpgsql;
 
 -- Check if resource exists at remote node
 CREATE FUNCTION not_exists(node_id int, what text) RETURNS bool AS $$

@@ -235,10 +235,11 @@ have some limitations which doesn't allow to build efficient execution plans for
 some queries.
 
 Shardlord commands called on workers are implicitly redirected to shardlord, but
-it is highly recommended to perform them directly at shardlord. DDL commands can
-be broadcasted to all cluster nodes using `shardman.forall(cmd text)` function,
-but right now shardman doesn't support altering of existing tables schema. You
-can, however, try to create indexes. It must be done per each partition
+it is highly recommended to perform them directly at shardlord. It is possible to
+broadcast command to all cluster nodes using `shardman.forall(cmd text, use_2pc bool = false, including_shardlord bool = false)` function.
+But if you are going to alter sharded or shared table, you should use
+`shardman.forall(rel regclass, alter_clause text)` function.
+You can also create new indexes. It must be done per each partition
 separately, see
 [pathman docs](https://github.com/postgrespro/pg_pathman/wiki/How-do-I-create-indexes)
 
