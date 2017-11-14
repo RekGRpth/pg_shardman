@@ -123,13 +123,14 @@ Datum
 broadcast(PG_FUNCTION_ARGS)
 {
 	char *sql_full = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char* sql = pstrdup(sql_full);
+	char* cmd = pstrdup(sql_full);
 	bool  ignore_errors = PG_GETARG_BOOL(1);
 	bool  two_phase = PG_GETARG_BOOL(2);
 	bool  sync_commit_on = PG_GETARG_BOOL(3);
 	bool  sequential = PG_GETARG_BOOL(4);
 	bool  super_connstr = PG_GETARG_BOOL(5);
 	char* sep;
+	char* sql;
 	PGresult *res;
 	char* fetch_node_connstr;
 	int   rc;
@@ -144,24 +145,25 @@ broadcast(PG_FUNCTION_ARGS)
 
 	char* errmsg = NULL;
 
-	elog(DEBUG1, "Broadcast commmand '%s'",  sql);
+	elog(DEBUG1, "Broadcast commmand '%s'",  cmd);
 
 	initStringInfo(&resp);
 
 	SPI_connect();
 	conn = (PGconn**) palloc(sizeof(PGconn*) * n_cons);
 
-	while ((sep = strchr(sql, *sql == '{' ? '}' : ';')) != NULL)
+	while ((sep = strchr(cmd, *cmd == '{' ? '}' : ';')) != NULL)
 	{
 		*sep = '\0';
 
-		if (*sql == '{')
-			sql += 1;
-		rc = sscanf(sql, "%d:%n", &node_id, &n);
+		if (*cmd == '{')
+			cmd += 1;
+		rc = sscanf(cmd, "%d:%n", &node_id, &n);
 		if (rc != 1) {
-			elog(ERROR, "SHARDMAN: Invalid command string: %s", sql);
+			elog(ERROR, "SHARDMAN: Invalid command string: %s", cmd);
 		}
-		sql += n;
+		sql = cmd + n;
+		cmd = sep + 1;
 		if (node_id != 0)
 		{
 			fetch_node_connstr = psprintf(
@@ -230,13 +232,11 @@ broadcast(PG_FUNCTION_ARGS)
 							  node_id, PQerrorMessage(conn[n_cmds-1]));
 			goto cleanup;
 		}
-
-		sql = sep + 1;
 	}
 
-	if (*sql != '\0')
+	if (*cmd != '\0')
 	{
-		elog(ERROR, "SHARDMAN: Junk at end of command list: %s", sql);
+		elog(ERROR, "SHARDMAN: Junk at end of command list: %s", cmd);
 	}
 
 	for (i = 0; i < n_cmds; i++)

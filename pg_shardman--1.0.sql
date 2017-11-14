@@ -371,6 +371,12 @@ BEGIN
 	-- Exclude partitions of removed node
 	FOR part in SELECT * from shardman.partitions where node_id=rm_node_id
 	LOOP
+		-- If there are more than one replica of this partition, we need to synchronize them
+		IF shardman.get_redundancy_of_partition(part.part_name)>1
+		THEN
+			PERFORM shardman.synchronize_replicas(part.part_name);
+		END IF;
+
 		-- Is there some replica of this node?
 		SELECT node_id INTO new_master_id FROM shardman.replicas WHERE part_name=part.part_name ORDER BY random() LIMIT 1;
 		IF new_master_id IS NOT NULL
@@ -577,7 +583,13 @@ BEGIN
 	-- Broadcast alter subscription commands
 	PERFORM shardman.broadcast(subs, synchronous => copy_data, super_connstr => true);
 
-	-- This function doesn't wait completion of replication sync. 
+	-- Maintain change log to be able to synchronize replicas after primary node failure
+	IF redundancy > 1
+	THEN
+		PERFORM shardman.generate_on_change_triggers(rel_name);
+	END IF;
+
+	-- This function doesn't wait completion of replication sync.
 	-- Use wait ensure_redundancy function to wait until sync is completed
 END
 $$ LANGUAGE plpgsql;
@@ -598,7 +610,7 @@ BEGIN
 		RETURN;
 	END IF;
 
-	-- Wait until all subscritpion switch to ready state
+	-- Wait until all subscriptions switch to ready state
 	LOOP
 		poll := '';
 		FOR src_node_id IN SELECT id FROM shardman.nodes
@@ -611,7 +623,7 @@ BEGIN
 			END LOOP;
 		END LOOP;
 
-		-- Poll subsciption statuses at all nodes
+		-- Poll subscription statuses at all nodes
 		response := shardman.broadcast(poll);
 
 		-- Check if all are ready
@@ -931,16 +943,13 @@ BEGIN
 	    RAISE EXCEPTION 'There is no node with ID % in the cluster', master_node_id;
 	END IF;
 
-	-- Get information about relation attributes and primary keys needed to construct CREATE TABLE statement and 
-	PERFORM shardman.get_relation_metadata(rel, dst, src, pk);
-
     -- Generate SQL statement creating this table
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
 	-- Construct table attributes for create foreign table
 	SELECT shardman.reconstruct_table_attrs(rel) INTO table_attrs;
 
-	-- Generatate SQL statements creating  instead rules for updates
+	-- Generate SQL statements creating  instead rules for updates
 	SELECT shardman.gen_create_rules_sql(rel_name) INTO create_rules;
 
 	-- Create table at all nodes
@@ -1004,6 +1013,7 @@ DECLARE
 	src_repl_group text;
 	dst_repl_group text;
 	master_node_id int;
+	rel_name text;
 BEGIN
 	IF shardman.redirect_to_shardlord(format('mv_replica(%L, %L, %L)', mv_part_name, src_node_id, dst_node_id))
 	THEN
@@ -1038,7 +1048,7 @@ BEGIN
 	END IF;
 
 	-- Get node ID of primary partition
-	SELECT node_id INTO master_node_id FROM shardman.partitions WHERE part_name=mv_part_name;
+	SELECT node_id,relation INTO master_node_id,rel_name FROM shardman.partitions WHERE part_name=mv_part_name;
 
 	IF master_node_id=dst_node_id
 	THEN
@@ -1064,6 +1074,14 @@ BEGIN
 
 	-- Truncate original table
 	PERFORM shardman.broadcast(format('%s:TRUNCATE TABLE %I;', src_node_id, mv_part_name));
+
+	-- If there are more than one replica, we need to maintain change_log table for it
+	IF shardman.get_redundancy_of_partition(mv_part_name) > 1
+	THEN
+		PERFORM shardman.broadcast(format('{%s:%s}{%s:%s}',
+										   dst_node_id, shardman.create_on_change_triggers(rel_name, mv_part_name),
+										   src_node_id, shardman.drop_on_change_triggers(mv_part_name)));
+	END IF;
 END
 $$ LANGUAGE plpgsql;
 
@@ -1130,7 +1148,7 @@ $$ LANGUAGE plpgsql;
 
 -- Get self node identifier
 CREATE FUNCTION get_my_id() RETURNS int AS $$
-DECLARE 
+DECLARE
     node_id int;
 BEGIN
 	SELECT shardman.broadcast(format('0:SELECT id FROM shardman.nodes WHERE system_id=%s;', shardman.get_system_identifier()))::int INTO node_id;
@@ -1426,11 +1444,14 @@ BEGIN
 	PERFORM shardman.broadcast(pubs, super_connstr => true);
 	-- Create not existed subscriptions
 	PERFORM shardman.broadcast(subs, super_connstr => true);
+
+	-- Create not existed on_change triggers
+	PERFORM shardman.generate_on_change_triggers();
 END
 $$ LANGUAGE plpgsql;
 
 
--- Alter table at sharload and all nodes
+-- Alter table at shardlord and all nodes
 CREATE FUNCTION alter_table(rel regclass, alter_clause text) RETURNS void AS $$
 DECLARE
 	rel_name text = rel::text;
@@ -1644,7 +1665,7 @@ CREATE FUNCTION synchronous_replication()
 CREATE FUNCTION is_shardlord()
 	RETURNS bool AS 'pg_shardman' LANGUAGE C STRICT;
 
--- Get subscription status 
+-- Get subscription status
 CREATE FUNCTION is_subscription_ready(sname text) RETURNS bool AS $$
 DECLARE
 	n_not_ready bigint;
@@ -1719,6 +1740,7 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Truncate the partition at source node after copy completion and switch off write protection for this partition
 CREATE FUNCTION complete_partition_move(src_node_id int, dst_node_id int, part_name text) RETURNS void AS $$
 BEGIN
 	PERFORM shardman.broadcast(format('%s:TRUNCATE TABLE %I;',
@@ -1728,20 +1750,189 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Trigger procedure prohibiting modification of the table
 CREATE FUNCTION deny_access() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION 'Access to moving partition is temporary denied';
 END
 $$ LANGUAGE plpgsql;
 
+-- In case of primary node failure ensure that all replicas are identical using change_log table.
+-- We check last seqno stored in change_log at all replicas and for each lagging replica (last_seqno < max_seqno) perform three actions:
+-- 1. Copy missing part of change_log table
+-- 2. Delete all records from partition which primary key=old_pk in change_log table with seqno>last_seqno
+-- 3. Copy from advanced replica those records which primary key=new_pk in change_log table with seqno>last_seqno
+CREATE FUNCTION synchronize_replicas(pname text) RETURNS void AS $$
+DECLARE
+	max_seqno bigint = 0;
+	seqno bigint;
+	advanced_node int;
+	replica shardman.replicas;
+BEGIN
+	-- Select most advanced replica: replica with largest seqno
+	FOR replica IN SELECT * FROM shardman.replicas WHERE part_name=pname
+	LOOP
+		SELECT shardman.broadcast(format('%s:SELECT max(seqno) FROM %s_change_log;',
+			replica.node_id, replica.part_name))::bigint INTO seqno;
+		IF seqno > max_seqno
+		THEN
+		   max_seqno := seqno;
+		   advanced_node := replica.node_id;
+		END IF;
+	END LOOP;
+
+	-- Synchronize all lagging replicas
+	FOR replica IN SELECT * FROM shardman.replicas WHERE part_name=pname AND node_id<>advanced_node
+	LOOP
+		SELECT shardman.broadcast(format('%s:SELECT max(seqno) FROM %s_change_log;',
+			replica.node_id, replica.part_name))::bigint INTO seqno;
+		IF seqno <> max_seqno
+		THEN
+		   RAISE NOTICE 'Advance node % from %', replica.node_id, advanced_node;
+		   PERFORM shardman.remote_copy(replica.relation, replica.part_name, replica.node_id, advanced_node, seqno);
+		END IF;
+	END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Get relation primary key. There can be table with no primary key or with compound primary key.
+-- But logical replication and hash partitioning in any case requires single primary key.
+CREATE FUNCTION get_primary_key(rel regclass, out pk_name text, out pk_type text) AS $$
+	SELECT a.attname::text,a.atttypid::regtype::text FROM pg_index i
+	JOIN   pg_attribute a ON a.attrelid = i.indrelid
+                     AND a.attnum = ANY(i.indkey)
+    WHERE  i.indrelid = rel
+    AND    i.indisprimary;
+$$ LANGUAGE sql;
+
+-- Copy missing data from one node to another. This function us using change_log table to determine records which need to be copied.
+-- See explanations in synchronize_replicas.
+-- Parameters:
+--   rel_name:   name of parent relation
+--   part_name:  synchronized partition name
+--   dst_node:   lagging node
+--   src_node:   advanced node
+--   last_seqno: maximal seqno at lagging node
+CREATE FUNCTION remote_copy(rel_name text, part_name text, dst_node int, src_node int, last_seqno bigint) RETURNS void AS $$
+DECLARE
+	script text;
+	conn_string text;
+	pk_name text;
+	pk_type text;
+BEGIN
+	SELECT * FROM shardman.get_primary_key(rel_name) INTO pk_name,pk_type;
+	SELECT connection_string INTO conn_string FROM shardman.nodes WHERE id=src_node;
+	-- We need to execute all this three statements in one transaction to exclude inconsistencies in case of failure
+	script := format('{%s:COPY %s_change_log FROM PROGRAM ''psql "%s" -c "COPY (SELECT * FROM %s_change_log WHERE seqno>%s) TO stdout"'';
+		   	  		      DELETE FROM %I USING %s_change_log cl WHERE cl.seqno>%s AND cl.old_pk=%I;
+						  COPY %I FROM PROGRAM ''psql "%s" -c "COPY (SELECT DISTINCT ON (%I) %I.* FROM %I,%s_change_log cl WHERE cl.seqno>%s AND cl.new_pk=%I ORDER BY %I) TO stdout"''}',
+					dst_node, part_name, conn_string, part_name, last_seqno,
+					part_name, part_name, last_seqno, pk_name,
+					part_name, conn_string, pk_name, part_name, part_name, part_name, last_seqno, pk_name, pk_name);
+	PERFORM shardman.broadcast(script);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Drop on_change triggers when replica is moved
+CREATE FUNCTION drop_on_change_triggers(part_name text) RETURNS text AS $$
+BEGIN
+	return format('DROP FUNCTION on_%s_insert CASCADE;
+		   		   DROP FUNCTION on_%s_update CASCADE;
+				   DROP FUNCTION on_%s_delete CASCADE;',
+				   part_name, part_name, part_name);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Generate triggers which maintain change_log table for replica
+CREATE FUNCTION create_on_change_triggers(rel_name text, part_name text) RETURNS text AS $$
+DECLARE
+	pk_name text;
+	pk_type text;
+	change_log_limit int = 32*1024;
+BEGIN
+	SELECT * FROM shardman.get_primary_key(rel_name) INTO pk_name,pk_type;
+	RETURN format($triggers$
+		CREATE TABLE IF NOT EXISTS %s_change_log(seqno bigserial primary key, new_pk %s, old_pk %s);
+		CREATE FUNCTION on_%s_update() RETURNS TRIGGER AS $func$
+		DECLARE
+			last_seqno bigint;
+		BEGIN
+			INSERT INTO %s_change_log (new_pk, old_pk) values (NEW.%I, OLD.%I) RETURNING seqno INTO last_seqno;
+			IF last_seqno %% %s = 0 THEN
+			    DELETE FROM %s_change_log WHERE seqno < last_seqno - %s;
+			END IF;
+			RETURN NEW;
+		END; $func$ LANGUAGE plpgsql;
+		CREATE FUNCTION on_%s_insert() RETURNS TRIGGER AS $func$
+		DECLARE
+			last_seqno bigint;
+		BEGIN
+			INSERT INTO %s_change_log (new_pk) values (NEW.%I) RETURNING seqno INTO last_seqno;
+			IF last_seqno %% %s = 0 THEN
+			    DELETE FROM %s_change_log WHERE seqno < last_seqno - %s;
+			END IF;
+			RETURN NEW;
+		END; $func$ LANGUAGE plpgsql;
+		CREATE FUNCTION on_%s_delete() RETURNS TRIGGER AS $func$
+		DECLARE
+			last_seqno bigint;
+		BEGIN
+			INSERT INTO %s_change_log (old_pk) values (OLD.%I) RETURNING seqno INTO last_seqno;
+			IF last_seqno %% %s = 0 THEN
+			    DELETE FROM %s_change_log WHERE seqno < last_seqno - %s;
+			END IF;
+		END; $func$ LANGUAGE plpgsql;
+		CREATE TRIGGER on_insert AFTER INSERT ON %I FOR EACH ROW EXECUTE PROCEDURE on_%s_insert();
+		CREATE TRIGGER on_update AFTER UPDATE ON %I FOR EACH ROW EXECUTE PROCEDURE on_%s_update();
+		CREATE TRIGGER on_delete AFTER DELETE ON %I FOR EACH ROW EXECUTE PROCEDURE on_%s_delete();
+		ALTER TABLE %I ENABLE REPLICA TRIGGER on_insert, ENABLE REPLICA TRIGGER on_update, ENABLE REPLICA TRIGGER on_delete;$triggers$,
+		part_name, pk_type, pk_type,
+		part_name, part_name, pk_name, pk_name, change_log_limit*2, part_name, change_log_limit,
+		part_name, part_name, pk_name, change_log_limit*2, part_name, change_log_limit,
+		part_name, part_name, pk_name, change_log_limit*2, part_name, change_log_limit,
+		part_name, part_name,
+		part_name, part_name,
+		part_name, part_name,
+		part_name);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Generate change_log triggers for partitions with more than one replica at nodes where this replicas are located
+CREATE FUNCTION generate_on_change_triggers(table_pattern text = '%') RETURNS void AS $$
+DECLARE
+	replica shardman.replicas;
+	create_triggers text = '';
+BEGIN
+	FOR replica IN SELECT * FROM shardman.replicas WHERE relation LIKE table_pattern
+	LOOP
+		IF shardman.get_redundancy_of_partition(replica.part_name) > 1
+		   AND shardman.not_exists(replica.node_id, format('pg_trigger t, pg_class c WHERE tgname=''on_insert'' AND t.tgrelid=c.oid AND c.relname=%L', replica.part_name))
+		THEN
+			create_triggers := format('%s{%s:%s}', create_triggers, replica.node_id, shardman.create_on_change_triggers(replica.relation, replica.part_name));
+		END IF;
+	END LOOP;
+
+	-- Create triggers at all nodes
+	PERFORM shardman.broadcast(create_triggers);
+END;
+$$ LANGUAGE plpgsql;
+
+
 -- Returns PostgreSQL system identifier (written in control file)
 CREATE FUNCTION get_system_identifier()
     RETURNS bigint AS 'pg_shardman' LANGUAGE C STRICT;
 
--- View for monitoring replication lag
+-- View for monitoring logical replication lag.
+-- Can be used only at shardlord.
 CREATE VIEW replication_lag(pubnode, subnode, lag) AS
 	SELECT src.id AS srcnode, dst.id AS dstnode,
 		shardman.broadcast(format('%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=''node_%s'';',
 						   src.id, dst.id))::bigint AS lag
     FROM shardman.nodes src, shardman.nodes dst WHERE src.id<>dst.id;
 
+-- Yet another view for replication state based on change_log table.
+-- Can be used only at shardlord only only if redundancy level is greater than 1.
+-- This functions is polling state of all nodes, if some node is offline, then it should
+-- be explicitly excluded by filter condition, otherwise error will be reported.
+CREATE VIEW replication_state(part_name, node_id, last_seqno) AS
+	SELECT part_name,node_id,shardman.broadcast(format('%s:SELECT max(seqno) FROM %s_change_log;',node_id,part_name))::bigint FROM shardman.replicas;
