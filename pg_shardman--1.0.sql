@@ -1146,16 +1146,22 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Get self node identifier
-CREATE FUNCTION get_my_id() RETURNS int AS $$
+-- Map system identifier to node identifier.
+CREATE FUNCTION get_node_by_sysid(sysid bigint) RETURNS int AS $$
 DECLARE
     node_id int;
 BEGIN
-	SELECT shardman.broadcast(format('0:SELECT id FROM shardman.nodes WHERE system_id=%s;', shardman.get_system_identifier()))::int INTO node_id;
+	SELECT shardman.broadcast(format('0:SELECT id FROM shardman.nodes WHERE system_id=%s;', sysid))::int INTO node_id;
 	RETURN node_id;
 END
 $$ LANGUAGE plpgsql;
 
+-- Get self node identifier.
+CREATE FUNCTION get_my_id() RETURNS int AS $$
+BEGIN
+    RETURN shardman.get_node_by_sysid(shardman.get_system_identifier());
+END
+$$ LANGUAGE plpgsql;
 
 -- Check consistency of cluster with metadata and perform recovery
 CREATE FUNCTION recovery() RETURNS void AS $$
@@ -1921,6 +1927,97 @@ $$ LANGUAGE plpgsql;
 -- Returns PostgreSQL system identifier (written in control file)
 CREATE FUNCTION get_system_identifier()
     RETURNS bigint AS 'pg_shardman' LANGUAGE C STRICT;
+
+-----------------------------------------------------------------------
+-- Some useful views.
+-----------------------------------------------------------------------
+
+create type process as (node int, pid int);
+
+-- View to build lock graph which can be used to detect global deadlock
+CREATE VIEW lock_graph(wait,hold) AS
+	SELECT
+		ROW(shardman.get_my_id(),
+			wait.pid)::shardman.process,
+	 	ROW(CASE WHEN hold.pid IS NOT NULL THEN shardman.get_my_id() ELSE shardman.get_node_by_sysid(split_part(gid,':',3)::bigint) END,
+		    COALESCE(hold.pid, split_part(gid,':',1)::int))::shardman.process
+    FROM pg_locks wait, pg_locks hold LEFT OUTER JOIN pg_prepared_xacts twopc ON twopc.transaction=hold.transactionid
+	WHERE
+		NOT wait.granted AND wait.pid IS NOT NULL AND hold.granted
+		AND (wait.transactionid=hold.transactionid OR (wait.page=hold.page AND wait.tuple=hold.tuple))
+		AND (hold.pid IS NOT NULL OR twopc.gid IS NOT NULL)
+	UNION ALL
+	SELECT ROW(shardman.get_node_by_sysid(split_part(application_name,':',2)::bigint),
+			   split_part(application_name,':',3)::int)::shardman.process,
+		   ROW(shardman.get_my_id(),
+			   pid)::shardman.process
+	FROM pg_stat_activity WHERE application_name LIKE 'pgfdw:%';
+
+-- Pack lock graph into string
+CREATE FUNCTION serialize_lock_graph() RETURNS TEXT AS $$
+	SELECT string_agg((wait).node||':'||(wait).pid||'->'||(hold).node||':'||(hold).pid, ',') FROM shardman.lock_graph;
+$$ LANGUAGE sql;
+
+-- Unpack lock graph from string
+CREATE FUNCTION deserialize_lock_graph(edges text) RETURNS SETOF shardman.lock_graph AS $$
+	SELECT ROW(split_part(split_part(edge, '->', 1), ':', 1)::int,
+		       split_part(split_part(edge, '->', 1), ':', 2)::int)::shardman.process AS wait,
+	       ROW(split_part(split_part(edge, '->', 2), ':', 1)::int,
+		       split_part(split_part(edge, '->', 2), ':', 2)::int)::shardman.process AS hold
+	FROM regexp_split_to_table(edges, ',') edge;
+$$ LANGUAGE sql;
+
+-- Collect lock graphs from all nodes
+CREATE global_lock_graph() RETURNS text AS $$
+DECLARE
+	node_id int;
+	poll text = '';
+	graph text;
+BEGIN
+	IF NOT shardman.is_shardlord() THEN
+		RETURN shardman.broadcast('0:SELECT shardman.global_lock_graph();');
+	END IF;
+
+	FOR node_id IN SELECT id FROM shardman.nodes
+	LOOP
+		poll := format('%s%s:SELECT shardman.serialize_lock_graph();', poll, node_id);
+	END LOOP;
+	SELECT shardman.broadcast(poll) INTO graph;
+
+	RETURN graph;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Detect distributed deadlock and return set of process involed in deadlock. If there is no deadlock then this view ias empty.
+--
+-- This query is based on the algorithm described by Knuth for detecting a cycle in a linked list. In one column, keep track of the children,
+-- the children's children, the children's children's children, etc. In another column, keep track of the grandchildren, the grandchildren's grandchildren,
+-- the grandchildren's grandchildren's grandchildren, etc.
+--
+-- For the initial selection, the distance between Child and Grandchild columns is 1. Every selection from union all increases the depth of Child by 1, and that of Grandchild by 2.
+-- The distance between them increases by 1.
+--
+-- If there is any loop, since the distance only increases by 1 each time, at some point after Child is in the loop, the distance will be a multiple of the cycle length.
+-- When that happens, the Child and the Grandchild columns are the same. Use that as an additional condition to stop the recursion, and detect it in the rest of your code as an error.
+CREATE VIEW deadlock AS
+	WITH RECURSIVE LinkTable AS (SELECT wait AS Parent, hold AS Child FROM shardman.deserialize_lock_graph(shardman.global_lock_graph())),
+	cte AS (
+    	SELECT lt1.Parent, lt1.Child, lt2.Child AS Grandchild
+    	FROM LinkTable lt1
+    	INNER JOIN LinkTable lt2 on lt2.Parent = lt1.Child
+    	UNION ALL
+    	SELECT cte.Parent, lt1.Child, lt3.Child AS Grandchild
+    	FROM cte
+    	INNER JOIN LinkTable lt1 ON lt1.Parent = cte.Child
+    	INNER JOIN LinkTable lt2 ON lt2.Parent = cte.Grandchild
+    	INNER JOIN LinkTable lt3 ON lt3.Parent = lt2.Child
+    	WHERE cte.Child <> cte.Grandchild
+	)
+	SELECT DISTINCT Parent
+	FROM cte
+	WHERE Child = Grandchild;
+
 
 -- View for monitoring logical replication lag.
 -- Can be used only at shardlord.
