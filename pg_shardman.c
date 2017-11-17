@@ -104,6 +104,9 @@ wait_command_completion(PGconn* conn)
 		int wc = WaitLatchOrSocket(MyLatch,
 								   WL_LATCH_SET | WL_SOCKET_READABLE,
 								   PQsocket(conn),
+#if defined (PGPRO_EE)
+								   false,
+#endif
 								   -1L, PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 

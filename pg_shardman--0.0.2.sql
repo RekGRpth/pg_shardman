@@ -59,7 +59,7 @@ CREATE TABLE replicas (
 -- * It allows to set up pgbouncer, as replication can't go through it.
 -- If conn_string is null, super_conn_string is used everywhere.
 CREATE FUNCTION add_node(super_conn_string text, conn_string text = NULL,
-						 repl_group text = 'default') RETURNS void AS $$
+						 repl_group text = 'default') RETURNS int AS $$
 DECLARE
 	new_node_id int;
 	system_id bigint;
@@ -90,11 +90,14 @@ DECLARE
 	master_node_id int;
 	sys_id bigint;
 	conn_string_effective text = COALESCE(conn_string, super_conn_string);
+	redirected bool;
 BEGIN
-	IF shardman.redirect_to_shardlord(
+	SELECT * FROM shardman.redirect_to_shardlord_with_res(
 		format('add_node(%L, %L, %L)', super_conn_string, conn_string, repl_group))
+					  INTO new_node_id, redirected;
+	IF redirected
 	THEN
-		RETURN;
+		RETURN new_node_id;
 	END IF;
 
 	-- Insert new node in nodes table
@@ -237,6 +240,8 @@ BEGIN
 	PERFORM shardman.broadcast(create_rules);
 	-- Broadcast create subscriptions for shared tables
 	PERFORM shardman.broadcast(subs, super_connstr => true);
+
+	RETURN new_node_id;
 END
 $$ LANGUAGE plpgsql;
 
@@ -353,7 +358,7 @@ BEGIN
 	    PERFORM shardman.broadcast(conf, ignore_errors:=true, super_connstr => true);
 	END IF;
 /* To correctly remove foreign servers we need to update pf_depend table, otherwise
- * our hack with direct update pg_foreign_table leaves deteriorated dependencies 
+ * our hack with direct update pg_foreign_table leaves deteriorated dependencies
 	-- Remove foreign servers at all nodes for the removed node
     FOR node IN SELECT * FROM shardman.nodes WHERE id<>rm_node_id
 	LOOP
@@ -465,6 +470,10 @@ BEGIN
 	IF EXISTS(SELECT relation FROM shardman.tables WHERE relation = rel_name)
 	THEN
 		RAISE EXCEPTION 'Table % is already sharded', rel_name;
+	END IF;
+
+	IF (SELECT count(*) FROM shardman.nodes) = 0 THEN
+		RAISE EXCEPTION 'Please add some nodes first';
 	END IF;
 
 	-- Generate SQL statement creating this table
@@ -1005,7 +1014,7 @@ $$ LANGUAGE plpgsql;
 
 
 -- Move replica to other node. This function is able to move replica only within replication group.
--- It initiates copying data to new replica, disables logical replication to original replica, 
+-- It initiates copying data to new replica, disables logical replication to original replica,
 -- waits completion of initial table sync and then removes old replica.
 CREATE FUNCTION mv_replica(mv_part_name text, src_node_id int, dst_node_id int)
 RETURNS void AS $$
@@ -1243,7 +1252,7 @@ BEGIN
 					PERFORM shardman.broadcast(format('%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
 						src_node.id, fdw_part_name, table_attrs, srv_name, part.part_name));
 				ELSIF shardman.not_exists(src_node.id, format('pg_class c,pg_foreign_table f,pg_foreign_server s WHERE c.oid=f.ftrelid AND c.relname=%L AND f.ftserver=s.oid AND s.srvname = %L', fdw_part_name, srv_name))
-				THEN 
+				THEN
 					RAISE NOTICE 'Bind foreign table % to server % at node %', fdw_part_name, srv_name, src_node.id;
 					PERFORM shardman.broadcast(format('%s:UPDATE pg_foreign_table SET ftserver = (SELECT oid FROM pg_foreign_server WHERE srvname = %L) WHERE ftrelid = (SELECT oid FROM pg_class WHERE relname=%L);',
 						src_node.id, srv_name, fdw_part_name));
@@ -1550,15 +1559,24 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Execute command at shardlord
-CREATE FUNCTION redirect_to_shardlord(cmd text) RETURNS bool AS $$
+CREATE FUNCTION redirect_to_shardlord_with_res(cmd text, out res int,
+											   out redirected bool) AS $$
 BEGIN
 	IF NOT shardman.is_shardlord() THEN
 	    RAISE NOTICE 'Redirect command "%" to shardlord',cmd;
-		PERFORM shardman.broadcast(format('0:SELECT shardman.%s;', cmd));
-		RETURN true;
+		res = (shardman.broadcast(format('0:SELECT shardman.%s;', cmd)))::int;
+		redirected = true;
 	ELSE
-		RETURN false;
+		redirected = false;
 	END IF;
+END
+$$ LANGUAGE plpgsql;
+-- same, but don't care for the result -- to avoid changing all calls to
+-- redirect_to_shardlord to '.redirected'
+CREATE FUNCTION redirect_to_shardlord(cmd text) RETURNS bool AS $$
+DECLARE
+BEGIN
+	RETURN redirected FROM shardman.redirect_to_shardlord_with_res(cmd);
 END
 $$ LANGUAGE plpgsql;
 

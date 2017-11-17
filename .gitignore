@@ -1,7 +1,6 @@
 *.o
 *.so
 .dir-locals.el
-pg_shardman*.sql
 bin/setup.sh
 
 *.pyc

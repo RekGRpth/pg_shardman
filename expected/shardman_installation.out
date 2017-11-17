@@ -1,0 +1,5 @@
+\set VERBOSITY terse
+CREATE EXTENSION pg_shardman CASCADE;
+NOTICE:  installing required extension "pg_pathman"
+NOTICE:  installing required extension "postgres_fdw"
+DROP EXTENSION pg_shardman CASCADE;

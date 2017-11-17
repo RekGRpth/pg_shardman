@@ -321,7 +321,7 @@ Below goes full list of commands.
 ### Membership
 
 ```plpgsql
-add_node(super_conn_string text, conn_string text = NULL, repl_group text = 'default')
+add_node(super_conn_string text, conn_string text = NULL, repl_group text = 'default') returns int
 ```
 Add node with given libpq connstring(s) to the cluster. Node is assigned unique
 id. If node previously contained shardman state from old cluster (not one
@@ -342,6 +342,8 @@ again.
 We don't move any parts and replicas to newly added node, see `rebalance_*`
 commands for that below. However, freshly added node instantly becomes aware
 of sharded tables and can accept queries to them.
+
+Returns id of the new node.
 
 ```plpgsql
 get_my_id()
