@@ -22,9 +22,8 @@ synchronous_commit = on
 # for 2pc
 max_prepared_transactions = 1000
 postgres_fdw.use_2pc = on
-# only for testing performace; setting this to 'on' violates visibilitys
+# only for testing performace; setting this to 'on' violates visibility
 postgres_fdw.use_repeatable_read = off
 
-shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
 # This node is shardlord?
 shardman.shardlord = off

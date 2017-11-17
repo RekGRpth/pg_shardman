@@ -1,5 +1,7 @@
 shared_preload_libraries = 'pg_pathman'
 
+shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
+
 # a bit usual performance-related settings
 shared_buffers = 512MB
 effective_cache_size = 512MB

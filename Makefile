@@ -1,8 +1,10 @@
 # the extension name
 EXTENSION = pg_shardman
-EXTVERSION = 1.0
+EXTVERSION = 0.0.2
 # This file will be executed by CREATE EXTENSION, so let pgxs install it.
 DATA = $(EXTENSION)--$(EXTVERSION).sql
+
+REGRESS = shardman_installation
 
 MODULE_big = pg_shardman
 OBJS = pg_shardman.o
@@ -30,3 +32,6 @@ SHLIB_LINK += -lpq # add libpq
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 endif
+
+python_tests:
+	$(MAKE) -C tests/python

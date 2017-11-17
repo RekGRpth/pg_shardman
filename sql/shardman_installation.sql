@@ -1,0 +1,4 @@
+\set VERBOSITY terse
+
+CREATE EXTENSION pg_shardman CASCADE;
+DROP EXTENSION pg_shardman CASCADE;
