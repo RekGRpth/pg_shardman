@@ -1932,6 +1932,7 @@ CREATE FUNCTION get_system_identifier()
 -- Some useful views.
 -----------------------------------------------------------------------
 
+-- Type to represent vertex in lock graph
 create type process as (node int, pid int);
 
 -- View to build lock graph which can be used to detect global deadlock
@@ -1951,11 +1952,17 @@ CREATE VIEW lock_graph(wait,hold) AS
 			   split_part(application_name,':',3)::int)::shardman.process,
 		   ROW(shardman.get_my_id(),
 			   pid)::shardman.process
-	FROM pg_stat_activity WHERE application_name LIKE 'pgfdw:%';
+	FROM pg_stat_activity WHERE application_name LIKE 'pgfdw:%' AND wait_event<>'ClientRead'
+	UNION ALL
+	SELECT ROW(shardman.get_my_id(),
+			   pid)::shardman.process,
+		   ROW(shardman.get_node_by_sysid(split_part(application_name,':',2)::bigint),
+			   split_part(application_name,':',3)::int)::shardman.process
+	FROM pg_stat_activity WHERE application_name LIKE 'pgfdw:%' AND wait_event='ClientRead';
 
 -- Pack lock graph into string
 CREATE FUNCTION serialize_lock_graph() RETURNS TEXT AS $$
-	SELECT string_agg((wait).node||':'||(wait).pid||'->'||(hold).node||':'||(hold).pid, ',') FROM shardman.lock_graph;
+	SELECT COALESCE(string_agg((wait).node||':'||(wait).pid||'->'||(hold).node||':'||(hold).pid, ','),'') FROM shardman.lock_graph;
 $$ LANGUAGE sql;
 
 -- Unpack lock graph from string
@@ -1964,11 +1971,11 @@ CREATE FUNCTION deserialize_lock_graph(edges text) RETURNS SETOF shardman.lock_g
 		       split_part(split_part(edge, '->', 1), ':', 2)::int)::shardman.process AS wait,
 	       ROW(split_part(split_part(edge, '->', 2), ':', 1)::int,
 		       split_part(split_part(edge, '->', 2), ':', 2)::int)::shardman.process AS hold
-	FROM regexp_split_to_table(edges, ',') edge;
+	FROM regexp_split_to_table(edges, ',') edge WHERE edge<>'';
 $$ LANGUAGE sql;
 
 -- Collect lock graphs from all nodes
-CREATE global_lock_graph() RETURNS text AS $$
+CREATE FUNCTION global_lock_graph() RETURNS text AS $$
 DECLARE
 	node_id int;
 	poll text = '';
