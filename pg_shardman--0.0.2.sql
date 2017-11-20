@@ -2007,7 +2007,7 @@ BEGIN
 	LOOP
 		poll := format('%s%s:SELECT shardman.serialize_lock_graph();', poll, node_id);
 	END LOOP;
-	SELECT shardman.broadcast(poll) INTO graph;
+	SELECT shardman.broadcast(poll, ignore_errors => true) INTO graph;
 
 	RETURN graph;
 END;
@@ -2015,8 +2015,8 @@ $$ LANGUAGE plpgsql;
 
 
 -- Detect distributed deadlock and returns path in the lock graph forming deadlock loop
-CREATE FUNCTION detect_deadlock() RETURNS shardman.process[] AS $$
-	WITH RECURSIVE LinkTable AS (SELECT wait AS Parent, hold AS Child FROM shardman.deserialize_lock_graph(shardman.global_lock_graph())),
+CREATE FUNCTION detect_deadlock(lock_graph text) RETURNS shardman.process[] AS $$
+	WITH RECURSIVE LinkTable AS (SELECT wait AS Parent, hold AS Child FROM shardman.deserialize_lock_graph(lock_graph)),
 	cte AS (
 		SELECT Child, Parent, ARRAY[Child] AS AllParents, false AS Loop
   	  	FROM LinkTable
@@ -2027,33 +2027,81 @@ CREATE FUNCTION detect_deadlock() RETURNS shardman.process[] AS $$
 	SELECT AllParents FROM cte WHERE Loop;
 $$ LANGUAGE sql;
 
--- Monitor cluster for presence of distributed deadlocks and cancel correspondent queries
-CREATE FUNCTION monitor_deadlocks(timeout_sec int = 5) RETURNS void AS $$
+-- Monitor cluster for presence of distributed deadlocks and node failures.
+-- Tries to cancel queries causing deadlock and exclude unavailable nodes from the cluser.
+CREATE FUNCTION monitor(deadlock_check_timeout_sec int = 5, rm_node_timeout_sec int = 60) RETURNS void AS $$
 DECLARE
 	prev_deadlock_path shardman.process[];
 	deadlock_path shardman.process[];
 	victim shardman.process;
 	loop_begin int;
 	loop_end int;
+	prev_loop_begin int;
+	prev_loop_end int;
+	sep int;
+	resp text;
+	error_begin int;
+	error_end int;
+	error_msg text;
+	error_node_id int;
+	failed_node_id int;
+	failure_timestamp timestamp with time zone;
 BEGIN
-	IF shardman.redirect_to_shardlord(format('monitor_deadlocks(%s)', timeout_sec))
+	IF shardman.redirect_to_shardlord(format('monitor(%s, %s)', deadlock_check_timeout_sec, rm_node_timeout_sec))
 	THEN
 		RETURN;
 	END IF;
 
+	RAISE NOTICE 'Start cluster monitor...';
+
 	LOOP
-		deadlock_path := shardman.detect_deadlock();
-		IF deadlock_path && prev_deadlock_path
+		resp := shardman.global_lock_graph();
+		error_begin := position('<error>' IN resp);
+		IF error_begin<>0
 		THEN
+			error_end := position('</error>' IN resp);
+			sep := position(':' IN resp);
+			error_node_id := substring(resp FROM error_begin+7 FOR sep-error_begin-7)::int;
+			error_msg := substring(resp FROM sep+1 FOR error_end-sep-1);
+			IF error_node_id = failed_node_id
+			THEN
+				IF clock_timestamp() > failure_timestamp + rm_node_timeout_sec * interval '1 sec'
+				THEN
+					RAISE NOTICE 'Remove node % because of % timeout expiration', failed_node_id, rm_node_timeout_sec;
+					PERFORM shardman.broadcast(format('0:SELECT shardman.rm_node(%s, force=>true);', failed_node_id));
+					failed_node_id := null;
+				END IF;
+			ELSE
+				RAISE NOTICE 'Node % reports error message %', error_node_id, error_msg;
+				failed_node_id := error_node_id;
+				failure_timestamp := clock_timestamp();
+			END IF;
+			prev_deadlock_path := null;
+		ELSE
+			failed_node_id := null;
+			deadlock_path := shardman.detect_deadlock(resp);
 			loop_end := array_upper(deadlock_path, 1);
 			loop_begin := array_position(deadlock_path, deadlock_path[loop_end]);
-			victim := deadlock_path[loop_begin + ((loop_end - loop_begin)*random())::integer];
-			RAISE NOTICE 'Detect deadlock: cancel process % at node %', victim.pid, victim.node;
-			PERFORM shardman.broadcast(format('%s:SELECT pg_cancel_backend(%s);',
-				victim.node, victim.pid));
+			-- Check if old and new lock graph contain the same subgraph.
+			-- Because we can not make consistent distributed snapshot,
+			-- collected global local graph can contain "false" loops.
+			-- So we report deadlock only if detected loop persists during
+			-- deadlock detection period.
+			IF prev_deadlock_path IS NOT NULL
+			   AND loop_end - loop_begin = prev_loop_end - prev_loop_begin
+			   AND deadlock_path[loop_begin:loop_end] = prev_deadlock_path[prev_loop_begin:prev_loop_end]
+			THEN
+				-- Try to cancel random node in loop
+				victim := deadlock_path[loop_begin + ((loop_end - loop_begin)*random())::integer];
+				RAISE NOTICE 'Detect deadlock: cancel process % at node %', victim.pid, victim.node;
+				PERFORM shardman.broadcast(format('%s:SELECT pg_cancel_backend(%s);',
+					victim.node, victim.pid));
+			END IF;
+			prev_deadlock_path := deadlock_path;
+			prev_loop_begin := loop_begin;
+			prev_loop_end := loop_end;
 		END IF;
-		prev_deadlock_path := deadlock_path;
-		PERFORM pg_sleep(timeout_sec);
+		PERFORM pg_sleep(deadlock_check_timeout_sec);
 	END LOOP;
 END;
 $$ LANGUAGE plpgsql;

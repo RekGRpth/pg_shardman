@@ -122,10 +122,17 @@ wait_command_completion(PGconn* conn)
 	return  true;
 }
 
+typedef struct
+{
+	PGconn* con;
+	char*   sql;
+	int     node;
+} Channel;
+
 Datum
 broadcast(PG_FUNCTION_ARGS)
 {
-	char *sql_full = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char* sql_full = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char* cmd = pstrdup(sql_full);
 	bool  ignore_errors = PG_GETARG_BOOL(1);
 	bool  two_phase = PG_GETARG_BOOL(2);
@@ -143,17 +150,18 @@ broadcast(PG_FUNCTION_ARGS)
 	int   n_cmds = 0;
 	int   i;
 	int n_cons = 1024;
-	PGconn** conn;
+	Channel* chan;
+	PGconn* con;
 	StringInfoData resp;
 
-	char* errmsg = NULL;
+	char const* errmsg = "";
 
 	elog(DEBUG1, "Broadcast commmand '%s'",  cmd);
 
 	initStringInfo(&resp);
 
 	SPI_connect();
-	conn = (PGconn**) palloc(sizeof(PGconn*) * n_cons);
+	chan = (Channel*) palloc(sizeof(Channel) * n_cons);
 
 	while ((sep = strchr(cmd, *cmd == '{' ? '}' : ';')) != NULL)
 	{
@@ -163,7 +171,7 @@ broadcast(PG_FUNCTION_ARGS)
 			cmd += 1;
 		rc = sscanf(cmd, "%d:%n", &node_id, &n);
 		if (rc != 1) {
-			elog(ERROR, "SHARDMAN: Invalid command string: %s", cmd);
+			elog(ERROR, "SHARDMAN: Invalid command string: '%s' in '%s'", cmd, sql_full);
 		}
 		sql = cmd + n;
 		cmd = sep + 1;
@@ -191,21 +199,26 @@ broadcast(PG_FUNCTION_ARGS)
 		}
 		if (n_cmds >= n_cons)
 		{
-			conn = (PGconn**) repalloc(conn, sizeof(PGconn*) * (n_cons *= 2));
+			chan = (Channel*) repalloc(chan, sizeof(Channel) * (n_cons *= 2));
 		}
 
-		conn[n_cmds] = PQconnectdb(conn_str);
-		if (PQstatus(conn[n_cmds++]) != CONNECTION_OK)
+		con = PQconnectdb(conn_str);
+		chan[n_cmds].con = con;
+		chan[n_cmds].node = node_id;
+		chan[n_cmds].sql = sql;
+		n_cmds += 1;
+
+		if (PQstatus(con) != CONNECTION_OK)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Connection failure: %s.",
-								  errmsg ? errmsg : "", node_id,
-								  PQerrorMessage(conn[n_cmds - 1]));
+				errmsg = psprintf("%s<error>%d:Connection failure: %s</error>",
+								  errmsg, node_id, PQerrorMessage(con));
+				chan[n_cmds-1].sql = NULL;
 				continue;
 			}
 			errmsg = psprintf("Failed to connect to node %d: %s", node_id,
-							  PQerrorMessage(conn[n_cmds-1]));
+							  PQerrorMessage(con));
 			goto cleanup;
 		}
 		if (!sync_commit_on)
@@ -221,18 +234,18 @@ broadcast(PG_FUNCTION_ARGS)
 			}
 		}
 		elog(DEBUG1, "Send command '%s' to node %d", sql, node_id);
-		if (!PQsendQuery(conn[n_cmds - 1], sql)
-			|| (sequential && !wait_command_completion(conn[n_cmds - 1])))
+		if (!PQsendQuery(con, sql)
+			|| (sequential && !wait_command_completion(con)))
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Failed to send query '%s': %s'.",
-								  errmsg ? errmsg : "", node_id, sql,
-								  PQerrorMessage(conn[n_cmds-1]));
+				errmsg = psprintf("%s<error>%d:Failed to send query '%s': %s</error>",
+								  errmsg, node_id, sql, PQerrorMessage(con));
+				chan[n_cmds-1].sql = NULL;
 				continue;
 			}
 			errmsg = psprintf("Failed to send query '%s' to node %d: %s'", sql,
-							  node_id, PQerrorMessage(conn[n_cmds-1]));
+							  node_id, PQerrorMessage(con));
 			goto cleanup;
 		}
 	}
@@ -248,7 +261,15 @@ broadcast(PG_FUNCTION_ARGS)
 		PGresult* res = NULL;
 		ExecStatusType status;
 
-		while ((next_res = PQgetResult(conn[i])) != NULL)
+		con = chan[i].con;
+
+		if (chan[i].sql == NULL)
+		{
+			/* Ignore commands which were not sent */
+			continue;
+		}
+
+		while ((next_res = PQgetResult(con)) != NULL)
 		{
 			if (res != NULL)
 			{
@@ -260,10 +281,12 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Failed to received response for '%s': %s.", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
+				errmsg = psprintf("%s<error>%d:Failed to received response for '%s': %s</error>",
+								  errmsg, chan[i].node, chan[i].sql, PQerrorMessage(con));
 				continue;
 			}
-			errmsg = psprintf("Failed to receive response for query %s from node %d: %s", sql_full, node_id, PQerrorMessage(conn[i]));
+			errmsg = psprintf("Failed to receive response for query %s from node %d: %s",
+							  chan[i].sql, chan[i].node, PQerrorMessage(con));
 			goto cleanup;
 		}
 
@@ -273,11 +296,13 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s%d:Command %s failed: %s.", errmsg ? errmsg : "", node_id, sql_full, PQerrorMessage(conn[i]));
+				errmsg = psprintf("%s<error>%d:Command %s failed: %s</error>",
+								  errmsg, chan[i].node, chan[i].sql, PQerrorMessage(con));
 				PQclear(res);
 				continue;
 			}
-			errmsg = psprintf("Command %s failed at node %d: %s", sql_full, node_id, PQerrorMessage(conn[i]));
+			errmsg = psprintf("Command %s failed at node %d: %s",
+							  chan[i].sql, chan[i].node, PQerrorMessage(con));
 			PQclear(res);
 			goto cleanup;
 		}
@@ -292,11 +317,13 @@ broadcast(PG_FUNCTION_ARGS)
 				if (ignore_errors)
 				{
 					appendStringInfoString(&resp, "?");
-					elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d", sql_full, node_id);
+					elog(WARNING, "SHARDMAN: Query '%s' doesn't return single tuple at node %d",
+						 chan[i].sql, chan[i].node);
 				}
 				else
 				{
-					errmsg = psprintf("Query '%s' doesn't return single tuple at node %d", sql_full, node_id);
+					errmsg = psprintf("Query '%s' doesn't return single tuple at node %d",
+									  chan[i].sql, chan[i].node);
 					PQclear(res);
 					goto cleanup;
 				}
@@ -315,37 +342,39 @@ broadcast(PG_FUNCTION_ARGS)
   cleanup:
 	for (i = 0; i < n_cmds; i++)
 	{
+		con = chan[i].con;
 		if (two_phase)
 		{
-			if (errmsg)
+			if (*errmsg)
 			{
-				res = PQexec(conn[i], "ROLLBACK PREPARED 'shardlord'");
+				res = PQexec(con, "ROLLBACK PREPARED 'shardlord'");
 				if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				{
 					elog(WARNING, "SHARDMAN: Rollback of 2PC failed at node %d: %s",
-						 node_id, PQerrorMessage(conn[i]));
+						 chan[i].node, PQerrorMessage(con));
 				}
 				PQclear(res);
 			}
 			else
 			{
-				res = PQexec(conn[i], "COMMIT PREPARED 'shardlord'");
+				res = PQexec(con, "COMMIT PREPARED 'shardlord'");
 				if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				{
 					elog(WARNING, "SHARDMAN: Commit of 2PC failed at node %d: %s",
-						 node_id, PQerrorMessage(conn[i]));
+						 chan[i].node, PQerrorMessage(con));
 				}
 				PQclear(res);
 			}
 		}
-		PQfinish(conn[i]);
+		PQfinish(con);
 	}
 
-	if (errmsg)
+	if (*errmsg)
 	{
 		if (ignore_errors)
 		{
-			appendStringInfo(&resp, "Error:%s", errmsg);
+			resetStringInfo(&resp);
+			appendStringInfoString(&resp, errmsg);
 			elog(WARNING, "SHARDMAN: %s", errmsg);
 		}
 		else
@@ -354,7 +383,7 @@ broadcast(PG_FUNCTION_ARGS)
 		}
 	}
 
-	pfree(conn);
+	pfree(chan);
 	SPI_finish();
 
 	PG_RETURN_TEXT_P(cstring_to_text(resp.data));
@@ -366,7 +395,7 @@ broadcast(PG_FUNCTION_ARGS)
  * defaults, everything. Parameter is not REGCLASS because pg_dump can't
  * handle oids anyway. Connstring must be proper libpq connstring, it is feed
  * to pg_dump.
- * TODO: actually we should have much more control on what is dumped, so we
+ * TODO: actually we should have muchmore control on what is dumped, so we
  * need to copy-paste parts of messy pg_dump or collect the needed data
  * manually walking over catalogs.
  */
