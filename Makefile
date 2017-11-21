@@ -11,12 +11,13 @@ OBJS = pg_shardman.o
 PGFILEDESC = "pg_shardman - sharding for Postgres"
 
 mkfile_path := $(abspath $(lastword $(MAKEFILE_LIST))) # abs path to this makefile
-mkfile_dir := $(shell basename $(dir $(mkfile_path))) # parent dir of the project
+mkfile_dir := $(shell basename $(shell dirname $(dir $(mkfile_path)))) # parent dir of the project
 ifndef USE_PGXS # hmm, user didn't requested to use pgxs
-ifneq ($(mkfile_dir),contrib) # a-ha, but we are not inside 'contrib' dir
-USE_PGXS := 1 # so use it anyway, most probably that's use user wants
+ifneq ($(strip $(mkfile_dir)),contrib) # a-ha, but we are not inside 'contrib' dir
+USE_PGXS := 1 # so use it anyway, most probably that's what the user wants
 endif
 endif
+$(info $$USE_PGXS is [${USE_PGXS}] (we use it automatically if not in contrib dir))
 
 ifdef USE_PGXS # use pgxs
 # You can specify path to pg_config in PG_CONFIG var
