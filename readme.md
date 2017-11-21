@@ -470,6 +470,30 @@ recovery()
 Check consistency of cluster state against current metadata and perform recovery,
 if needed (reconfigure LR channels, repair FDW, etc).
 
+```plpgsql
+monitor(deadlock_check_timeout_sec int = 5, rm_node_timeout_sec int = 60)
+```
+Monitor cluster for presence of distributed deadlocks and node failures.
+This function is intended to be executed at shardlord and is redirected to shardlord been launched at any other node.
+It starts infinite loop which polls all clusters nodes, collecting local *lock graphs* from all nodes.
+Period of poll is specified by `deadlock_check_timeout_sec` parameter (default value is 5 seconds).
+Local lock graphs are combined into global lock graph which is analyzed for presence of loops.
+A loop in lock graph means distributed deadlock. Monitor function tries to resolve deadlock by canceling one or more backends
+involved in the deadlock loop (using `pg_cancel_backend` function, which is not actually terminate backend but tries to cancel current query).
+As far as not all backends are blocked in active query state, it may be needed send cancel several times.
+Right now canceled backend is randomly chosen within
+deadlock loop.
+
+Local local graphs collected from all nodes do not form consistent global snapshot, so there is possibility of false deadlocks:
+edges in deadlock loop correspond to different moment of times. To prevent false deadlock detection, monitor function
+doesn't react on detected deadlock immediately. Instead of it, previous deadlock loop located at previous iteration is compared with current deadlock
+loop and only if them are equal, then deadlock is reported and recovery is performed.
+
+If some node is unreachable then monitor function prints correspondent error message and retries access until
+`rm_node_timeout_sec` timeout expiration. After it node is removed from the cluster using `shardman.rm_node` function.
+If redundancy level is non-zero, then primary partitions from the disabled node are replaced with replicas.
+
+
 ## Transactions
 When using vanilla PostgreSQL, local changes are handled by PostgreSQL as usual
 -- so if you queries touch only only node, you are safe. Distributed
@@ -489,6 +513,5 @@ be made new shardlord at any moment.
 ## Some limitations:
   * You should not touch `sync_standby_names` manually while using pg_shardman.
   * The shardlord itself can't be worker node for now.
-  * ALTER TABLE for sharded is mostly not supported.
   * All [limitations of `pg_pathman`](https://github.com/postgrespro/pg_pathman/wiki/Known-limitations),
   e.g. we don't support global primary keys and foreign keys to sharded tables.
