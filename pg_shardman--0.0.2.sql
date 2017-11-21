@@ -2007,41 +2007,104 @@ BEGIN
 	LOOP
 		poll := format('%s%s:SELECT shardman.serialize_lock_graph();', poll, node_id);
 	END LOOP;
-	SELECT shardman.broadcast(poll) INTO graph;
+	SELECT shardman.broadcast(poll, ignore_errors => true) INTO graph;
 
 	RETURN graph;
 END;
 $$ LANGUAGE plpgsql;
 
 
--- Detect distributed deadlock and return set of process involed in deadlock. If there is no deadlock then this view ias empty.
---
--- This query is based on the algorithm described by Knuth for detecting a cycle in a linked list. In one column, keep track of the children,
--- the children's children, the children's children's children, etc. In another column, keep track of the grandchildren, the grandchildren's grandchildren,
--- the grandchildren's grandchildren's grandchildren, etc.
---
--- For the initial selection, the distance between Child and Grandchild columns is 1. Every selection from union all increases the depth of Child by 1, and that of Grandchild by 2.
--- The distance between them increases by 1.
---
--- If there is any loop, since the distance only increases by 1 each time, at some point after Child is in the loop, the distance will be a multiple of the cycle length.
--- When that happens, the Child and the Grandchild columns are the same. Use that as an additional condition to stop the recursion, and detect it in the rest of your code as an error.
-CREATE VIEW deadlock AS
-	WITH RECURSIVE LinkTable AS (SELECT wait AS Parent, hold AS Child FROM shardman.deserialize_lock_graph(shardman.global_lock_graph())),
+-- Detect distributed deadlock and returns path in the lock graph forming deadlock loop
+CREATE FUNCTION detect_deadlock(lock_graph text) RETURNS shardman.process[] AS $$
+	WITH RECURSIVE LinkTable AS (SELECT wait AS Parent, hold AS Child FROM shardman.deserialize_lock_graph(lock_graph)),
 	cte AS (
-    	SELECT lt1.Parent, lt1.Child, lt2.Child AS Grandchild
-    	FROM LinkTable lt1
-    	INNER JOIN LinkTable lt2 on lt2.Parent = lt1.Child
-    	UNION ALL
-    	SELECT cte.Parent, lt1.Child, lt3.Child AS Grandchild
-    	FROM cte
-    	INNER JOIN LinkTable lt1 ON lt1.Parent = cte.Child
-    	INNER JOIN LinkTable lt2 ON lt2.Parent = cte.Grandchild
-    	INNER JOIN LinkTable lt3 ON lt3.Parent = lt2.Child
-    	WHERE cte.Child <> cte.Grandchild
+		SELECT Child, Parent, ARRAY[Child] AS AllParents, false AS Loop
+  	  	FROM LinkTable
+	  	UNION ALL
+	  	SELECT c.Child, c.Parent, p.AllParents||c.Child, c.Child=ANY(p.AllParents)
+	 	FROM LinkTable c JOIN cte p	ON c.Parent = p.Child AND NOT p.Loop
 	)
-	SELECT DISTINCT Parent
-	FROM cte
-	WHERE Child = Grandchild;
+	SELECT AllParents FROM cte WHERE Loop;
+$$ LANGUAGE sql;
+
+-- Monitor cluster for presence of distributed deadlocks and node failures.
+-- Tries to cancel queries causing deadlock and exclude unavailable nodes from the cluser.
+CREATE FUNCTION monitor(deadlock_check_timeout_sec int = 5, rm_node_timeout_sec int = 60) RETURNS void AS $$
+DECLARE
+	prev_deadlock_path shardman.process[];
+	deadlock_path shardman.process[];
+	victim shardman.process;
+	loop_begin int;
+	loop_end int;
+	prev_loop_begin int;
+	prev_loop_end int;
+	sep int;
+	resp text;
+	error_begin int;
+	error_end int;
+	error_msg text;
+	error_node_id int;
+	failed_node_id int;
+	failure_timestamp timestamp with time zone;
+BEGIN
+	IF shardman.redirect_to_shardlord(format('monitor(%s, %s)', deadlock_check_timeout_sec, rm_node_timeout_sec))
+	THEN
+		RETURN;
+	END IF;
+
+	RAISE NOTICE 'Start cluster monitor...';
+
+	LOOP
+		resp := shardman.global_lock_graph();
+		error_begin := position('<error>' IN resp);
+		IF error_begin<>0
+		THEN
+			error_end := position('</error>' IN resp);
+			sep := position(':' IN resp);
+			error_node_id := substring(resp FROM error_begin+7 FOR sep-error_begin-7)::int;
+			error_msg := substring(resp FROM sep+1 FOR error_end-sep-1);
+			IF error_node_id = failed_node_id
+			THEN
+				IF clock_timestamp() > failure_timestamp + rm_node_timeout_sec * interval '1 sec'
+				THEN
+					RAISE NOTICE 'Remove node % because of % timeout expiration', failed_node_id, rm_node_timeout_sec;
+					PERFORM shardman.broadcast(format('0:SELECT shardman.rm_node(%s, force=>true);', failed_node_id));
+					failed_node_id := null;
+				END IF;
+			ELSE
+				RAISE NOTICE 'Node % reports error message %', error_node_id, error_msg;
+				failed_node_id := error_node_id;
+				failure_timestamp := clock_timestamp();
+			END IF;
+			prev_deadlock_path := null;
+		ELSE
+			failed_node_id := null;
+			deadlock_path := shardman.detect_deadlock(resp);
+			loop_end := array_upper(deadlock_path, 1);
+			loop_begin := array_position(deadlock_path, deadlock_path[loop_end]);
+			-- Check if old and new lock graph contain the same subgraph.
+			-- Because we can not make consistent distributed snapshot,
+			-- collected global local graph can contain "false" loops.
+			-- So we report deadlock only if detected loop persists during
+			-- deadlock detection period.
+			IF prev_deadlock_path IS NOT NULL
+			   AND loop_end - loop_begin = prev_loop_end - prev_loop_begin
+			   AND deadlock_path[loop_begin:loop_end] = prev_deadlock_path[prev_loop_begin:prev_loop_end]
+			THEN
+				-- Try to cancel random node in loop
+				victim := deadlock_path[loop_begin + ((loop_end - loop_begin)*random())::integer];
+				RAISE NOTICE 'Detect deadlock: cancel process % at node %', victim.pid, victim.node;
+				PERFORM shardman.broadcast(format('%s:SELECT pg_cancel_backend(%s);',
+					victim.node, victim.pid));
+			END IF;
+			prev_deadlock_path := deadlock_path;
+			prev_loop_begin := loop_begin;
+			prev_loop_end := loop_end;
+		END IF;
+		PERFORM pg_sleep(deadlock_check_timeout_sec);
+	END LOOP;
+END;
+$$ LANGUAGE plpgsql;
 
 
 -- View for monitoring logical replication lag.
