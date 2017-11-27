@@ -10,14 +10,25 @@ MODULE_big = pg_shardman
 OBJS = pg_shardman.o
 PGFILEDESC = "pg_shardman - sharding for Postgres"
 
-mkfile_path := $(abspath $(lastword $(MAKEFILE_LIST))) # abs path to this makefile
-mkfile_dir := $(shell basename $(shell dirname $(dir $(mkfile_path)))) # parent dir of the project
 ifndef USE_PGXS # hmm, user didn't requested to use pgxs
-ifneq ($(strip $(mkfile_dir)),contrib) # a-ha, but we are not inside 'contrib' dir
+# relative path to this makefile
+mkfile_path := $(word $(words $(MAKEFILE_LIST)),$(MAKEFILE_LIST))
+# relative path to dir with this makefile
+mkfile_dir := $(dir $(mkfile_path))
+# abs path to dir with this makefile
+mkfile_abspath := $(shell cd $(mkfile_dir) && pwd -P)
+# parent dir name of directory with makefile
+parent_dir_name := $(shell basename $(shell dirname $(mkfile_abspath)))
+ifneq ($(parent_dir_name),contrib) # a-ha, but this shardman is not inside 'contrib' dir
 USE_PGXS := 1 # so use it anyway, most probably that's what the user wants
 endif
 endif
+# $(info) is introduced in 3.81, and PG doesn't support makes older than 3.80
+ifeq ($(MAKE_VERSION),3.80)
+$(warning $$USE_PGXS is [${USE_PGXS}] (we use it automatically if not in contrib dir))
+else
 $(info $$USE_PGXS is [${USE_PGXS}] (we use it automatically if not in contrib dir))
+endif
 
 ifdef USE_PGXS # use pgxs
 # You can specify path to pg_config in PG_CONFIG var
