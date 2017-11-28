@@ -481,8 +481,7 @@ Local lock graphs are combined into global lock graph which is analyzed for pres
 A loop in lock graph means distributed deadlock. Monitor function tries to resolve deadlock by canceling one or more backends
 involved in the deadlock loop (using `pg_cancel_backend` function, which is not actually terminate backend but tries to cancel current query).
 As far as not all backends are blocked in active query state, it may be needed send cancel several times.
-Right now canceled backend is randomly chosen within
-deadlock loop.
+Right now canceled backend is randomly chosen within deadlock loop.
 
 Local local graphs collected from all nodes do not form consistent global snapshot, so there is possibility of false deadlocks:
 edges in deadlock loop correspond to different moment of times. To prevent false deadlock detection, monitor function
@@ -492,6 +491,13 @@ loop and only if them are equal, then deadlock is reported and recovery is perfo
 If some node is unreachable then monitor function prints correspondent error message and retries access until
 `rm_node_timeout_sec` timeout expiration. After it node is removed from the cluster using `shardman.rm_node` function.
 If redundancy level is non-zero, then primary partitions from the disabled node are replaced with replicas.
+Finally shardman performs recovery of distributed transactions which coordinators were at failed node.
+It is done using `shardman.recover_xacts` function which collects status of distributed transaction at all participants and
+tries to make decision whether it should be committed or aborted.
+
+Function `shardman.recover_xacts` can be also implicitly invoked by database administrator after abnormal cluster restart to recover
+not completed distributed transactions. First of all it tries to obtain status of distributed transaction from its coordinator and only
+if it is not available, performs voting among all nodes.
 
 
 ## Transactions

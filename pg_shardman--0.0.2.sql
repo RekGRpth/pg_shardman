@@ -90,14 +90,10 @@ DECLARE
 	master_node_id int;
 	sys_id bigint;
 	conn_string_effective text = COALESCE(conn_string, super_conn_string);
-	redirected bool;
 BEGIN
-	SELECT * FROM shardman.redirect_to_shardlord_with_res(
-		format('add_node(%L, %L, %L)', super_conn_string, conn_string, repl_group))
-					  INTO new_node_id, redirected;
-	IF redirected
+	IF NOT shardman.is_shardlord()
 	THEN
-		RETURN new_node_id;
+		RETURN shardman.broadcast(format('0:SELECT shardman.add_node(%L, %L, %L)', super_conn_string, conn_string, repl_group))::int;
 	END IF;
 
 	-- Insert new node in nodes table
@@ -357,7 +353,7 @@ BEGIN
 								   super_connstr => true);
 	    PERFORM shardman.broadcast(conf, ignore_errors:=true, super_connstr => true);
 	END IF;
-/* To correctly remove foreign servers we need to update pf_depend table, otherwise
+/* To correctly remove foreign servers we need to update pg_depend table, otherwise
  * our hack with direct update pg_foreign_table leaves deteriorated dependencies
 	-- Remove foreign servers at all nodes for the removed node
     FOR node IN SELECT * FROM shardman.nodes WHERE id<>rm_node_id
@@ -1508,9 +1504,145 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
----------------------------------------------------------------------
--- Utility functions
----------------------------------------------------------------------
+
+-- Commit or rollback not completed distributed transactions
+CREATE FUNCTION recover_xacts() RETURNS void AS $$
+DECLARE
+	node_id int;
+	xacts text[];
+	xact_node_id int;
+	xact text;
+    cmds text = '';
+	gid text;
+	xid bigint;
+	sysid bigint;
+	counter text;
+	coordinator int;
+	status text;
+	n_participants int;
+	n_prepared int;
+	resp text;
+	do_commit bool;
+	do_rollback bool;
+	finish text = '';
+BEGIN
+	IF shardman.redirect_to_shardlord('recover_xacts()')
+	THEN
+		RETURN;
+	END IF;
+
+	FOR node_id IN SELECT id FROM shardman.nodes
+	LOOP
+		cmds := format('%s%s:SELECT string_agg(''%s=>''||gid, '','') FROM pg_prepared_xacts;', cmds, node_id, node_id);
+	END LOOP;
+
+	-- Collected prepared xacts from all nodes
+	SELECT string_to_array(shardman.broadcast(cmds), ',') INTO xacts;
+
+	FOREACH xact IN ARRAY xacts
+	LOOP
+		xact_node_id := split_part(xact, '=>', 1);
+		gid := split_part(xact, '=>', 2);
+		sysid := split_part(gid, ':', 3)::bigint;
+		xid := split_part(gid, ':', 4)::bigint;
+		SELECT id INTO coordinator FROM shardman.nodes WHERE system_id=sysid;
+		IF coordinator IS NULL
+		THEN
+			-- Coordinator node is not available
+			RAISE NOTICE 'Coordinator of transaction % is not available', gid;
+			n_participants := split_part(gid, ':', 5)::int;
+			IF n_participants > 1
+			THEN
+				-- Poll all participants.
+				-- First of all try portable way: get information from pg_prepared_xacts.
+				cmds := '';
+				FOR node_id IN SELECT id FROM shardman.nodes
+				LOOP
+					cmds := format('%s%s:SELECT COUNT(*) FROM pg_prepared_xacts WHERE gid=%L;', cmds, node_id, gid);
+				END LOOP;
+				SELECT shardman.broadcast(cmds) INTO resp;
+
+				n_prepared := 0;
+				FOREACH counter IN ARRAY string_to_array(resp, ',')
+				LOOP
+					n_prepared := n_prepared + counter::int;
+				END LOOP;
+
+				IF n_prepared=n_participants
+				THEN
+					RAISE NOTICE 'Commit distributed transaction % which is prepared at all participant nodes', gid;
+					finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
+				ELSE
+					RAISE NOTICE 'Distributed transaction % is prepared at % nodes from %',
+						  gid, n_prepared, n_participants;
+
+					IF EXISTS (SELECT * FROM pg_proc WHERE proname='pg_prepared_xact_status')
+					THEN
+						-- Without coordinator there is no standard way to get status of this distributed transaction.
+						-- Use PGPRO-EE pg_prepared_xact_status() function if available
+						cmds := '';
+						FOR node_id IN SELECT id FROM shardman.nodes
+						LOOP
+							cmds := format('%s%s:SELECT pg_prepared_xact_status(%L);', cmds, node_id, gid);
+						END LOOP;
+						SELECT shardman.broadcast(cmds) INTO resp;
+
+						-- Collect information about distributed transaction status at all nodes
+						do_commit := false;
+						do_rollback := false;
+						FOREACH status IN ARRAY string_to_array(resp, ',')
+						LOOP
+							IF status='committed'
+							THEN
+								do_commit := true;
+							ELSIF status='aborted'
+							THEN
+								do_rollback := true;
+							END IF;
+						END LOOP;
+
+						IF do_commit
+						THEN
+							IF do_rollack
+							THEN
+								RAISE NOTICE 'Inconsistent state of transaction %', gid;
+							ELSE
+								RAISE NOTICE 'Commit transaction %s at node % because if was committed at one of participants',
+									gid, xact_node_id;
+								finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
+							END IF;
+						ELSIF do_rollback
+						THEN
+							RAISE NOTICE 'Abort transaction %s at node % because if was aborted at one of participants',
+								gid, xact_node_id;
+							finish := format('%s%s:ROLLBACK PREPARED %L;', finish, xact_node_id, gid);
+						ELSE
+							RAISE NOTICE 'Can not make any decision concerning distributes transaction %', gid;
+						END IF;
+					END IF;
+				END IF;
+			ELSE
+				RAISE NOTICE 'Commit transaction % with single participant %', gid, xact_node_id;
+				finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
+			END IF;
+		ELSE
+			-- Check status of transaction at coordinator
+			SELECT shardman.broadcast(format('%s:SELECT txid_status(%s);', coordinator, xid)) INTO status;
+			RAISE NOTICE 'Status of distributed transaction % is % at coordinator %', gid, status, coordinator;
+			IF status='committed'
+			THEN
+				finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
+			ELSIF status='aborted'
+			THEN
+				finish := format('%s%s:ROLLBACK PREPARED %L;', finish, xact_node_id, gid);
+			END IF;
+		END IF;
+	END LOOP;
+
+	-- Finish all prepared transactions for which decision was made
+	PERFORM shardman.broadcast(finish, sync_commit_on => true);
+END
+$$ LANGUAGE plpgsql;
 
 -- Generate rules for redirecting updates for shared table
 CREATE FUNCTION gen_create_rules_sql(rel_name text, fdw_name text) RETURNS text AS $$
@@ -1559,27 +1691,17 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Execute command at shardlord
-CREATE FUNCTION redirect_to_shardlord_with_res(cmd text, out res int,
-											   out redirected bool) AS $$
+CREATE FUNCTION redirect_to_shardlord(cmd text) RETURNS bool AS $$
 BEGIN
-	IF NOT shardman.is_shardlord() THEN
+	IF NOT shardman.is_shardlord()
+	THEN
 	    RAISE NOTICE 'Redirect command "%" to shardlord',cmd;
-		res = (shardman.broadcast(format('0:SELECT shardman.%s;', cmd)))::int;
-		redirected = true;
+		RETURN true;
 	ELSE
-		redirected = false;
+		RETURN false;
 	END IF;
 END
 $$ LANGUAGE plpgsql;
--- same, but don't care for the result -- to avoid changing all calls to
--- redirect_to_shardlord to '.redirected'
-CREATE FUNCTION redirect_to_shardlord(cmd text) RETURNS bool AS $$
-DECLARE
-BEGIN
-	RETURN redirected FROM shardman.redirect_to_shardlord_with_res(cmd);
-END
-$$ LANGUAGE plpgsql;
-
 
 -- Generate based on information from catalog SQL statement creating this table
 CREATE FUNCTION gen_create_table_sql(relation text)
@@ -1642,7 +1764,7 @@ BEGIN
 	um_opts := '';
 	SELECT * FROM shardman.pq_conninfo_parse(conn_string)
 	  INTO conn_string_keywords, conn_string_vals;
-	FOR i IN 1..(SELECT array_upper(conn_string_keywords, 1)) LOOP
+	FOR i IN 1..array_upper(conn_string_keywords, 1) LOOP
 		IF conn_string_keywords[i] = 'client_encoding' OR
 			conn_string_keywords[i] = 'fallback_application_name' THEN
 			CONTINUE; /* not allowed in postgres_fdw */
@@ -1999,7 +2121,8 @@ DECLARE
 	poll text = '';
 	graph text;
 BEGIN
-	IF NOT shardman.is_shardlord() THEN
+	IF NOT shardman.is_shardlord()
+	THEN
 		RETURN shardman.broadcast('0:SELECT shardman.global_lock_graph();');
 	END IF;
 
@@ -2028,7 +2151,7 @@ CREATE FUNCTION detect_deadlock(lock_graph text) RETURNS shardman.process[] AS $
 $$ LANGUAGE sql;
 
 -- Monitor cluster for presence of distributed deadlocks and node failures.
--- Tries to cancel queries causing deadlock and exclude unavailable nodes from the cluser.
+-- Tries to cancel queries causing deadlock and exclude unavailable nodes from the cluster.
 CREATE FUNCTION monitor(deadlock_check_timeout_sec int = 5, rm_node_timeout_sec int = 60) RETURNS void AS $$
 DECLARE
 	prev_deadlock_path shardman.process[];
@@ -2069,6 +2192,7 @@ BEGIN
 				THEN
 					RAISE NOTICE 'Remove node % because of % timeout expiration', failed_node_id, rm_node_timeout_sec;
 					PERFORM shardman.broadcast(format('0:SELECT shardman.rm_node(%s, force=>true);', failed_node_id));
+					PERFORM shardman.broadcast('0:SELECT shardman.recover_xacts();');
 					failed_node_id := null;
 				END IF;
 			ELSE
