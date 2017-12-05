@@ -348,7 +348,7 @@ Returns id of the new node.
 ```plpgsql
 get_my_id()
 ```
-Get this node's id. Executed on any node.
+Get this worker's id. Executed on any worker node. Fails on shardlord.
 
 ```plpgsql
 rm_node(rm_node_id int, force bool = false)
@@ -499,6 +499,16 @@ Function `shardman.recover_xacts` can be also implicitly invoked by database adm
 not completed distributed transactions. First of all it tries to obtain status of distributed transaction from its coordinator and only
 if it is not available, performs voting among all nodes.
 
+```plpgsql
+wipe_state(drop_slots_with_fire bool DEFAULT true)
+```
+Remove unilaterally all publications, subscriptions and replication slots
+created on the worker node by `pg_shardman`. PostgreSQL forbids to drop
+replication slot with active connection; if `drop_slots_with_fire` is true, we
+will try to kill the walsenders before dropping the slots. Also, immediately
+after transaction commit set `synchronous_standby_names` GUC to empty string --
+this is a non-transactional action and there is a very small chance it won't be
+completed. You probably want to run it before `DROP EXTENSION pg_shardman`.
 
 ## Transactions
 When using vanilla PostgreSQL, local changes are handled by PostgreSQL as usual

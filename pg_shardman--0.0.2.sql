@@ -11,12 +11,25 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_shardman" to load this file. \quit
 
+-- We define several GUCs (though user can see them in SHOW if she sets it
+-- explicitly even without loaded lib) and have to inform pathman that we want
+-- shardman's COPY FROM, so it makes sense to load the lib on server start.
+DO $$
+BEGIN
+-- -- Yes, malicious user might have another extension containing 'pg_shardman'...
+-- -- Probably better just call no-op func from the library
+	IF strpos(current_setting('shared_preload_libraries'), 'pg_shardman') = 0 THEN
+		RAISE EXCEPTION 'pg_shardman must be loaded via shared_preload_libraries. Refusing to proceed.';
+	END IF;
+END
+$$;
+
 -- Shardman tables
 
 -- List of nodes present in the cluster
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
-	system_id bigint NOT NULL,
+	system_id bigint NOT NULL UNIQUE,
     super_connection_string text UNIQUE NOT NULL,
 	connection_string text UNIQUE NOT NULL,
 	replication_group text NOT NULL -- group of nodes within which shard replicas are allocated
@@ -62,7 +75,6 @@ CREATE FUNCTION add_node(super_conn_string text, conn_string text = NULL,
 						 repl_group text = 'default') RETURNS int AS $$
 DECLARE
 	new_node_id int;
-	system_id bigint;
     node shardman.nodes;
     part shardman.partitions;
 	t shardman.tables;
@@ -93,21 +105,31 @@ DECLARE
 BEGIN
 	IF NOT shardman.is_shardlord()
 	THEN
-		RETURN shardman.broadcast(format('0:SELECT shardman.add_node(%L, %L, %L)', super_conn_string, conn_string, repl_group))::int;
+		RETURN shardman.broadcast(
+			format('0:SELECT shardman.add_node(%L, %L, %L)',
+				   super_conn_string, conn_string, repl_group))::int;
 	END IF;
 
 	-- Insert new node in nodes table
-	INSERT INTO shardman.nodes (system_id, super_connection_string, connection_string, replication_group)
+	INSERT INTO shardman.nodes (system_id, super_connection_string,
+								connection_string, replication_group)
 	VALUES (0, super_conn_string, conn_string_effective, repl_group)
-	RETURNING id INTO new_node_id;
+		   RETURNING id INTO new_node_id;
 
-	-- We have to update system_id after insert, because otherwise broadcast will not work
-	sys_id := shardman.broadcast(format('%s:SELECT shardman.get_system_identifier();', new_node_id))::bigint;
+	-- We have to update system_id after insert, because otherwise broadcast
+	-- will not work
+	sys_id := shardman.broadcast(
+		format('%s:SELECT shardman.get_system_identifier();',
+			   new_node_id))::bigint;
+	IF EXISTS(SELECT 1 FROM shardman.nodes where system_id = sys_id) THEN
+		RAISE EXCEPTION 'Node with system id % is already in the cluster', sys_id;
+	END IF;
 	UPDATE shardman.nodes SET system_id=sys_id WHERE id=new_node_id;
 
 	-- Adjust replication channels within replication group.
 	-- We need all-to-all replication channels between all group members.
-	FOR node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group AND id  <> new_node_id
+	FOR node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group
+		AND id  <> new_node_id
 	LOOP
 		-- Add to new node publications for all existing nodes and add
 		-- publication for new node to all existing nodes
@@ -443,8 +465,10 @@ $$ LANGUAGE plpgsql;
 -- Shard table with hash partitions. Parameters are the same as in pathman.
 -- It also scatter partitions through all nodes.
 -- This function expects that empty table is created at shardlord.
--- So it can be executed only at shardlord and there is no need to redirect this function to shardlord.
-CREATE FUNCTION create_hash_partitions(rel regclass, expr text, part_count int, redundancy int = 0)
+-- It can be executed only at shardlord and there is no need to redirect this
+-- function to shardlord.
+CREATE FUNCTION create_hash_partitions(rel regclass, expr text, part_count int,
+									   redundancy int = 0)
 RETURNS void AS $$
 DECLARE
 	create_table text;
@@ -1857,7 +1881,7 @@ BEGIN
 				 dst_node_id, slot));
 			IF response::bool THEN
 			    synced := true;
-				RAISE DEBUG 'Table % sync completed', part_name;
+				RAISE DEBUG '[SHMN] Table % sync completed', part_name;
 				CONTINUE;
 			END IF;
 	    ELSE
@@ -1868,7 +1892,7 @@ BEGIN
 			END IF;
 			lag := response::bigint;
 
-			RAISE DEBUG 'Replication lag %', lag;
+			RAISE DEBUG '[SHMN] Replication lag %', lag;
 			IF locked THEN
 		        IF lag<=0 THEN
 			   	    RETURN;
@@ -2245,3 +2269,101 @@ CREATE VIEW replication_lag(pubnode, subnode, lag) AS
 -- be explicitly excluded by filter condition, otherwise error will be reported.
 CREATE VIEW replication_state(part_name, node_id, last_seqno) AS
 	SELECT part_name,node_id,shardman.broadcast(format('%s:SELECT max(seqno) FROM %s_change_log;',node_id,part_name))::bigint FROM shardman.replicas;
+
+
+-- Drop replication slot, if it exists.
+-- About 'with_fire' option: we can't just drop replication slots because
+-- pg_drop_replication_slot will bail out with ERROR if connection is active.
+-- Therefore the caller must either ensure that the connection is dead (e.g.
+-- drop subscription on far end) or pass 'true' to 'with_fire' option, which
+-- does the following dirty hack. It kills several times active walsender with
+-- short interval. After the first kill, replica will immediately try to
+-- reconnect, so the connection resurrects instantly. However, if we kill it
+-- second time, replica won't try to reconnect until wal_retrieve_retry_interval
+-- after its first reaction passes, which is 5 secs by default. Of course, this
+-- is not reliable and should be redesigned.
+CREATE FUNCTION drop_repslot(slot_name text, with_fire bool DEFAULT true)
+	RETURNS void AS $$
+DECLARE
+	slot_exists bool;
+	kill_ws_times int := 3;
+BEGIN
+	RAISE DEBUG '[SHMN] Dropping repslot %', slot_name;
+	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
+				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
+	IF slot_exists THEN
+		IF with_fire THEN -- kill walsender several times
+			RAISE DEBUG '[SHMN] Killing repslot % with fire', slot_name;
+			FOR i IN 1..kill_ws_times LOOP
+				RAISE DEBUG '[SHMN] Killing walsender for slot %', slot_name;
+				PERFORM shardman.terminate_repslot_walsender(slot_name);
+				IF i != kill_ws_times THEN
+					PERFORM pg_sleep(0.05);
+				END IF;
+			END LOOP;
+		END IF;
+		EXECUTE format('SELECT pg_drop_replication_slot(%L)', slot_name);
+	END IF;
+END
+$$ LANGUAGE plpgsql STRICT;
+CREATE FUNCTION terminate_repslot_walsender(slot_name text) RETURNS void AS $$
+BEGIN
+	EXECUTE format('SELECT pg_terminate_backend(active_pid) FROM
+				   pg_replication_slots WHERE slot_name = %L', slot_name);
+END
+$$ LANGUAGE plpgsql STRICT;
+
+-- Drop sub unilaterally: If sub exists, disable it, detach repslot from it and
+-- drop.
+CREATE FUNCTION eliminate_sub(subname name)
+	RETURNS void AS $$
+DECLARE
+	sub_exists bool;
+BEGIN
+	EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname
+				   = %L)', subname) INTO sub_exists;
+	IF sub_exists THEN
+		EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', subname);
+		EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', subname);
+		EXECUTE format('DROP SUBSCRIPTION %I', subname);
+	END IF;
+END
+$$ LANGUAGE plpgsql STRICT;
+
+
+-- Remove all shardman state (LR stuff, synchronous_standby_names). If
+-- drop_slots_with_fire is true, we will kill walsenders before dropping LR
+-- slots.
+-- We reset synchronous_standby_names to empty string after commit,
+-- -- this is non-transactional action and might be not performed.
+CREATE OR REPLACE FUNCTION wipe_state(drop_slots_with_fire bool DEFAULT true)
+	RETURNS void AS $$
+DECLARE
+	srv record;
+	pub record;
+	sub record;
+	rs record;
+BEGIN
+	-- otherwise we might hang
+	SET LOCAL synchronous_commit TO LOCAL;
+
+	FOR srv IN SELECT srvname FROM pg_foreign_server WHERE srvname LIKE 'node_%' LOOP
+		EXECUTE format('DROP SERVER %I CASCADE', srv.srvname);
+	END LOOP;
+
+	FOR pub IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'node_%' LOOP
+		EXECUTE format('DROP PUBLICATION %I', pub.pubname);
+	END LOOP;
+	FOR sub IN SELECT subname FROM pg_subscription WHERE subname LIKE 'sub_%' LOOP
+		PERFORM shardman.eliminate_sub(sub.subname);
+	END LOOP;
+	FOR rs IN SELECT slot_name FROM pg_replication_slots
+		WHERE slot_name LIKE 'node_%' AND slot_type = 'logical' LOOP
+		PERFORM shardman.drop_repslot(rs.slot_name, drop_slots_with_fire);
+	END LOOP;
+		-- TODO: remove only shardman's standbys
+	PERFORM shardman.reset_synchronous_standby_names_on_commit();
+END;
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION reset_synchronous_standby_names_on_commit()
+	RETURNS void AS 'pg_shardman' LANGUAGE C STRICT;

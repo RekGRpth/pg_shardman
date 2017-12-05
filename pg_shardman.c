@@ -7,19 +7,22 @@
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "libpq-fe.h"
-#include "miscadmin.h"
+
+#include "access/htup_details.h"
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "catalog/pg_type.h"
+#include "commands/event_trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
+#include "libpq-fe.h"
+#include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/latch.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include "catalog/pg_type.h"
-#include "access/htup_details.h"
-#include "access/xlog.h"
-#include "storage/latch.h"
 
 /* ensure that extension won't load against incompatible version of Postgres */
 PG_MODULE_MAGIC;
@@ -31,6 +34,7 @@ PG_FUNCTION_INFO_V1(broadcast);
 PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
 PG_FUNCTION_INFO_V1(pq_conninfo_parse);
 PG_FUNCTION_INFO_V1(get_system_identifier);
+PG_FUNCTION_INFO_V1(reset_synchronous_standby_names_on_commit);
 
 /* GUC variables */
 static bool is_lord;
@@ -38,6 +42,11 @@ static bool sync_replication;
 static char *shardlord_connstring;
 
 extern void _PG_init(void);
+
+static bool reset_ssn_callback_set = false;
+static bool reset_ssn_requested = false;
+
+static void reset_ssn_xact_callback(XactEvent event, void *arg);
 
 /*
  * Entrypoint of the module. Define GUCs.
@@ -75,6 +84,15 @@ _PG_init()
 		PGC_SUSET,
 		0,
 		NULL, NULL, NULL);
+
+	/*
+	 * Tell pathman that we want it to do shardman-specific COPY FROM: that
+	 * is, support copy to foreign partitions by copying to foreign parent.
+	 * For now we just ask to do it always. Better to turn on this in copy
+	 * hook turn off after, however for that we need metadata on all nodes.
+	 */
+	*find_rendezvous_variable(
+		"shardman_pathman_copy_from_rendezvous") = DatumGetPointer(1);
 }
 
 Datum
@@ -604,4 +622,46 @@ Datum
 get_system_identifier(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(GetSystemIdentifier());
+}
+
+/*
+ * Execute "ALTER SYSTEM SET synchronous_standby_names = '' on commit"
+ */
+Datum
+reset_synchronous_standby_names_on_commit(PG_FUNCTION_ARGS)
+{
+	if (!reset_ssn_callback_set)
+		RegisterXactCallback(reset_ssn_xact_callback, NULL);
+	reset_ssn_requested = true;
+	PG_RETURN_VOID();
+}
+
+static void
+reset_ssn_xact_callback(XactEvent event, void *arg)
+{
+	if (reset_ssn_requested)
+	{
+		/* I just wanted to practice a bit with PG nodes and lists */
+		A_Const *aconst = makeNode(A_Const);
+		List *set_stmt_args = list_make1(aconst);
+		VariableSetStmt setstmt;
+		AlterSystemStmt altersysstmt;
+
+		aconst->val.type = T_String;
+		aconst->val.val.str = ""; /* set it to empty value */
+		aconst->location = -1;
+
+		setstmt.type = T_VariableSetStmt;
+		setstmt.kind = VAR_SET_VALUE;
+		setstmt.name = "synchronous_standby_names";
+		setstmt.args = set_stmt_args;
+
+		altersysstmt.type = T_AlterSystemStmt;
+		altersysstmt.setstmt = &setstmt;
+		AlterSystemSetConfigFile(&altersysstmt);
+		pg_reload_conf(NULL);
+
+		list_free_deep(setstmt.args);
+		reset_ssn_requested = false;
+	}
 }

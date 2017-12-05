@@ -3,4 +3,4 @@
 mkfile_dir := $(shell dirname $(shell readlink -f $(abspath $(lastword $(MAKEFILE_LIST)))))
 
 all:
-	cd $(mkfile_dir) && python3 -m unittest tests.py -v -f
+	cd $(mkfile_dir) && python3 tests.py
