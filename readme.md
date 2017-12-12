@@ -12,13 +12,15 @@ importantly, to support sane cross-node transactions, we use patched
 `postgres_fdw` with 2PC for atomicity and distributed snapshot manager providing
 `snapshot isolation` level of xact isolation. We support current
 version
-[here](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman).
+[here](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman), which
+we call 'patched Postgres' in this document.
 
 To manage this zoo, we need one designated PG node which we call
 *shardlord*. This node accepts sharding commands from the user and makes sure
-the whole cluster changes its state as desired. Shardlord keeps several tables
+the whole cluster changes its state as desired. Shardlord holds several tables
 (see below) forming cluster metadata -- which nodes are in cluster and which
-partitions they keep. Currently shardlord can't keep usual data itself.
+partitions they keep. Currently shardlord can't keep usual data itself and
+is manually configured by the administrator.
 
 Some terminology:
   * 'commands' is what constitutes shardman interface: functions for sharding
@@ -30,7 +32,7 @@ Some terminology:
   * 'primary' is main partition of sharded table, i.e. the only writable
      partition.
   * 'replica' is secondary partition of sharded table, i.e. read-only partition.
-  * 'cluster' -- either the whole system of shardlord and workers, or cluster in
+  * 'cluster' is either the whole system of shardlord and workers, or cluster in
 	 traditional PostgreSQL sense, this should be clear from the context.
 
 Number of working nodes in cluster depends on number of servers you have, volume
@@ -47,12 +49,12 @@ nodes in future. Or, more precisely, you will be able to add new nodes, but not
 rebalance existed data between this new nodes. Also you will not be able to
 address data skew, when some data is accessed much more often than other.
 
-This is why it is recommended to have number of shards about ten times larger
+That's why it is recommended to have number of shards about ten times larger
 then number of nodes. In this case you can increase number of nodes up to ten
 times and manually move partitions between nodes to provide more or less uniform
 load of all cluster nodes.
 
-If you need fault tolerance, you need to store data with
+If you want fault tolerance, you need to store data with
 redundancy. `pg_shardman` provides redundancy using logical replication.  In
 theory you can choose any redundancy level: from 0 to infinity. But right now
 having redundancy level larger than one doesn't have much sense. Even in case of
@@ -75,9 +77,9 @@ Both shardlord and workers require extension built and installed. We depend on
 `pg_pathman` extension so it must be installed too. PostgreSQL location for
 building is derived from `pg_config` by default, you can also specify path to it
 in `PG_CONFIG` environment variable. PostgreSQL 10 (`REL_10_STABLE branch`) is
-required. Extension links with libpq, so if you install PG from packages, you
-should install libpq-dev package. The whole process of building and copying
-files to PG server is just:
+required. Extension links with `libpq`, and if you install PG from packages, you
+should install `libpq-dev` package or something like that. The whole process of
+building and copying files to PG server is just:
 
 ```shell
 git clone https://github.com/postgrespro/pg_shardman
@@ -85,10 +87,12 @@ cd pg_shardman
 make install
 ```
 
-To actually install extension, add `pg_pathman` to `shared_preload_libraries`
-(see
-[pg_pathman's docs](http://github.com/postgrespro/pg_pathman), restart the
-server and run
+To actually install extension, add `pg_pathman` and `pg_shardman` to
+`shared_preload_libraries`:
+```shell
+shared_preload_libraries='pg_shardman, pg_pathman'
+```
+restart the server and run
 
 ```plpgsql
 create extension pg_shardman cascade;
@@ -102,26 +106,30 @@ accordingly. Basic configuration:
   * `shardman.shardlord` must be `on` on shardlord and `off` on worker;
   * `shardman.shardlord_connstring` must be configured everywhere for now --
 	on workers for cmd redirection, on shardlord for connecting to itself;
-  * If `shardman.sync_replication` is `on`, shardlord configures sync replicas
-    async otherwise.
+  * If `shardman.sync_replication` is `on`, shardlord configures sync replicas,
+    otherwise async.
   * Logical replication settings, see `postgresql.conf.worker`
 
-Currently extension scheme is fixed, it is, who would have thought, 'shardman'.
+Currently extension scheme is fixed, it is, who would have thought, `shardman`.
 
-## Usage
+## Usage guide
 
 ### Basics
 
 All cluster-management commands are executed on shardlord, thery are usual
-PostgreSQL functions in `shardman` schema. To get started, direct your steps to
-shardlord and register all cluster nodes on it using `shardman.add_node`
-function ( see description of all commands below), e.g.
+PostgreSQL functions in `shardman` schema. Most commands will be redirected to
+shardlord if you execute them on worker node, but we recommend to run them
+directly on the lord.
+
+To get started, direct your steps to shardlord and register all cluster nodes on
+it using `shardman.add_node` function (see full description of all commands
+below), e.g.
 
 ```plpgsql
-select shadman.add_node('port=5433', repl_group => 'default')
+select shardman.add_node('port=5433', repl_group => 'rg_0')
 ```
 
-`repl_group` is arbitrary string identifying *replication group* (RG) we are
+`repl_group` is an arbitrary string identifying *replication group* (RG) we are
 adding node to. Replication group is a set of nodes which can create replicas on
 each other. Every node in the cluster belongs to some replication group and RGs
 don't intersect. Node can't replicate partitions to nodes not from its RG. We
@@ -158,40 +166,193 @@ partitions between replication groups. It means that if we have e.g. cluster of
 into the battle, the only way to do that without resharding is to enlarge
 existing replication groups.
 
-By default all nodes are included in replication group "default". So be careful:
-if you do not explicitly specify replication group, then all nodes will be
-placed in the single replication group "default". As mentioned above, it can
-cause serious problems with performance, especially in case of using synchronous
-replication.
+By default node is assigned to replication group with name equal to node's
+unique system identifier, which means that replications groups consist of a
+single node and no logical replication channes are configured: you can't create
+replicas, and no overhead is added.
 
-But if you do not need fault tolerance and are not going to use replication at
-all, then using default replication group can also cause performance problems.
-The reason is that `pg_shardman` configures replication channels between
-replication group members at the moment when node is added to the group.  Even
-if you specify redundancy level 0, there are still be active WAL senders, which
-parse WALs, decode transactions and send them to other nodes.  These
-transactions are empty, because there are not published tables, but decoding WAL
-and sending empty transaction still adds signficant overhead and slows down
-performance up to two times.
+BTW, even in absence of replicas, configured logical replication channels adds
+serious overhead (up to two times on our measurments on ~10 nodes in one
+RG). That's because walsenders still have to decode whole WAL, and moreover they
+still send decoded empty transactions to subscribers.
 
-If you are not going to use replication, assign unique replication group name to
-each node. In this case there are no logical replication subscriptions.
+With nodes added, you can shard tables. To do that, create the table
+on shardlord with usual `CREATE TABLE` DDL and execute
+`shardman.create_hash_partitions` function, for example
 
-After adding all nodes you can shard your tables.
-It should be done using `shardman.create_hash_partition function`.
-This function has four arguments:
- * name of the name
- * name of sharding key
- * number of partitions
- * redundancy level (default is 0).
+```plpgsql
+CRATE TABLE horns (id int, branchness int);
+select create_hash_partitions('horns', 'id', 30, redundancy = 1)
+```
 
-Right now shardman scatters shards between nodes using round-robin algorithm.
-Replicas are randomly chosen within replication group, but with a guarantee that
-there is no more than one copy of the partition per node.
+On successfull execution, table `horns` will be hash-sharded into 30 partitions
+(`horns_0`, `horns_1`... `horns_29`) by `id` column. For each partition a one
+replica will be spawn and added to logical replication channel between nodes
+holding primary and replica.
+
+After table was sharded, each `pg_shardman` node can execute any DML statement
+involving it. You are free to issue queries involving data from more than one
+shard, remote or local. It works using standard Postgres inheritance mechanism:
+all partitions are derived from parent table. If a partition is located at some
+other node, it will be accessed using foreign data wrapper
+`postgres_fdw`. Unfortunately inheritance and FDW in Postgres have some
+limitations which doesn't allow to build efficient execution plans for some
+queries. Though Postgres 10 is capable of pushing aggregates to FDW, it can't
+merge partial aggregate values from different nodes. Also it can't execute query
+on all nodes in parallel: foreign data wrappers do not support parallel scan
+because of using cursors. Execution of OLAP queries at `pg_shardman` might not
+be that efficient. `pg_shardman` is oriented mainly on OLTP workload.
+
+Presently internal Postgres function is used for hashing; there is no easy way
+for client app to determine the node for particular record to perform local
+reads/writes.
+
+### Importing data
+
+The most efficient way to import data is to use `COPY` command. Vanilla
+PostgreSQL doesn't support `COPY FROM` to foreign tables yet, and we have
+implemented this feature in
+[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman).
+Binary format is not supported there. Data can be loaded parallel from several
+nodes.
+
+Obviously nobody forbids you to populate the cluster using normal inserts.
+
+If redundancy level is not zero, then it is better to avoid large transactions,
+because WAL decoder will spill large transactions to the disk, which
+significantly reduces speed.
+
+### Replication
+Apart from specifying redundancy in `create_hash_partitions` call, replicas for
+existing tables can be bred with `shardman.set_redundancy(rel_name name,
+redundancy int)` function. This function can only increase redundancy level, it
+doesn't delete replicas. `set_redundancy` function doesn't wait for completion
+of initial table sync for new replicas. If you want to wait it to ensure that
+the requested redundancy level is reached, run `shardman.ensure_redundancy()`
+function.
+
+If GUC `shardman.sync_replication` is `on` during replica creation, replica will
+be added to `synchronous_standby_names` of the primary holder, making the
+replication synchronous: though transactions on primary will be committed
+locally immediately after the `COMMIT` request, the client will not get
+successfull confirmation until it is committed on replica holder.
+
+The trade-off is well-known: asynchronous replication is faster, but allows
+replica to lag arbitrary behind the primary, which might lead to loss of a bunch
+of recently committed transactions, or WAL puffing up in case of replica
+failure. Synchronous replication is slower, but committed transaction are
+*typically* not dropped. Typically, because it is actually still possible
+to lose them without kind of 2PC commit. Imagine the following scenario:
+ * Primary's connection with replica is teared down.
+ * Primary executes a transaction, e.g. adds some row with id `42`, commits it
+   locally and blocks because there is no connection with replica.
+ * Client suddenly loses connection with primary for a moment and reconnects
+   to learn the status of the transaction, sees the row with id `42` and
+   thinks that it has been committed.
+ * Now primary fails permanently and we switch to the replica. Replica has
+   no idea of that transaction, but client is sure it is committed.
+
+Though this situation is rather unlikely in practice, it is possible.
+
+We don't track replication mode for each table separately, and changing
+`shardman.sync_replication` GUC during cluster operation might lead to a mess.
+It is better to set it permanently for now.
+
+### Balancing the load
+
+Newly added nodes are initially empty. To bring some sense into their existence,
+we need to rebalance the data. `pg_shardman` currently doesn't know how to move
+it between replication groups. Functions
+`shardman.rebalance(part_pattern text = '%')` and
+`shardman.rebalance_replicas(replica_pattern text = '%')` try to
+distribute partitions/replicas which names are `LIKE` given pattern uniformly
+between all nodes of their replication groups. In `pg_shardman`, partitions are
+called `${sharded_table_num}_${part_num}`. For instance, if you have sharded
+table `horns`, issuing `shardman.rebalance('horns%')` should be enough to
+rebalance its partitions. These functions move partitions/replicas sequentially,
+one at time. We pretend that is was done to minimize the impact on the normal
+work of the cluster -- they are expected to work in background. However, you are
+free to think that we were just too indolent to implement parallel migration as
+well.
+
+You can also achieve more fine-grained control over data distribution by moving
+explicitly partition or its replica to some other node. Again, moves are only
+possible inside replication groups. Shardman provides
+`shardman.mv_partition(mv_part_name text, dst_node_id int)` and
+`shardman.mv_replica(mv_part_name text, src_node_id int, dst_node_id int)`
+functions. Both take as first argument name of partition to move. `pg_shardman`
+knows original location of partition, so it is enough to specify just the
+destination node; for replica it is also necessary to specify the source node.
+
+### Transactions
+
+Atomicity and durability of transactions touching only single node is handled as
+usual in PostgreSQL, which does a pretty good job at that. However, without
+special arrangments result of cross-node transaction might be non-atomic: if
+coordinator (node where transaction started) has committed it on some nodes and
+then something went wrong (e.g. it failed), the transaction will be aborted on
+the rest of nodes. Because of
+that
+[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman) implements
+two-phase commit (2PC) in `postgres_fdw`, which is turned on when
+`postgres_fdw.use_twophase` GUC is set to `true`. With 2PC, the transaction is
+firstly *prepared* on each node, and only then committed. Successfull *prepare*
+on the node means that this node has promised to commit the transaction, and it
+is also possible to abort the transaction in this state, which allows to get
+consistent behaviour of all nodes.
+
+The problem is that presently `PREPARE` is not transferred via logical
+replication to replicas, which means that in case of permanent node failure we
+still might lost part of distributed transaction and get non-atomic result if
+primary has prepared the transaction, but failed without committing it and now
+replica has no idea about it. Properly implemented `PREPARE` going over logical
+replication will also mitigate the possibilty of losing transactions described
+in 'Replication' section, and we plan to do that.
+
+Similarly, if transactions affect only single nodes, plain PostgreSQL isolation
+rules are applicable. However, for distributed transactions we need distributed
+visibility, implemented in patched Postgres. GUC
+`postgres_fdw.use_global_snapshots` turns on distributed transaction manager
+based on Clock-SI algorithm. It provides snapshot isolation (called `REPEATABLE
+READ` in Postgres) consistency.
+
+Yet another problem is distributed deadlocks. They can be detected and resolved
+using `monitor` function, see the reference below.
+
+## Worker failover
+
+Shardman doesn't support presently automatic failure detection and recovery. It
+has to be done manually by the DBA. If some node is down, its data is not
+available until either node rises or it is ruled out from the cluster by
+`rm_node` command, which also promotes replicas of partitions held by removed
+node. The general procedure for failover is the following.
+* Make sure failed node is really turned off, and never make it online without
+  erasing its state -- otherwise stale reads and inconsistent writes on it
+  are possible.
+* Run `select shardman.rm_node(${failed_node_id}, force => true)` to exclude it
+  and promote replicas.
+* Run `select shardman.recover_xacts()` to resolve possibly hanged 2PC
+  transactions.
+
+Note that presently some recent transactions (or parts of distributed
+transactions) transactions still might be lost as explained in 'Transactions'
+section.
+
+## Shardlord failover
+
+Shardlord doesn't participate in normal cluster operation, and its failure is
+not that terrible. Anyway, it can be done relatively easily. The only
+shardlord's state is tables with metadata listed in section 'Metadata
+tables'. They can be replicated (with physical or logical replication) to some
+other node, which can be made new shardlord at any moment by adjusting
+`shardman.shardlord` GUC. It is DBA's responsibility that two lords are not used
+at the same time. Also, don't forget to update `shardman.shardlord_connstring`
+everywhere.
 
 ### Local and shared tables
 
-Apart from sharded tables, application may need to have local and/or shared tables.
+Apart from sharded tables, application may need to have local and/or shared
+tables.
 
 Local table stores data which is unique for the particular node. Usually it is
 some temporary data, for example temporary tables.  Local tables do not require
@@ -211,43 +372,7 @@ the node when it is added to the cluster. You can check node identifiers in
 `shardman.nodes` table at shardlord. Node identifies start from 1 and are
 incremented on each add of a node.
 
-### Importing data
-After creation of sharded and shared tables at all nodes, you can upload data to
-the cluster. The most efficient way is to use `COPY` command. Vanilla PostgreSQL
-doesn't support `COPY FROM` to foreign tables. To make it work, for now we need
-  * [patched postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman)
-  * [and patched pg_pathman](https://github.com/arssher/pg_pathman/tree/foreign_copy_from)
-Right now `pg_shardman` supports only text format and doesn't allow to specify
-columns in COPY command.  It is possible to load data in parallel from several
-nodes.
-
-Certainly it is possible to populate data using normal inserts, which are
-redirected by pathman to the proper node. Right now sharding is performed using
-internal Postgres hash function, so it is not possible to predict at client
-application level at which node particular record will be stored.
-
-If redundancy level is not zero, then it is better to avoid large transactions,
-because WAL sender decoder will spill large transactions to the disk, which
-significantly reduces speed.
-
-### Accessing the cluster
-
-Each shardman node can execute any DML statement. You are free to issue queries
-involving data from more than one shard, remote or local. It works using
-standard Postgres inheritance mechanism: all partitions are derived from parent
-table. If a partition is located at some other node, it will be accessed using
-foreign data wrapper `postgres_fdw`. Unfortunately inheritance and FDW in
-Postgres have some limitations which doesn't allow to build efficient execution
-plans for some queries. Though Postgres 10 is capable of pushing aggregates to
-FDW, it can't merge partial aggregate values from different nodes. Also it can't
-execute query at all nodes in parallel: foreign data wrappers do not support
-parallel scan because of using cursors. Execution of OLAP queries at
-`pg_shardman` may be not so efficient. `pg_shardman` is oriented mainly on OLTP
-workload.
-
-### Administrating the cluster.
-Shardlord commands called on workers are implicitly redirected to shardlord, but
-it is highly recommended to perform them directly at shardlord.
+### What else you can do with the cluster
 
 It is possible to execute some SQL on all cluster nodes using
 `shardman.forall(cmd text, use_2pc bool = false, including_shardlord bool =
@@ -269,96 +394,19 @@ partitions of the deleted node with replica. Right now random replica is used.
 In case of presence of more than one replica, shardman can not enforce
 consistency if all this replicas.
 
-Newly added nodes are initially empty. To bring some sense into their existence,
-we need to rebalance the data. `pg_shardman` currently doesn't know how to move
-it between replication groups. Functions `shardman.rebalance(part_pattern text =
-'%')` and `shardman.rebalance_replicas(replica_pattern text = '%')` try to
-distribute partitions/replicas which names are `LIKE` given pattern uniformly
-between all nodes of their replication groups. In `pg_shardman`, partitions are
-called `${sharded_table_num}_${part_num}`. For instance, if you have sharded
-table `horns`, issuing `shardman.rebalance('horns%')` should be enough to
-rebalance its partitions. These functions move partitions/replicas sequentially,
-one at time. We pretend that is was done to minimize the impact on the normal
-work of the cluster -- they are expected to work in background. However, you are
-free to think that we were just too indolent to implement parallel migration as
-well.
-
-You can also achieve more fine-grained control over data distribution by moving
-explicitly partition or its replica to some other node. Again, moves are only
-possible inside replication groups. Shardman provides
-`shardman.mv_partition(mv_part_name text, dst_node_id int)` and
-`shardman.mv_replica(mv_part_name text, src_node_id int, dst_node_id int)`
-functions. Both take as first argument name of partition to move. `pg_shardman`
-knows original location of partition, so it is enough to specify just
-destination node; for replica it is also necessary to specify the source node.
-
-It is also possible to increase redundancy level of existing table using
-`shardman.set_redundancy(rel_name name, redundancy int)` function. This function
-can only increase redundancy level, not decrease it. `set_redundancy` function
-doesn't wait completion of initial table sync for new replicas. If you want to
-wait it, to ensure that requested redundancy level is reached, then use
-`shardman.ensure_redundancy()` function.
-
 It is possible to remove table together with all its partitions and replicas
 using `shardman.rm_table(rel regclass)` function. Please be careful: it doesn't
 require any confirmation.
 
 If shardlord has failed during command execution or you just feel that something
-goes wrong, run `shadman.recovery()` function. It will verify nodes state
+goes wrong, run `shadman.recover()` function. It will verify nodes state
 against current shardlord's metadata and try to fix up things, i.e. reconfigure
 LR channels, repair FDW, etc.
 
 There is also `shardman.replication_lag` view which can be used to monitor
 replication lag, which can be critical for asynchronous replication.
 
-Below goes full list of commands.
-
-## List of commands
-
-### Membership
-
-```plpgsql
-add_node(super_conn_string text, conn_string text = NULL, repl_group text = 'default') returns int
-```
-Add node with given libpq connstring(s) to the cluster. Node is assigned unique
-id. If node previously contained shardman state from old cluster (not one
-managed by current shardlord), this state will be lost.
-
-`super_conn_string` is connection string to the node which must provide
-superuser access to the node, and `conn_string` can be some other connstring. The
-former is used for configuring logical replication, the latter for DDL and for
-setting up FDW. This separation serves two purposes:
-  * It allows to access data without requiring superuser privileges.
-  * It allows to set up pgbouncer, as replication can't go through it.
-If `conn_string` is `NULL`, `super_conn_string` is used everywhere.
-
-`repl_group` is the name of node's replication group. We have no explicit
-command for changing RG of already added node -- you have to remove it and add
-again.
-
-We don't move any parts and replicas to newly added node, see `rebalance_*`
-commands for that below. However, freshly added node instantly becomes aware
-of sharded tables and can accept queries to them.
-
-Returns id of the new node.
-
-```plpgsql
-get_my_id()
-```
-Get this worker's id. Executed on any worker node. Fails on shardlord.
-
-```plpgsql
-rm_node(rm_node_id int, force bool = false)
-```
-Remove node from the cluster. If 'force' is true, we don't care whether node
-contains any partitions. Otherwise we won't allow to rm node holding shards.
-We will try to remove shardman's stuff (pubs, subs, repslots) on deleted node if
-node is alive, but the command succeeds even if we can't. Currently we don't
-remove tables with data on removed node.
-
-If node contained partitions, for each one we automatically promote random
-replica. NOTE: currently promotion procedure is not safe if there are more than
-1 replica because we don't handle different state of replicas.
+## Metadata tables
 
 You can see all cluster nodes on shardlord by examining `shardman.nodes` table:
 ```plpgsql
@@ -370,21 +418,6 @@ CREATE TABLE nodes (
 	replication_group text NOT NULL -- group of nodes within which shard replicas are allocated
 );
 ```
-
-### Shards and replicas
-
-```plpgsql
-create_hash_partitions(rel_name name, expr text, part_count int, redundancy int = 0)
-```
-To shard the table, you must create it on shardlord with usual `CREATE TABLE
-...` and then call this function. It hash-shards table `rel_name` by key `expr`,
-creating `part_count` shards, distributing shards evenly among the nodes. As you
-probably noticed, the signature mirrors pathman's function with the same
-name. `redundancy` replicas will be immediately created for each partition,
-evenly scattered among the nodes.
-
-Node for each partition is choosen in round-robin fashion among all worker
-nodes.
 
 There are three tables describing sharded tables (no pun intended) state,
 `shardman.tables`, `shardman.partitions` and `shardman.replicas`:
@@ -414,6 +447,73 @@ CREATE TABLE replicas (
 	PRIMARY KEY (part_name,node_id)
 );
 ```
+
+## Commands reference
+
+### Membership
+
+```plpgsql
+add_node(super_conn_string text, conn_string text = NULL, repl_group text = 'default') returns int
+```
+Add node with given libpq connstring(s) to the cluster. Node is assigned unique
+id. If node previously contained shardman state from old cluster (not one
+managed by current shardlord), this state will be lost.
+
+Returns cluster-unique id of added node. Identifiers start from 1 and are
+incremented on each node addition.
+
+`super_conn_string` is connection string to the node which must provide
+superuser access to the node, and `conn_string` can be some other connstring. The
+former is used for configuring logical replication, the latter for DDL and for
+setting up FDW. This separation serves two purposes:
+  * It allows to access data without requiring superuser privileges.
+  * It allows to set up pgbouncer, as replication can't go through it.
+If `conn_string` is `NULL`, `super_conn_string` is used everywhere.
+
+`repl_group` is the name of node's replication group. We have no explicit
+command for changing RG of already added node -- you have to remove it and add
+again.
+
+We don't move any parts and replicas to newly added node, see `rebalance_*`
+commands for that below. However, freshly added node instantly becomes aware
+of sharded tables and can accept queries to them.
+
+Returns id of the new node.
+
+```plpgsql
+get_my_id()
+```
+Get this worker's id. Executed on any worker node. Fails on shardlord.
+
+```plpgsql
+rm_node(rm_node_id int, force bool = false)
+```
+Remove node from the cluster. If `force` is true, we don't care whether node
+contains any partitions. Otherwise we won't allow to rm node holding shards.
+We will try to remove shardman's stuff (pubs, subs, repslots) on deleted node if
+node is alive, but the command succeeds even if we can't. Currently we don't
+remove tables with data on removed node.
+
+If node contained partitions, for each one we automatically promote random
+replica. NOTE: currently promotion procedure is not safe if there are more than
+1 replica because we don't handle different state of replicas.
+
+### Shards and replicas
+
+```plpgsql
+create_hash_partitions(rel_name name, expr text, part_count int, redundancy int = 0)
+```
+To shard the table, you must create it on shardlord with usual `CREATE TABLE
+...` and then call this function. It hash-shards table `rel_name` by key `expr`,
+creating `part_count` shards, distributing shards evenly among the nodes. As you
+probably noticed, the signature mirrors `pg_pathman`'s function with the same
+name. `redundancy` replicas will be immediately created for each partition.
+
+Shards are scattered among nodes using round-robin algorithm. Replicas are
+randomly chosen within replication group, but with a guarantee that there is no
+more than one copy of the partition per node. Distributed table is always
+created empty, it doesn't matter had the original table on shardlord had any
+data or not.
 
 ```plpgsql
 rm_table(rel_name name)
@@ -490,7 +590,7 @@ Returns number of replicas at the particular node.
 ### Other functions
 
 ```plpgsql
-recovery()
+recover()
 ```
 Check consistency of cluster state against current metadata and perform recovery,
 if needed (reconfigure LR channels, repair FDW, etc).
@@ -534,25 +634,12 @@ will try to kill the walsenders before dropping the slots. Also, immediately
 after transaction commit set `synchronous_standby_names` GUC to empty string --
 this is a non-transactional action and there is a very small chance it won't be
 completed. You probably want to run it before `DROP EXTENSION pg_shardman`.
-
-## Transactions
-When using vanilla PostgreSQL, local changes are handled by PostgreSQL as usual
--- so if you queries touch only only node, you are safe. Distributed
-transactions for `postgres_fdw` are provided by [patched postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman), but
-that's largely work in progress:
-  * `postgres_fdw.use_twophase = on` GUC turns on 2PC commit, but resolving procedure
-    is fully manual for now, and replicas don't receive `PREPARE` yet.
-  * `track_global_snapshots` and `postgres_fdw.use_global_snapshots` GUCs control
-     distrubuted snapshot manager, providing `snapshot isolation` transaction
-     isolation level.
-
-## Shardlord failover
-The only shardlord's state is tables with metadata mentioned above. They can be
-replicated (with physical or logical replication) to some other node, which can
-be made new shardlord at any moment.
+Data is not touched by this command.
 
 ## Some limitations:
-  * You should not touch `sync_standby_names` manually while using pg_shardman.
+  * You should not touch `synchronous_standby_names` manually while using pg_shardman.
   * The shardlord itself can't be worker node for now.
   * All [limitations of `pg_pathman`](https://github.com/postgrespro/pg_pathman/wiki/Known-limitations),
-  e.g. we don't support global primary keys and foreign keys to sharded tables.
+	e.g. we don't support global primary keys and foreign keys to sharded tables.
+  * All [limitations of logical replications](https://www.postgresql.org/docs/10/static/logical-replication-restrictions.html).
+    `TRUNCATE` statements on sharded tables will not be replicated.

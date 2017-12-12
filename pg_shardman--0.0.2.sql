@@ -1212,7 +1212,7 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Check consistency of cluster with metadata and perform recovery
-CREATE FUNCTION recovery() RETURNS void AS $$
+CREATE FUNCTION recover() RETURNS void AS $$
 DECLARE
 	dst_node shardman.nodes;
 	src_node shardman.nodes;
@@ -1240,7 +1240,7 @@ DECLARE
 	old_sync_policy text;
 	new_sync_policy text;
 BEGIN
-	IF shardman.redirect_to_shardlord('recovery()')
+	IF shardman.redirect_to_shardlord('recover()')
 	THEN
 		RETURN;
 	END IF;
