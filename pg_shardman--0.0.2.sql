@@ -32,7 +32,8 @@ CREATE TABLE nodes (
 	system_id bigint NOT NULL UNIQUE,
     super_connection_string text UNIQUE NOT NULL,
 	connection_string text UNIQUE NOT NULL,
-	replication_group text NOT NULL -- group of nodes within which shard replicas are allocated
+	-- group of nodes within which shard replicas are allocated
+	replication_group text NOT NULL
 );
 
 -- List of sharded tables
@@ -72,7 +73,7 @@ CREATE TABLE replicas (
 -- * It allows to set up pgbouncer, as replication can't go through it.
 -- If conn_string is null, super_conn_string is used everywhere.
 CREATE FUNCTION add_node(super_conn_string text, conn_string text = NULL,
-						 repl_group text = 'default') RETURNS int AS $$
+						 repl_group text = NULL) RETURNS int AS $$
 DECLARE
 	new_node_id int;
     node shardman.nodes;
@@ -113,18 +114,22 @@ BEGIN
 	-- Insert new node in nodes table
 	INSERT INTO shardman.nodes (system_id, super_connection_string,
 								connection_string, replication_group)
-	VALUES (0, super_conn_string, conn_string_effective, repl_group)
+	VALUES (0, super_conn_string, conn_string_effective, '')
 		   RETURNING id INTO new_node_id;
 
-	-- We have to update system_id after insert, because otherwise broadcast
-	-- will not work
+	-- We have to update system_id along with dependant repl_group after insert,
+	-- because otherwise broadcast will not work.
 	sys_id := shardman.broadcast(
 		format('%s:SELECT shardman.get_system_identifier();',
 			   new_node_id))::bigint;
 	IF EXISTS(SELECT 1 FROM shardman.nodes where system_id = sys_id) THEN
 		RAISE EXCEPTION 'Node with system id % is already in the cluster', sys_id;
 	END IF;
-	UPDATE shardman.nodes SET system_id=sys_id WHERE id=new_node_id;
+	UPDATE shardman.nodes SET system_id = sys_id WHERE id = new_node_id;
+	-- By default, use system id as repl group name
+	UPDATE shardman.nodes SET replication_group =
+		(CASE WHEN repl_group IS NULL THEN sys_id::text ELSE repl_group END)
+		WHERE id = new_node_id;
 
 	-- Adjust replication channels within replication group.
 	-- We need all-to-all replication channels between all group members.
@@ -137,10 +142,10 @@ BEGIN
 			 			  %s:CREATE PUBLICATION node_%s;
 						  %s:SELECT pg_create_logical_replication_slot(''node_%s'', ''pgoutput'');
 						  %s:SELECT pg_create_logical_replication_slot(''node_%s'', ''pgoutput'');',
-			 pubs, node.id, new_node_id,
-			 	   new_node_id, node.id,
-			       node.id, new_node_id,
-			 	   new_node_id, node.id);
+						  pubs, node.id, new_node_id,
+						  new_node_id, node.id,
+						  node.id, new_node_id,
+						  new_node_id, node.id);
 		-- Add to new node subscriptions to existing nodes and add subscription
 		-- to new node to all existing nodes
 		-- sub name is sub_$subnodeid_pubnodeid to avoid application_name collision
@@ -202,7 +207,7 @@ BEGIN
 	-- Broadcast command for creating user mapping for this servers
 	PERFORM shardman.broadcast(usms);
 
-	-- Create FDWs at new node for all existed partitions
+	-- Create FDWs at new node for all existing partitions
 	FOR t IN SELECT * from shardman.tables WHERE sharding_key IS NOT NULL
 	LOOP
 		create_tables := format('%s{%s:%s}',
@@ -210,10 +215,8 @@ BEGIN
 		create_partitions := format('%s%s:SELECT create_hash_partitions(%L,%L,%L);',
 			create_partitions, new_node_id, t.relation, t.sharding_key, t.partitions_count);
 		SELECT shardman.reconstruct_table_attrs(t.relation) INTO table_attrs;
-		FOR part IN SELECT * from shardman.partitions WHERE relation=t.relation
+		FOR part IN SELECT * FROM shardman.partitions WHERE relation=t.relation
 	    LOOP
-			SELECT connection_string INTO conn_string from shardman.nodes WHERE id=part.node_id;
-		    SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(conn_str) INTO server_opts, um_opts;
 			srv_name := format('node_%s', part.node_id);
 			fdw_part_name := format('%s_fdw', part.part_name);
 			create_fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
@@ -460,14 +463,27 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-
+-- Bail out with ERROR if some replication group doesn't have 'redundancy'
+-- replicas
+CREATE FUNCTION check_max_replicas(redundancy int) RETURNS void AS $$
+DECLARE
+	rg record;
+BEGIN
+	FOR rg IN SELECT count(*), replication_group FROM shardman.nodes
+		GROUP BY replication_group LOOP
+		IF rg.count < redundancy + 1 THEN
+			RAISE EXCEPTION 'Requested redundancy % is too high: replication group % has % members', redundancy, rg.replication_group, rg.count;
+		END IF;
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
 
 -- Shard table with hash partitions. Parameters are the same as in pathman.
 -- It also scatter partitions through all nodes.
 -- This function expects that empty table is created at shardlord.
 -- It can be executed only at shardlord and there is no need to redirect this
 -- function to shardlord.
-CREATE FUNCTION create_hash_partitions(rel regclass, expr text, part_count int,
+CREATE FUNCTION create_hash_partitions(rel_name name, expr text, part_count int,
 									   redundancy int = 0)
 RETURNS void AS $$
 DECLARE
@@ -483,7 +499,6 @@ DECLARE
 	create_partitions text = '';
 	create_fdws text = '';
 	replace_parts text = '';
-	rel_name text = rel::text;
 	i int;
 	n_nodes int;
 BEGIN
@@ -495,6 +510,9 @@ BEGIN
 	IF (SELECT count(*) FROM shardman.nodes) = 0 THEN
 		RAISE EXCEPTION 'Please add some nodes first';
 	END IF;
+
+	-- Check right away to avoid unneccessary recover()
+	PERFORM shardman.check_max_replicas(redundancy);
 
 	-- Generate SQL statement creating this table
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
@@ -522,7 +540,7 @@ BEGIN
 	n_nodes := array_length(node_ids, 1);
 
 	-- Reconstruct table attributes from parent table
-	SELECT shardman.reconstruct_table_attrs(rel_name) INTO table_attrs;
+	SELECT shardman.reconstruct_table_attrs(rel_name::regclass) INTO table_attrs;
 
 	FOR i IN 0..part_count-1
 	LOOP
@@ -553,7 +571,7 @@ BEGIN
 
 	IF redundancy <> 0
 	THEN
-		PERFORM shardman.set_redundancy(rel, redundancy, copy_data => false);
+		PERFORM shardman.set_redundancy(rel_name, redundancy, copy_data => false);
 	END IF;
 END
 $$ LANGUAGE plpgsql;
@@ -561,7 +579,7 @@ $$ LANGUAGE plpgsql;
 -- Provide requested level of redundancy. 0 means no redundancy.
 -- If existing level of redundancy is greater than specified, then right now this
 -- function does nothing.
-CREATE FUNCTION set_redundancy(rel regclass, redundancy int, copy_data bool = true)
+CREATE FUNCTION set_redundancy(rel_name name, redundancy int, copy_data bool = true)
 RETURNS void AS $$
 DECLARE
 	part shardman.partitions;
@@ -570,7 +588,6 @@ DECLARE
 	repl_group text;
 	pubs text = '';
 	subs text = '';
-	rel_name text = rel::text;
 	sub_options text = '';
 BEGIN
 	IF shardman.redirect_to_shardlord(format('set_redundancy(%L, %L)', rel_name, redundancy))
@@ -578,12 +595,14 @@ BEGIN
 		RETURN;
 	END IF;
 
+	PERFORM shardman.check_max_replicas(redundancy);
+
 	IF NOT copy_data THEN
 	    sub_options := ' WITH (copy_data=false)';
 	END IF;
 
 	-- Loop through all partitions of this table
-	FOR part IN SELECT * from shardman.partitions where relation=rel_name
+	FOR part IN SELECT * FROM shardman.partitions WHERE relation=rel_name
 	LOOP
 		-- Count number of replicas of this partition
 		SELECT count(*) INTO n_replicas FROM shardman.replicas WHERE part_name=part.part_name;
@@ -665,10 +684,9 @@ $$ LANGUAGE plpgsql;
 
 
 -- Remove table from all nodes.
-CREATE FUNCTION rm_table(rel regclass)
+CREATE FUNCTION rm_table(rel_name name)
 RETURNS void AS $$
 DECLARE
-	rel_name text = rel::text;
 	node_id int;
 	pname text;
 	drop1 text = '';
@@ -702,10 +720,11 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Move partition to other node. This function is able to move partition only within replication group.
--- It creates temporary logical replication channel to copy partition to new location.
--- Until logical replication almost caught-up access to old partition is now denied.
--- Then we revoke all access to this table until copy is completed and all FDWs are updated.
+-- Move partition to other node. This function can move partition only within
+-- replication group. It creates temporary logical replication channel to copy
+-- partition to new location. Until logical replication almost caught-up access
+-- to old partition is denied. Then we revoke all access to this table until
+-- copy is completed and all FDWs are updated.
 CREATE FUNCTION mv_partition(mv_part_name text, dst_node_id int)
 RETURNS void AS $$
 DECLARE
@@ -750,12 +769,12 @@ BEGIN
 	-- Check if destination belongs to the same replication group as source
 	IF dst_repl_group<>src_repl_group AND shardman.get_redundancy_of_partition(mv_part_name)>0
 	THEN
-	    RAISE EXCEPTION 'Can not move partition % to different replication group', mv_part_name;
+	    RAISE EXCEPTION 'Unable to move partition % to different replication group', mv_part_name;
 	END IF;
 
 	IF EXISTS(SELECT * FROM shardman.replicas WHERE part_name=mv_part_name AND node_id=dst_node_id)
 	THEN
-	    RAISE EXCEPTION 'Can not move partition % to node % with existed replica', mv_part_name, dst_node_id;
+	    RAISE EXCEPTION 'Unable to move partition % to node % with existing replica', mv_part_name, dst_node_id;
 	END IF;
 
 	-- Copy partition data to new location
@@ -845,8 +864,8 @@ $$ LANGUAGE sql;
 
 -- Get minimal redundancy of the specified relation.
 -- This command can be executed only at shardlord.
-CREATE FUNCTION get_min_redundancy(rel regclass) returns bigint AS $$
-	SELECT min(redundancy) FROM (SELECT count(*) redundancy FROM shardman.replicas WHERE relation=rel::text GROUP BY part_name) s;
+CREATE FUNCTION get_min_redundancy(rel_name name) RETURNS bigint AS $$
+	SELECT min(redundancy) FROM (SELECT count(*) redundancy FROM shardman.replicas WHERE relation=rel_name GROUP BY part_name) s;
 $$ LANGUAGE sql;
 
 -- Execute command at all shardman nodes.
@@ -896,7 +915,7 @@ $$ LANGUAGE sql;
 -- It is not able to move partition between replication groups.
 -- This function intentionally moves one partition per time to minimize
 -- influence on system performance.
-CREATE FUNCTION rebalance(table_pattern text = '%') RETURNS void AS $$
+CREATE FUNCTION rebalance(part_pattern text = '%') RETURNS void AS $$
 DECLARE
 	dst_node int;
 	src_node int;
@@ -906,7 +925,7 @@ DECLARE
 	repl_group text;
 	done bool;
 BEGIN
-	IF shardman.redirect_to_shardlord(format('rebalance(%L)', table_pattern))
+	IF shardman.redirect_to_shardlord(format('rebalance(%L)', part_pattern))
 	THEN
 		RETURN;
 	END IF;
@@ -919,13 +938,13 @@ BEGIN
 			-- Select node in this group with minimal number of partitions
 			SELECT node_id, count(*) n_parts INTO dst_node, min_count
 				FROM shardman.partitions p JOIN shardman.nodes n ON p.node_id=n.id
-			    WHERE n.replication_group=repl_group AND p.relation LIKE table_pattern
+			    WHERE n.replication_group=repl_group AND p.relation LIKE part_pattern
 				GROUP BY node_id
 				ORDER BY n_parts ASC LIMIT 1;
 			-- Select node in this group with maximal number of partitions
 			SELECT node_id, count(*) n_parts INTO src_node,max_count
 			    FROM shardman.partitions p JOIN shardman.nodes n ON p.node_id=n.id
-				WHERE n.replication_group=repl_group AND p.relation LIKE table_pattern
+				WHERE n.replication_group=repl_group AND p.relation LIKE part_pattern
 				GROUP BY node_id
 				ORDER BY n_parts DESC LIMIT 1;
 			-- If difference of number of partitions on this nodes is greater
@@ -933,7 +952,7 @@ BEGIN
 			IF max_count - min_count > 1 THEN
 			    SELECT p.part_name INTO mv_part_name
 				FROM shardman.partitions p
-				WHERE p.node_id=src_node AND p.relation LIKE table_pattern AND
+				WHERE p.node_id=src_node AND p.relation LIKE part_pattern AND
 				    NOT EXISTS(SELECT * from shardman.replicas r
 							   WHERE r.node_id=dst_node AND r.part_name=p.part_name)
 				ORDER BY random() LIMIT 1;
@@ -947,8 +966,8 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Share table between all nodes. This function should be executed at shardlord. The empty table should be present at shardlord,
--- but not at nodes.
+-- Share table between all nodes. This function should be executed at
+-- shardlord. The empty table should be present at shardlord, but not at nodes.
 CREATE FUNCTION create_shared_table(rel regclass, master_node_id int = 1) RETURNS void AS $$
 DECLARE
 	node shardman.nodes;
@@ -1121,7 +1140,7 @@ $$ LANGUAGE plpgsql;
 -- It is not able to move replica between replication groups.
 -- This function intentionally moves one replica per time to minimize
 -- influence on system performance.
-CREATE FUNCTION rebalance_replicas(table_pattern text = '%') RETURNS void AS $$
+CREATE FUNCTION rebalance_replicas(replica_pattern text = '%') RETURNS void AS $$
 DECLARE
 	dst_node int;
 	src_node int;
@@ -1131,7 +1150,7 @@ DECLARE
 	repl_group text;
 	done bool;
 BEGIN
-	IF shardman.redirect_to_shardlord(format('rebalance_replicas(%L)', table_pattern))
+	IF shardman.redirect_to_shardlord(format('rebalance_replicas(%L)', replica_pattern))
 	THEN
 		RETURN;
 	END IF;
@@ -1144,13 +1163,13 @@ BEGIN
 			-- Select node in this group with minimal number of replicas
 			SELECT node_id, count(*) n_parts INTO dst_node, min_count
 				FROM shardman.replicas r JOIN shardman.nodes n ON r.node_id=n.id
-			    WHERE n.replication_group=repl_group AND r.relation LIKE table_pattern
+			    WHERE n.replication_group=repl_group AND r.relation LIKE replica_pattern
 				GROUP BY node_id
 				ORDER BY n_parts ASC LIMIT 1;
 			-- Select node in this group with maximal number of partitions
 			SELECT node_id, count(*) n_parts INTO src_node,max_count
 			    FROM shardman.replicas r JOIN shardman.nodes n ON r.node_id=n.id
-				WHERE n.replication_group=repl_group AND r.relation LIKE table_pattern
+				WHERE n.replication_group=repl_group AND r.relation LIKE replica_pattern
 				GROUP BY node_id
 				ORDER BY n_parts DESC LIMIT 1;
 			-- If difference of number of replicas on this nodes is greater
@@ -1158,7 +1177,7 @@ BEGIN
 			IF max_count - min_count > 1 THEN
 			    SELECT src.part_name INTO mv_part_name
 				FROM shardman.replicas src
-				WHERE src.node_id=src_node AND src.relation LIKE table_pattern
+				WHERE src.node_id=src_node AND src.relation LIKE replica_pattern
 				    AND NOT EXISTS(SELECT * FROM shardman.replicas dst
 							   WHERE dst.node_id=dst_node AND dst.part_name=src.part_name)
 				    AND NOT EXISTS(SELECT * FROM shardman.partitions p

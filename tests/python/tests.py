@@ -175,8 +175,8 @@ class Shardlord(PostgresNode):
         node.append_conf("postgresql.conf", config_lines)
         return node;
 
-    # Add worker using reserved node
-    def add_node(self, repl_group='default', additional_conf=""):
+    # Add worker using reserved node, returns node instance, node id pair
+    def add_node(self, repl_group=None, additional_conf=""):
         node = self.pop_worker()
 
         # start this node
@@ -185,12 +185,13 @@ class Shardlord(PostgresNode):
             .safe_psql(DBNAME, "drop extension if exists pg_shardman; create extension pg_shardman cascade;")
         # and register this node
         conn_string = self._common_conn_string(node.port)
-        add_node_cmd = "select shardman.add_node('{}', repl_group => '{}')".format(
-            conn_string, repl_group)
+        add_node_cmd = "select shardman.add_node('{}' {})".format(
+            conn_string, ", repl_group => '{}'".format(repl_group) if repl_group
+            else '')
         new_node_id = int(self.execute(DBNAME, add_node_cmd)[0][0])
         self.workers_dict[new_node_id] = node
 
-        return node
+        return node, new_node_id
 
     @property
     def workers(self):
@@ -216,17 +217,56 @@ class ShardmanTests(unittest.TestCase):
         TestgresConfig.cache_initdb = True
         self.lord.cleanup()
 
+    # utility methods
+
+    # check that every node sees the whole table
+    def pt_everyone_sees_the_whole(self):
+        luke_sum = int(self.lord.workers[0].execute(
+            DBNAME, sum_query("pt"))[0][0])
+        for worker in self.lord.workers[1:]:
+            worker_sum = int(worker.execute(
+                DBNAME, sum_query("pt"))[0][0])
+            self.assertEqual(luke_sum, worker_sum)
+
+    # check every replica integrity
+    def pt_replicas_integrity(self, required_replicas=None):
+        parts = self.lord.execute(
+            DBNAME, "select part_name, node_id from shardman.partitions")
+        for part_name, node_id in parts:
+            part_sum = self.lord.workers_dict[int(node_id)].execute(
+                DBNAME, sum_query(part_name))
+            replicas = self.lord.execute(
+                DBNAME,
+                "select node_id from shardman.replicas where part_name = '{}'" \
+                .format(part_name))
+            # exactly required_replicas replicas?
+            if required_replicas:
+                self.assertEqual(required_replicas, len(replicas))
+            for replica in replicas:
+                replica_id = int(replica[0])
+                replica_sum = self.lord.workers_dict[replica_id].execute(
+                    DBNAME, sum_query(part_name))
+                self.assertEqual(part_sum, replica_sum)
+
+    # tests
+
     def test_add_node(self):
         self.lord.start_lord()
         self.lord.add_node(repl_group="banana")
         self.lord.add_node(repl_group="banana")
-        yellow_fellow = self.lord.add_node(repl_group="mango")
+        yellow_fellow, _ = self.lord.add_node(repl_group="mango")
         self.assertEqual(2, len(self.lord.execute(
             DBNAME, "select * from shardman.nodes where replication_group = '{}'" \
             .format("banana"))))
         self.assertEqual(1, len(self.lord.execute(
             DBNAME, "select * from shardman.nodes where replication_group = '{}'" \
             .format("mango"))))
+
+        # without specifying replication group, rg must be equal to sys id
+        _, not_fruit_id = self.lord.add_node()
+        sys_id_and_rep_group = self.lord.execute(
+            DBNAME, "select system_id, replication_group from shardman.nodes where id={}".format(not_fruit_id))[0]
+        self.assertEqual(sys_id_and_rep_group[0], int(sys_id_and_rep_group[1]))
 
         # try to add existing node
         with self.assertRaises(testgres.QueryException) as cm:
@@ -241,7 +281,7 @@ class ShardmanTests(unittest.TestCase):
 
     def test_get_my_id(self):
         self.lord.start_lord()
-        yellow_fellow = self.lord.add_node(repl_group="banana")
+        yellow_fellow, _ = self.lord.add_node(repl_group="banana")
         self.assertTrue(int(
             yellow_fellow.execute(DBNAME,
                                   "select shardman.get_my_id()")[0][0]) > 0)
@@ -250,8 +290,7 @@ class ShardmanTests(unittest.TestCase):
     def test_rm_node(self):
         self.lord.start_lord()
         self.lord.add_node(repl_group="banana")
-        yellow_fellow = self.lord.add_node(repl_group="banana")
-        yf_id = yellow_fellow.execute(DBNAME, 'select shardman.get_my_id()')[0][0]
+        _, yf_id = self.lord.add_node(repl_group="banana")
         self.lord.safe_psql(DBNAME, 'select shardman.rm_node({})'.format(yf_id))
         self.assertEqual(1, len(self.lord.execute(
             DBNAME, "select * from shardman.nodes;")))
@@ -269,6 +308,7 @@ class ShardmanTests(unittest.TestCase):
             """)
         self.assertIn("add some nodes first", str(cm.exception))
 
+        # shard some table, make sure everyone sees it and replicas are good
         self.lord.create_cluster(3, 2)
         self.lord.safe_psql(
             DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
@@ -276,27 +316,8 @@ class ShardmanTests(unittest.TestCase):
             DBNAME,
             "insert into pt select generate_series(1, 1000), (random() * 100)::int")
 
-        luke_sum = int(self.lord.workers[0].execute(
-            DBNAME, sum_query("pt"))[0][0])
-        # check that every node sees the whole table
-        for worker in self.lord.workers[1:]:
-            worker_sum = int(worker.execute(
-                DBNAME, sum_query("pt"))[0][0])
-            self.assertEqual(luke_sum, worker_sum)
-
-        # check every replica integrity 
-        parts = self.lord.execute(
-            DBNAME, "select part_name, node_id from shardman.partitions")
-        for part_name, node_id in parts:
-            part_sum = self.lord.workers_dict[int(node_id)].execute(
-                DBNAME, sum_query(part_name))
-            replica_id = int(self.lord.execute(
-                DBNAME,
-                "select node_id from shardman.replicas where part_name = '{}'" \
-                .format(part_name))[0][0])
-            replica_sum = self.lord.workers_dict[replica_id].execute(
-                DBNAME, sum_query(part_name))
-            self.assertEqual(part_sum, replica_sum)
+        self.pt_everyone_sees_the_whole()
+        self.pt_replicas_integrity()
 
         # now rm table
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
@@ -305,6 +326,93 @@ class ShardmanTests(unittest.TestCase):
                 DBNAME, "select relname from pg_class where relname ~ '^pt.*';")
             self.assertEqual(len(ptrels), 0)
 
+        # now request too many replicas
+        with self.assertRaises(testgres.QueryException) as cm:
+            self.lord.safe_psql(DBNAME, """
+            select shardman.create_hash_partitions('pt', 'id', 30,
+            redundancy => 2);
+            """)
+        self.assertIn("redundancy 2 is too high", str(cm.exception))
+
+        self.lord.safe_psql(DBNAME, "drop table pt;")
+        self.lord.destroy_cluster()
+
+    def test_set_redundancy(self):
+        self.lord.create_cluster(2, 3)
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        # shard table without any replicas
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30);")
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int")
+        self.assertEqual(0, int(self.lord.execute(
+            DBNAME, "select count(*) from shardman.replicas;")[0][0]))
+
+        # now add two replicas to each part (2 replicas need changelog table
+        # creation, better to go through that code path too)
+        self.lord.safe_psql(
+            DBNAME, "select shardman.set_redundancy('pt', 2);")
+        # wait for sync
+        self.lord.safe_psql(DBNAME, "select shardman.ensure_redundancy();")
+        # and ensure their integrity
+        # must be exactly two replicas for each partition
+        self.pt_replicas_integrity(required_replicas=2)
+
+        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
+        self.lord.safe_psql(DBNAME, "drop table pt;")
+        self.lord.destroy_cluster()
+
+    def test_rebalance(self):
+        self.lord.create_cluster(2, 2)
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        # shard table
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int")
+
+        # now add new node to each repgroup
+        self.lord.add_node(repl_group="rg_0")
+        self.lord.add_node(repl_group="rg_1")
+
+        # rebalance parts and replicas
+        self.lord.safe_psql(DBNAME, "select shardman.rebalance('pt%')")
+        self.lord.safe_psql(DBNAME, "select shardman.rebalance_replicas('pt%')")
+
+        # make sure partitions are balanced
+        for rg in ["rg_0", "rg_1"]:
+            # max parts on node - min parts on node
+            diff = int(self.lord.execute(DBNAME, """
+            with parts_count as (
+	      select count(*) from shardman.partitions parts
+	      join shardman.nodes nodes on parts.node_id = nodes.id
+	      where nodes.replication_group = '{}'
+	      group by node_id
+	    )
+            select max(count) - min(count) from parts_count;
+            """.format(rg))[0][0])
+            self.assertTrue(diff <= 1)
+
+            diff_replicas = int(self.lord.execute(DBNAME, """
+            with replicas_count as (
+	      select count(*) from shardman.replicas replicas
+	      join shardman.nodes nodes on replicas.node_id = nodes.id
+	      where nodes.replication_group = '{}'
+	      group by node_id
+	    )
+            select max(count) - min(count) from replicas_count;
+            """.format(rg))[0][0])
+            self.assertTrue(diff_replicas <= 1)
+
+        # and data is consistent
+        self.pt_everyone_sees_the_whole()
+        self.pt_replicas_integrity()
+
+        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
         self.lord.safe_psql(DBNAME, "drop table pt;")
         self.lord.destroy_cluster()
 
@@ -473,7 +581,9 @@ b"""1
             DBNAME, "select string_agg(payload, '' order by id) from pt_text;")[0][0])
 
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt');")
+        self.lord.safe_psql(DBNAME, "drop table pt;")
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt_text');")
+        self.lord.safe_psql(DBNAME, "drop table pt_text;")
         self.lord.destroy_cluster()
 
 # We violate good practices and order the tests -- it doesn't make sense to
@@ -484,6 +594,8 @@ def suite():
     suite.addTest(ShardmanTests('test_get_my_id'))
     suite.addTest(ShardmanTests('test_rm_node'))
     suite.addTest(ShardmanTests('test_create_hash_partitions_and_rm_table'))
+    suite.addTest(ShardmanTests('test_set_redundancy'))
+    suite.addTest(ShardmanTests('test_rebalance'))
     suite.addTest(ShardmanTests('test_copy_from'))
     return suite
 
