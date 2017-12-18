@@ -23,9 +23,9 @@ partitions they keep. Currently shardlord can't keep usual data itself and
 is manually configured by the administrator.
 
 Some terminology:
-  * 'commands' is what constitutes shardman interface: functions for sharding
+  * 'commands' is what constitutes `pg_shardman` interface: functions for sharding
      management.
-  * 'shardlord' or 'lord' is postgres instance which manages sharding.
+  * 'shardlord' or 'lord' is Postgres instance which manages sharding.
   * 'worker nodes' or 'workers' are other nodes with data.
   * 'sharded table' is table managed by shardman.
   * 'shard' or 'partition' is any table containing part of sharded table.
@@ -38,30 +38,21 @@ Some terminology:
 Number of working nodes in cluster depends on number of servers you have, volume
 of data you are going to store and workload. Increasing number of nodes in
 cluster allows to store more data and provide better performance for some
-queries (which are not affecting all nodes). Number of nodes can be increased in
+queries (which are don't affect all nodes). Number of nodes can be increased in
 future. But from the very beginning you should properly choose number of shards
 (partitions) into which your table will be spitted, because we currently can't
 change that later. Obviously it should not be smaller than number of nodes,
-otherwise shardman will not be able to scatter data though all nodes.  Having
-one partition per node will provide the best performance, especially in case of
-using synchronous replication. But in this case you will not be able to add new
-nodes in future. Or, more precisely, you will be able to add new nodes, but not
-rebalance existed data between this new nodes. Also you will not be able to
+otherwise `pg_shardman` will not be able to scatter the data among all nodes.
+Having one partition per node will provide the best performance, especially in
+case of using synchronous replication. But in this case you will not be able to
+add new nodes in future. Or, more precisely, you will be able to add new nodes,
+but not rebalance existing data between them. Also you will not be able to
 address data skew, when some data is accessed much more often than other.
 
 That's why it is recommended to have number of shards about ten times larger
 then number of nodes. In this case you can increase number of nodes up to ten
 times and manually move partitions between nodes to provide more or less uniform
 load of all cluster nodes.
-
-If you want fault tolerance, you need to store data with
-redundancy. `pg_shardman` provides redundancy using logical replication.  In
-theory you can choose any redundancy level: from 0 to infinity. But right now
-having redundancy level larger than one doesn't have much sense. Even in case of
-using synchronous replication, failure of some of node of the cluster can cause
-different states of replicas of partition from the failed node. Shardman can't
-synchronize state of replicas and just randomly chooses one of them as new
-primary partition.
 
 ## Installation and configuration
 
@@ -324,13 +315,23 @@ using `monitor` function, see the reference below.
 Shardman doesn't support presently automatic failure detection and recovery. It
 has to be done manually by the DBA. If some node is down, its data is not
 available until either node rises or it is ruled out from the cluster by
-`rm_node` command, which also promotes replicas of partitions held by removed
-node. The general procedure for failover is the following.
+`rm_node` command. Moreover, if failed node holds replicas and sync replication
+is used, queries touching replicated partitions would block. When failed node is
+reestablished, data on it becomes reachable again and the node receives missed
+changes for holded replicas automatically. However, you should run
+`recover_xacts` or `monitor` functions to resolve possibly hanged distributed
+transactions.
+
+If failure is permanent and the node never intends to be up again, it should be
+excluded from the cluster with `rm_node` command. This function also promotes
+replicas of partitions held by removed node. The general procedure for failover
+is the following.
 * Make sure failed node is really turned off, and never make it online without
   erasing its state -- otherwise stale reads and inconsistent writes on it
   are possible.
 * Run `select shardman.rm_node(${failed_node_id}, force => true)` to exclude it
-  and promote replicas.
+  and promote replicas. The most advanced replica is choosen and state of other
+  replicas is synchronized.
 * Run `select shardman.recover_xacts()` to resolve possibly hanged 2PC
   transactions.
 
@@ -355,8 +356,9 @@ Apart from sharded tables, application may need to have local and/or shared
 tables.
 
 Local table stores data which is unique for the particular node. Usually it is
-some temporary data, for example temporary tables.  Local tables do not require
-any assistance from shardman: just create and use them locally at each node.
+some temporary data, for example temporary tables. Local tables do not require
+any assistance from `pg_shardman`: just create and use them locally at each
+node.
 
 Shared table can be used for dictionaries: rarely updated data required for all
 queries. Shardman stores shared table at one of cluster nodes (master) and
@@ -374,6 +376,10 @@ incremented on each add of a node.
 
 ### What else you can do with the cluster
 
+It is possible to remove table together with all its partitions and replicas
+using `shardman.rm_table(rel regclass)` function. Please be careful: it doesn't
+require any confirmation.
+
 It is possible to execute some SQL on all cluster nodes using
 `shardman.forall(cmd text, use_2pc bool = false, including_shardlord bool =
 false)` function.  But if you are going to alter sharded or shared table, you
@@ -381,22 +387,6 @@ should use `shardman.forall(rel regclass, alter_clause text)` function. You can
 also create new indices. It must be done per each partition separately,
 see
 [pathman docs](https://github.com/postgrespro/pg_pathman/wiki/How-do-I-create-indexes)
-
-Shardman doesn't support now automatic failure detection and recovery. It has to
-be done manually by DBA. Failed node should be excluded from the cluster using
-`shardman.rm_node(node_id int, force bool = false)` command.  To prevent
-unintentional loose of data, this function prohibit node deleting if there is
-some data located at this node. To allow deleting of such node set `force`
-parameter to `true`.
-
-If redundancy level is greater than zero, then shardman tries to replace
-partitions of the deleted node with replica. Right now random replica is used.
-In case of presence of more than one replica, shardman can not enforce
-consistency if all this replicas.
-
-It is possible to remove table together with all its partitions and replicas
-using `shardman.rm_table(rel regclass)` function. Please be careful: it doesn't
-require any confirmation.
 
 If shardlord has failed during command execution or you just feel that something
 goes wrong, run `shadman.recover()` function. It will verify nodes state
@@ -481,7 +471,7 @@ of sharded tables and can accept queries to them.
 Returns id of the new node.
 
 ```plpgsql
-get_my_id()
+get_my_id() returns int
 ```
 Get this worker's id. Executed on any worker node. Fails on shardlord.
 
@@ -596,29 +586,39 @@ Check consistency of cluster state against current metadata and perform recovery
 if needed (reconfigure LR channels, repair FDW, etc).
 
 ```plpgsql
-monitor(deadlock_check_timeout_sec int = 5, rm_node_timeout_sec int = 60)
+monitor(check_timeout_sec int = 5, rm_node_timeout_sec int = 60)
 ```
-Monitor cluster for presence of distributed deadlocks and node failures.
-This function is intended to be executed at shardlord and is redirected to shardlord been launched at any other node.
-It starts infinite loop which polls all clusters nodes, collecting local *lock graphs* from all nodes.
-Period of poll is specified by `deadlock_check_timeout_sec` parameter (default value is 5 seconds).
-Local lock graphs are combined into global lock graph which is analyzed for presence of loops.
-A loop in lock graph means distributed deadlock. Monitor function tries to resolve deadlock by canceling one or more backends
-involved in the deadlock loop (using `pg_cancel_backend` function, which is not actually terminate backend but tries to cancel current query).
-As far as not all backends are blocked in active query state, it may be needed send cancel several times.
-Right now canceled backend is randomly chosen within deadlock loop.
 
-Local local graphs collected from all nodes do not form consistent global snapshot, so there is possibility of false deadlocks:
-edges in deadlock loop correspond to different moment of times. To prevent false deadlock detection, monitor function
-doesn't react on detected deadlock immediately. Instead of it, previous deadlock loop located at previous iteration is compared with current deadlock
-loop and only if them are equal, then deadlock is reported and recovery is performed.
+Monitor cluster for presence of distributed deadlocks and node failures. This
+function is intended to be executed at shardlord and is redirected to shardlord
+been launched at any other node. It starts infinite loop which polls all
+clusters nodes, collecting local *lock graphs* from all nodes. Period of poll
+is specified by `check_timeout_sec` parameter (default value is 5 seconds).
+Local lock graphs are combined into global lock graph which is analyzed for the
+presence of loops. A loop in the lock graph means distributed deadlock. Monitor
+function tries to resolve deadlock by canceling one or more backends involved in
+the deadlock loop (using `pg_cancel_backend` function, which doesn't actually
+terminate backend but tries to cancel current query).  As far as not all
+backends are blocked in active query state, it may be needed send cancel several
+times. Canceled backend is randomly chosen within deadlock loop.
 
-If some node is unreachable then monitor function prints correspondent error message and retries access until
-`rm_node_timeout_sec` timeout expiration. After it node is removed from the cluster using `shardman.rm_node` function.
-If redundancy level is non-zero, then primary partitions from the disabled node are replaced with replicas.
-Finally shardman performs recovery of distributed transactions which coordinators were at failed node.
-It is done using `shardman.recover_xacts` function which collects status of distributed transaction at all participants and
-tries to make decision whether it should be committed or aborted.
+Since local graphs collected from all nodes do not form consistent global
+snapshot, false postives are possible: edges in deadlock loop correspond to
+different moment of times. To prevent false deadlock detection, monitor function
+doesn't react on detected deadlock immediately. Instead of it, previous deadlock
+loop located at previous iteration is compared with current deadlock loop and
+only if they are equal, deadlock is reported and resolving is performed.
+
+If some node is unreachable then monitor function prints correspondent error
+message and retries access until `rm_node_timeout_sec` timeout expiration. After
+it node is removed from the cluster using `shardman.rm_node` function.  If
+redundancy level is non-zero, then primary partitions from the disabled node are
+replaced with replicas.  Finally shardman performs recovery of distributed
+transactions which coordinators were at failed node.  It is done using
+`shardman.recover_xacts` function which collects status of distributed
+transaction at all participants and tries to make decision whether it should be
+committed or aborted.
+If `rm_node_timeout_sec` is `NULL`, `monitor` will not remove nodes.
 
 Function `shardman.recover_xacts` can be also implicitly invoked by database administrator after abnormal cluster restart to recover
 not completed distributed transactions. First of all it tries to obtain status of distributed transaction from its coordinator and only

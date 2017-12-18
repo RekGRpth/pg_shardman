@@ -49,14 +49,16 @@ CREATE TABLE tables (
 -- Main partitions
 CREATE TABLE partitions (
 	part_name text PRIMARY KEY,
-	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, -- node on which partition lies
+	 -- node on which partition lies
+	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
 	relation text NOT NULL REFERENCES tables(relation) ON DELETE CASCADE
 );
 
 -- Partition replicas
 CREATE TABLE replicas (
 	part_name text NOT NULL REFERENCES partitions(part_name) ON DELETE CASCADE,
-	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, -- node on which partition lies
+	-- node on which partition lies
+	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
 	relation text NOT NULL REFERENCES tables(relation) ON DELETE CASCADE,
 	PRIMARY KEY (part_name,node_id)
 );
@@ -590,7 +592,8 @@ DECLARE
 	subs text = '';
 	sub_options text = '';
 BEGIN
-	IF shardman.redirect_to_shardlord(format('set_redundancy(%L, %L)', rel_name, redundancy))
+	IF shardman.redirect_to_shardlord(format('set_redundancy(%L, %L)', rel_name,
+											 redundancy))
 	THEN
 		RETURN;
 	END IF;
@@ -605,10 +608,12 @@ BEGIN
 	FOR part IN SELECT * FROM shardman.partitions WHERE relation=rel_name
 	LOOP
 		-- Count number of replicas of this partition
-		SELECT count(*) INTO n_replicas FROM shardman.replicas WHERE part_name=part.part_name;
+		SELECT count(*) INTO n_replicas FROM shardman.replicas
+			WHERE part_name=part.part_name;
 		IF n_replicas < redundancy
 		THEN -- If it is smaller than requested...
-			SELECT replication_group INTO repl_group FROM shardman.nodes where id=part.node_id;
+			SELECT replication_group INTO repl_group FROM shardman.nodes
+				WHERE id=part.node_id;
 			-- ...then add requested number of replicas in corresponding replication group
 			FOR repl_node IN SELECT id FROM shardman.nodes
 				WHERE replication_group=repl_group AND id<>part.node_id AND NOT EXISTS
@@ -616,7 +621,8 @@ BEGIN
 				ORDER by random() LIMIT redundancy-n_replicas
 			LOOP
 				-- Insert information about new replica in replicas table
-				INSERT INTO shardman.replicas (part_name, node_id, relation) VALUES (part.part_name, repl_node, rel_name);
+				INSERT INTO shardman.replicas (part_name, node_id, relation)
+					VALUES (part.part_name, repl_node, rel_name);
 				-- Establish publications and subscriptions for this partition
 				pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 					 pubs, part.node_id, repl_node, part.part_name);
@@ -629,7 +635,10 @@ BEGIN
 	-- Broadcast alter publication commands
 	PERFORM shardman.broadcast(pubs, super_connstr => true);
 	-- Broadcast alter subscription commands
-	PERFORM shardman.broadcast(subs, synchronous => copy_data, super_connstr => true);
+	-- Initial tablesync creates temporary repslots, which wait until all xacts
+	-- started before snapshot creation end; because of that we must alter subs
+	-- sequentially, or deadlocks are possible.
+	PERFORM shardman.broadcast(subs, sequential => copy_data, super_connstr => true);
 
 	-- Maintain change log to be able to synchronize replicas after primary node failure
 	IF redundancy > 1
@@ -643,7 +652,8 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Wait completion of initial table sync for all replication subscriptions.
--- This function can be used after set_redundancy to ensure that partitions are copied to replicas.
+-- This function can be used after set_redundancy to ensure that partitions are
+-- copied to replicas.
 CREATE FUNCTION ensure_redundancy() RETURNS void AS $$
 DECLARE
 	src_node_id int;
@@ -704,7 +714,8 @@ BEGIN
 		drop1 := format('%s%s:DROP TABLE %I CASCADE;',
 			  drop1, node_id, rel_name);
 		-- Drop replicas and stub tables (which are replaced with foreign tables)
-		FOR pname IN SELECT part_name FROM shardman.partitions WHERE relation=rel_name
+		FOR pname IN SELECT part_name FROM shardman.partitions WHERE
+			relation = rel_name
 		LOOP
 			drop2 := format('%s%s:DROP TABLE IF EXISTS %I CASCADE;',
 			  	  drop2, node_id, pname);
@@ -745,7 +756,8 @@ DECLARE
 	repl_node_id int;
 	drop_slots text = '';
 BEGIN
-	IF shardman.redirect_to_shardlord(format('mv_partition(%L, %L)', mv_part_name, dst_node_id))
+	IF shardman.redirect_to_shardlord(format('mv_partition(%L, %L)', mv_part_name,
+											 dst_node_id))
 	THEN
 		RETURN;
 	END IF;
@@ -757,7 +769,9 @@ BEGIN
 	END IF;
 	src_node_id := part.node_id;
 
-	SELECT replication_group, super_connection_string INTO src_repl_group, conn_string FROM shardman.nodes WHERE id=src_node_id;
+	SELECT replication_group, super_connection_string
+	  INTO src_repl_group, conn_string
+	  FROM shardman.nodes WHERE id=src_node_id;
 	SELECT replication_group INTO dst_repl_group FROM shardman.nodes WHERE id=dst_node_id;
 
 	IF src_node_id = dst_node_id THEN
@@ -1759,27 +1773,29 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- prefix: node-id:sql-statement;
 -- To run multiple statements on node, wrap them in {}:
 -- {node-id:statement; statement;}
+-- All statements are run in one transaction.
+-- Don't specify node id twice with 2pc, we use only one prepared_xact name.
 -- Node id '0' means shardlord, shardlord_connstring guc is used.
--- Don't specify them separately with 2pc, we use only one prepared_xact name.
 -- No escaping is performed, so ';', '{' and '}' inside queries are not supported.
--- By default functions throws error is execution is failed at some of the
--- nodes, with ignore_errors=true errors are ignored and function returns string
--- with "Error:" prefix containing list of errors terminated by dots with
--- nodes prefixes.
--- In case of normal completion this function return list with node prefixes
--- separated by columns with single result for select queries or number of
--- affected rows for other commands.
--- If two_phase parameter is true, then each statement is wrapped in blocked and
--- prepared with subsequent commit or rollback of prepared transaction at second
--- phase of two phase commit.
+-- By default function throws error if execution has failed at some of the
+-- nodes. With ignore_errors=true errors are ignored and each error is appended
+-- to the function result in form of "<error>${node_id}:Something bad</error>"
+-- In case of normal completion this function returns comma-separated results
+-- for each run. A "result" is the first column of the first row of last
+-- statement.
+-- If two_phase parameter is true, then each statement is firstly prepared with
+-- subsequent commit or rollback of prepared transaction at second phase of two
+-- phase commit.
 -- If sync_commit_on is false, we set session synchronous_commit to local.
+-- If sequential is true, we send text cmd only when at least one statement for
+-- previous was already executed.
 -- If super_connstr is true, super connstring is used everywhere, usual
 -- connstr otherwise.
 CREATE FUNCTION broadcast(cmds text,
 						  ignore_errors bool = false,
 						  two_phase bool = false,
 						  sync_commit_on bool = false,
-						  synchronous bool = false,
+						  sequential bool = false,
 						  super_connstr bool = false)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
@@ -2118,34 +2134,54 @@ CREATE FUNCTION get_system_identifier()
 -- Type to represent vertex in lock graph
 create type process as (node int, pid int);
 
--- View to build lock graph which can be used to detect global deadlock
-CREATE VIEW lock_graph(wait,hold) AS
+-- View to build lock graph which can be used to detect global deadlock.
+-- Application_name is assumed pgfdw:$system_id:$coord_pid
+-- gid is assumed $pid:$count:$sys_id:$xid:$participants_count
+CREATE VIEW lock_graph(wait, hold) AS
+    -- If xact is already prepared, we take node and pid of the coordinator.
+	-- local dependencies
 	SELECT
 		ROW(shardman.get_my_id(),
 			wait.pid)::shardman.process,
-	 	ROW(CASE WHEN hold.pid IS NOT NULL THEN shardman.get_my_id() ELSE shardman.get_node_by_sysid(split_part(gid,':',3)::bigint) END,
-		    COALESCE(hold.pid, split_part(gid,':',1)::int))::shardman.process
-    FROM pg_locks wait, pg_locks hold LEFT OUTER JOIN pg_prepared_xacts twopc ON twopc.transaction=hold.transactionid
+	 	CASE WHEN hold.pid IS NOT NULL THEN
+		    ROW(shardman.get_my_id(), hold.pid)::shardman.process
+		ELSE -- prepared
+			ROW(shardman.get_node_by_sysid(split_part(gid, ':', 3)::bigint),
+				split_part(gid, ':', 1)::int)::shardman.process
+		END
+     FROM pg_locks wait, pg_locks hold LEFT OUTER JOIN pg_prepared_xacts twopc
+			  ON twopc.transaction=hold.transactionid
 	WHERE
 		NOT wait.granted AND wait.pid IS NOT NULL AND hold.granted
-		AND (wait.transactionid=hold.transactionid OR (wait.page=hold.page AND wait.tuple=hold.tuple))
-		AND (hold.pid IS NOT NULL OR twopc.gid IS NOT NULL)
+		-- this select captures waitings on xid and on, hm, tuples
+	    AND (wait.transactionid=hold.transactionid OR
+		    (wait.page=hold.page AND wait.tuple=hold.tuple))
+		AND (hold.pid IS NOT NULL OR twopc.gid IS NOT NULL) -- ???
 	UNION ALL
-	SELECT ROW(shardman.get_node_by_sysid(split_part(application_name,':',2)::bigint),
+	-- if this fdw backend is busy, potentially waiting, add edge coordinator -> fdw
+	SELECT ROW(shardman.get_node_by_sysid(split_part(application_name, ':', 2)::bigint),
 			   split_part(application_name,':',3)::int)::shardman.process,
 		   ROW(shardman.get_my_id(),
 			   pid)::shardman.process
 	FROM pg_stat_activity WHERE application_name LIKE 'pgfdw:%' AND wait_event<>'ClientRead'
 	UNION ALL
+	-- otherwise, coordinator itself is busy, potentially waiting, so add fdw ->
+	-- coordinator edge
 	SELECT ROW(shardman.get_my_id(),
 			   pid)::shardman.process,
 		   ROW(shardman.get_node_by_sysid(split_part(application_name,':',2)::bigint),
 			   split_part(application_name,':',3)::int)::shardman.process
 	FROM pg_stat_activity WHERE application_name LIKE 'pgfdw:%' AND wait_event='ClientRead';
 
--- Pack lock graph into string
+-- Pack lock graph into comma-separated string of edges like "2:17439->4:30046",
+-- i.e. pid 17439 on node 2 waits for pid 30046 on node 4
 CREATE FUNCTION serialize_lock_graph() RETURNS TEXT AS $$
-	SELECT COALESCE(string_agg((wait).node||':'||(wait).pid||'->'||(hold).node||':'||(hold).pid, ','),'') FROM shardman.lock_graph;
+	SELECT COALESCE(
+		string_agg((wait).node || ':' || (wait).pid || '->' ||
+				   (hold).node || ':' || (hold).pid,
+				   ','),
+		'')
+	FROM shardman.lock_graph;
 $$ LANGUAGE sql;
 
 -- Unpack lock graph from string
@@ -2154,7 +2190,7 @@ CREATE FUNCTION deserialize_lock_graph(edges text) RETURNS SETOF shardman.lock_g
 		       split_part(split_part(edge, '->', 1), ':', 2)::int)::shardman.process AS wait,
 	       ROW(split_part(split_part(edge, '->', 2), ':', 1)::int,
 		       split_part(split_part(edge, '->', 2), ':', 2)::int)::shardman.process AS hold
-	FROM regexp_split_to_table(edges, ',') edge WHERE edge<>'';
+	FROM regexp_split_to_table(edges, ',') edge WHERE edge <> '';
 $$ LANGUAGE sql;
 
 -- Collect lock graphs from all nodes
@@ -2179,23 +2215,30 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
--- Detect distributed deadlock and returns path in the lock graph forming deadlock loop
+-- Find all distributed deadlocks and for random one return path in the lock
+-- graph containing deadlock loop.
+-- We go from each vertex in all directions until either there is nowhere to go
+-- to or loop is discovered. It means that for each n-vertex-loop n paths
+-- starting at different vertices are actually found, though we return only one.
+-- Note that it doesn't neccessary returns path contatins ONLY the loop:
+-- non-empty inital tail is perfectly possible.
 CREATE FUNCTION detect_deadlock(lock_graph text) RETURNS shardman.process[] AS $$
 	WITH RECURSIVE LinkTable AS (SELECT wait AS Parent, hold AS Child FROM shardman.deserialize_lock_graph(lock_graph)),
 	cte AS (
 		SELECT Child, Parent, ARRAY[Child] AS AllParents, false AS Loop
   	  	FROM LinkTable
 	  	UNION ALL
-	  	SELECT c.Child, c.Parent, p.AllParents||c.Child, c.Child=ANY(p.AllParents)
+	  	SELECT c.Child, c.Parent, p.AllParents || c.Child, c.Child = ANY(p.AllParents)
 	 	FROM LinkTable c JOIN cte p	ON c.Parent = p.Child AND NOT p.Loop
 	)
-	SELECT AllParents FROM cte WHERE Loop;
+	SELECT AllParents FROM cte WHERE Loop LIMIT 1;
 $$ LANGUAGE sql;
 
 -- Monitor cluster for presence of distributed deadlocks and node failures.
--- Tries to cancel queries causing deadlock and exclude unavailable nodes from the cluster.
-CREATE FUNCTION monitor(deadlock_check_timeout_sec int = 5, rm_node_timeout_sec int = 60) RETURNS void AS $$
+-- Tries to cancel queries causing deadlock and exclude unavailable nodes from
+-- the cluster.
+CREATE FUNCTION monitor(check_timeout_sec int = 5,
+						rm_node_timeout_sec int = 60) RETURNS void AS $$
 DECLARE
 	prev_deadlock_path shardman.process[];
 	deadlock_path shardman.process[];
@@ -2210,30 +2253,30 @@ DECLARE
 	error_end int;
 	error_msg text;
 	error_node_id int;
-	failed_node_id int;
+	failed_node_id int := null;
 	failure_timestamp timestamp with time zone;
 BEGIN
-	IF shardman.redirect_to_shardlord(format('monitor(%s, %s)', deadlock_check_timeout_sec, rm_node_timeout_sec))
+	IF shardman.redirect_to_shardlord(format('monitor(%s, %s)', check_timeout_sec, rm_node_timeout_sec))
 	THEN
 		RETURN;
 	END IF;
 
-	RAISE NOTICE 'Start cluster monitor...';
+	RAISE NOTICE 'Start cluster monitoring...';
 
 	LOOP
 		resp := shardman.global_lock_graph();
 		error_begin := position('<error>' IN resp);
-		IF error_begin<>0
+		IF error_begin <> 0
 		THEN
 			error_end := position('</error>' IN resp);
 			sep := position(':' IN resp);
 			error_node_id := substring(resp FROM error_begin+7 FOR sep-error_begin-7)::int;
 			error_msg := substring(resp FROM sep+1 FOR error_end-sep-1);
-			IF error_node_id = failed_node_id
+			IF error_node_id = failed_node_id and rm_node_timeout_sec IS NOT NULL
 			THEN
 				IF clock_timestamp() > failure_timestamp + rm_node_timeout_sec * interval '1 sec'
 				THEN
-					RAISE NOTICE 'Remove node % because of % timeout expiration', failed_node_id, rm_node_timeout_sec;
+					RAISE NOTICE 'Removing node % because of % timeout expiration', failed_node_id, rm_node_timeout_sec;
 					PERFORM shardman.broadcast(format('0:SELECT shardman.rm_node(%s, force=>true);', failed_node_id));
 					PERFORM shardman.broadcast('0:SELECT shardman.recover_xacts();');
 					failed_node_id := null;
@@ -2247,6 +2290,7 @@ BEGIN
 		ELSE
 			failed_node_id := null;
 			deadlock_path := shardman.detect_deadlock(resp);
+			-- pick out the loop itself
 			loop_end := array_upper(deadlock_path, 1);
 			loop_begin := array_position(deadlock_path, deadlock_path[loop_end]);
 			-- Check if old and new lock graph contain the same subgraph.
@@ -2254,6 +2298,8 @@ BEGIN
 			-- collected global local graph can contain "false" loops.
 			-- So we report deadlock only if detected loop persists during
 			-- deadlock detection period.
+			-- We count upon that not only the loop, but the sequence of visited
+			-- nodes is the same
 			IF prev_deadlock_path IS NOT NULL
 			   AND loop_end - loop_begin = prev_loop_end - prev_loop_begin
 			   AND deadlock_path[loop_begin:loop_end] = prev_deadlock_path[prev_loop_begin:prev_loop_end]
@@ -2268,7 +2314,7 @@ BEGIN
 			prev_loop_begin := loop_begin;
 			prev_loop_end := loop_end;
 		END IF;
-		PERFORM pg_sleep(deadlock_check_timeout_sec);
+		PERFORM pg_sleep(check_timeout_sec);
 	END LOOP;
 END;
 $$ LANGUAGE plpgsql;

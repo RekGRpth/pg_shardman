@@ -11,6 +11,7 @@
 import unittest
 import logging
 import os
+import threading
 from time import sleep
 from contextlib import contextmanager
 
@@ -23,7 +24,7 @@ NODE_NAMES = ["Luke", "C3PO", "Palpatine", "DarthMaul", "jabba", "bobafett"]
 
 class Shardlord(PostgresNode):
     def __init__(self, name, port=None):
-        # worker_id -> PostgresNode
+        # worker_id (int) -> PostgresNode
         self.workers_dict = {}
         # list of allocated, but currently not used workers
         self.reserved_workers = []
@@ -80,7 +81,7 @@ class Shardlord(PostgresNode):
         return self
 
     # create fresh cluster with given num of repgroups and nodes in each one
-    def create_cluster(self, num_repgroups, nodes_in_repgroup):
+    def create_cluster(self, num_repgroups, nodes_in_repgroup=1):
         self.destroy_cluster()
         self.start_lord()
         for rgnum in range(num_repgroups):
@@ -415,6 +416,101 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
         self.lord.safe_psql(DBNAME, "drop table pt;")
         self.lord.destroy_cluster()
+
+    def test_deadlock_detector(self):
+        self.lord.create_cluster(2)
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 4)")
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 100), (random() * 100)::int")
+
+        node_1_part = self.lord.execute(
+            DBNAME,
+            "select part_name from shardman.partitions where node_id = 1;")[0][0]
+
+        # take parts & keys from node 1 and node 2 to work with
+        node_1, node_2 = self.lord.workers_dict[1], self.lord.workers_dict[2]
+        node_1_part = self.lord.execute(
+            DBNAME,
+            "select part_name from shardman.partitions where node_id = 1;")[0][0]
+        node_1_key = node_1.execute(
+            DBNAME, "select id from {} limit 1;".format(node_1_part))[0][0]
+        node_2_part = self.lord.execute(
+            DBNAME,
+            "select part_name from shardman.partitions where node_id = 2;")[0][0]
+        node_2_key = node_2.execute(
+            DBNAME, "select id from {} limit 1;".format(node_2_part))[0][0]
+
+        # Induce deadlock. It would be much better to use async db connections,
+        # but pg8000 doesn't support them, and we generally aim at portability
+        def xact_1():
+            with node_1.connect() as con:
+                con.begin()
+                con.execute("update pt set payload = 42 where id = {}" \
+                            .format(node_1_key))
+                barrier.wait()
+                try:
+                    con.execute("update pt set payload = 43 where id = {}" \
+                                .format(node_2_key))
+                except Exception as e:
+                    if "canceling statement due to user request" in str(e):
+                        global xact_1_aborted
+                        xact_1_aborted = True
+
+        def xact_2():
+            with node_1.connect() as con:
+                con.begin()
+                con.execute("update pt set payload = 42 where id = {}" \
+                            .format(node_2_key))
+                barrier.wait()
+                try:
+                    con.execute("update pt set payload = 43 where id = {}" \
+                                .format(node_1_key))
+                except Exception as e:
+                    if "canceling statement due to user request" in str(e):
+                        global xact_2_aborted
+                        xact_2_aborted = True
+
+        barrier = threading.Barrier(2)
+        global xact_1_aborted
+        global xact_2_aborted
+        xact_1_aborted, xact_2_aborted = False, False
+        t1 = threading.Thread(target=xact_1, args=())
+        t1.start()
+        t2 = threading.Thread(target=xact_2, args=())
+        t2.start()
+        # monitor for some time
+        try:
+            with self.lord.connect() as con:
+                con.execute("set statement_timeout = '3s'")
+                con.execute("select shardman.monitor(deadlock_check_timeout_sec => 1)")
+        except:
+            pass
+        t1.join(5)
+        self.assertTrue(not t1.is_alive())
+        t2.join(5)
+        self.assertTrue(not t2.is_alive())
+        self.assertTrue(xact_1_aborted or xact_2_aborted)
+
+        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
+        self.lord.safe_psql(DBNAME, "drop table pt;")
+        self.lord.destroy_cluster();
+
+    def test_worker_failover(self):
+        self.lord.create_cluster(3, 2)
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int default 1);')
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 10000), (random() * 100)::int")
+        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
+        self.lord.safe_psql(DBNAME, "drop table pt;")
+        self.lord.destroy_cluster();
 
     def test_copy_from(self):
         self.lord.create_cluster(3, 2)

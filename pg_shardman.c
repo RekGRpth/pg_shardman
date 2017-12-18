@@ -113,6 +113,10 @@ is_shardlord(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(is_lord);
 }
 
+/*
+ * Wait until PQgetResult would certainly be non-blocking. Returns true if
+ * everything is ok, false on error.
+ */
 static bool
 wait_command_completion(PGconn* conn)
 {
@@ -137,7 +141,7 @@ wait_command_completion(PGconn* conn)
 				return false;
 		}
 	}
-	return  true;
+	return true;
 }
 
 typedef struct
@@ -163,11 +167,11 @@ broadcast(PG_FUNCTION_ARGS)
 	char* fetch_node_connstr;
 	int   rc;
 	int   node_id;
-	int   n;
+	int	  n;
 	char* conn_str;
 	int   n_cmds = 0;
 	int   i;
-	int n_cons = 1024;
+	int n_cons = 1024; /* num of channels allocated currently */
 	Channel* chan;
 	PGconn* con;
 	StringInfoData resp;
@@ -181,6 +185,7 @@ broadcast(PG_FUNCTION_ARGS)
 	SPI_connect();
 	chan = (Channel*) palloc(sizeof(Channel) * n_cons);
 
+	/* Open connections and send all queries */
 	while ((sep = strchr(cmd, *cmd == '{' ? '}' : ';')) != NULL)
 	{
 		*sep = '\0';
@@ -189,9 +194,10 @@ broadcast(PG_FUNCTION_ARGS)
 			cmd += 1;
 		rc = sscanf(cmd, "%d:%n", &node_id, &n);
 		if (rc != 1) {
-			elog(ERROR, "SHARDMAN: Invalid command string: '%s' in '%s'", cmd, sql_full);
+			elog(ERROR, "SHARDMAN: Invalid command string: '%s' in '%s'",
+				 cmd, sql_full);
 		}
-		sql = cmd + n;
+		sql = cmd + n; /* eat node id and colon */
 		cmd = sep + 1;
 		if (node_id != 0)
 		{
@@ -205,7 +211,8 @@ broadcast(PG_FUNCTION_ARGS)
 			}
 			pfree(fetch_node_connstr);
 
-			conn_str = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+			conn_str = SPI_getvalue(SPI_tuptable->vals[0],
+									SPI_tuptable->tupdesc, 1);
 		}
 		else
 		{
@@ -251,7 +258,7 @@ broadcast(PG_FUNCTION_ARGS)
 				sql = psprintf("SET SESSION synchronous_commit TO local; %s", sql);
 			}
 		}
-		elog(DEBUG1, "Send command '%s' to node %d", sql, node_id);
+		elog(DEBUG1, "Sending command '%s' to node %d", sql, node_id);
 		if (!PQsendQuery(con, sql)
 			|| (sequential && !wait_command_completion(con)))
 		{
@@ -273,6 +280,9 @@ broadcast(PG_FUNCTION_ARGS)
 		elog(ERROR, "SHARDMAN: Junk at end of command list: %s", cmd);
 	}
 
+	/*
+	 * Now collect results
+	 */
 	for (i = 0; i < n_cmds; i++)
 	{
 		PGresult* next_res;
@@ -287,6 +297,7 @@ broadcast(PG_FUNCTION_ARGS)
 			continue;
 		}
 
+		/* Skip all but the last result */
 		while ((next_res = PQgetResult(con)) != NULL)
 		{
 			if (res != NULL)
@@ -295,6 +306,7 @@ broadcast(PG_FUNCTION_ARGS)
 			}
 			res = next_res;
 		}
+
 		if (res == NULL)
 		{
 			if (ignore_errors)
@@ -308,7 +320,7 @@ broadcast(PG_FUNCTION_ARGS)
 			goto cleanup;
 		}
 
-		/* Ok, result was successfully fetched */
+		/* Ok, result was successfully fetched, add it to resp */
 		status = PQresultStatus(res);
 		if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK)
 		{
@@ -357,6 +369,7 @@ broadcast(PG_FUNCTION_ARGS)
 		}
 		PQclear(res);
 	}
+
   cleanup:
 	for (i = 0; i < n_cmds; i++)
 	{
