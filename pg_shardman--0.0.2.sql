@@ -2137,9 +2137,13 @@ create type process as (node int, pid int);
 -- View to build lock graph which can be used to detect global deadlock.
 -- Application_name is assumed pgfdw:$system_id:$coord_pid
 -- gid is assumed $pid:$count:$sys_id:$xid:$participants_count
+-- Currently we are oblivious about lock modes and report any wait -> hold edge
+-- on the same object and therefore might produce false loops. Furthermore,
+-- we have not idea about locking queues here. Probably it is better to use
+-- pg_blocking_pids, but it seems to ignore prepared xacts.
 CREATE VIEW lock_graph(wait, hold) AS
-    -- If xact is already prepared, we take node and pid of the coordinator.
 	-- local dependencies
+    -- If xact is already prepared, we take node and pid of the coordinator.
 	SELECT
 		ROW(shardman.get_my_id(),
 			wait.pid)::shardman.process,
@@ -2152,11 +2156,19 @@ CREATE VIEW lock_graph(wait, hold) AS
      FROM pg_locks wait, pg_locks hold LEFT OUTER JOIN pg_prepared_xacts twopc
 			  ON twopc.transaction=hold.transactionid
 	WHERE
-		NOT wait.granted AND wait.pid IS NOT NULL AND hold.granted
-		-- this select captures waitings on xid and on, hm, tuples
-	    AND (wait.transactionid=hold.transactionid OR
-		    (wait.page=hold.page AND wait.tuple=hold.tuple))
-		AND (hold.pid IS NOT NULL OR twopc.gid IS NOT NULL) -- ???
+		NOT wait.granted AND wait.pid IS NOT NULL AND hold.granted AND
+		-- waiter waits for the the object holder locks
+		wait.database IS NOT DISTINCT FROM hold.database AND
+		wait.relation IS NOT DISTINCT FROM hold.relation AND
+		wait.page IS NOT DISTINCT FROM hold.page AND
+		wait.tuple IS NOT DISTINCT FROM hold.tuple AND
+		wait.virtualxid IS NOT DISTINCT FROM hold.virtualxid AND
+		wait.transactionid IS NOT DISTINCT FROM hold.transactionid AND -- waiting on xid
+		wait.classid IS NOT DISTINCT FROM hold.classid AND
+		wait.objid IS NOT DISTINCT FROM hold.objid AND
+		wait.objsubid IS NOT DISTINCT FROM hold.objsubid AND
+		 -- this is most probably truism, but who knows
+		(hold.pid IS NOT NULL OR twopc.gid IS NOT NULL)
 	UNION ALL
 	-- if this fdw backend is busy, potentially waiting, add edge coordinator -> fdw
 	SELECT ROW(shardman.get_node_by_sysid(split_part(application_name, ':', 2)::bigint),
@@ -2276,7 +2288,7 @@ BEGIN
 			THEN
 				IF clock_timestamp() > failure_timestamp + rm_node_timeout_sec * interval '1 sec'
 				THEN
-					RAISE NOTICE 'Removing node % because of % timeout expiration', failed_node_id, rm_node_timeout_sec;
+					RAISE NOTICE 'Removing node % because of % sec timeout expiration', failed_node_id, rm_node_timeout_sec;
 					PERFORM shardman.broadcast(format('0:SELECT shardman.rm_node(%s, force=>true);', failed_node_id));
 					PERFORM shardman.broadcast('0:SELECT shardman.recover_xacts();');
 					failed_node_id := null;
@@ -2304,7 +2316,10 @@ BEGIN
 			   AND loop_end - loop_begin = prev_loop_end - prev_loop_begin
 			   AND deadlock_path[loop_begin:loop_end] = prev_deadlock_path[prev_loop_begin:prev_loop_end]
 			THEN
-				-- Try to cancel random node in loop
+				-- Try to cancel random node in loop.
+				-- If the victim is not executing active query at the moment,
+				-- pg_cancel_backend can't do anything with xact; because of that,
+				-- we probably need to repeat it several times
 				victim := deadlock_path[loop_begin + ((loop_end - loop_begin)*random())::integer];
 				RAISE NOTICE 'Detect deadlock: cancel process % at node %', victim.pid, victim.node;
 				PERFORM shardman.broadcast(format('%s:SELECT pg_cancel_backend(%s);',

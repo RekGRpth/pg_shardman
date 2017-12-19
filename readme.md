@@ -592,15 +592,15 @@ monitor(check_timeout_sec int = 5, rm_node_timeout_sec int = 60)
 Monitor cluster for presence of distributed deadlocks and node failures. This
 function is intended to be executed at shardlord and is redirected to shardlord
 been launched at any other node. It starts infinite loop which polls all
-clusters nodes, collecting local *lock graphs* from all nodes. Period of poll
-is specified by `check_timeout_sec` parameter (default value is 5 seconds).
-Local lock graphs are combined into global lock graph which is analyzed for the
+clusters nodes, collecting local *lock graphs* from all nodes. Period of poll is
+specified by `check_timeout_sec` parameter (default value is 5 seconds).  Local
+lock graphs are combined into global lock graph which is analyzed for the
 presence of loops. A loop in the lock graph means distributed deadlock. Monitor
 function tries to resolve deadlock by canceling one or more backends involved in
 the deadlock loop (using `pg_cancel_backend` function, which doesn't actually
-terminate backend but tries to cancel current query).  As far as not all
-backends are blocked in active query state, it may be needed send cancel several
-times. Canceled backend is randomly chosen within deadlock loop.
+terminate backend but tries to cancel current query). Canceled backend is
+randomly chosen within deadlock loop. Since not all deadlock members are
+hanged in 'active query' state, it might be needed to send cancel several times.
 
 Since local graphs collected from all nodes do not form consistent global
 snapshot, false postives are possible: edges in deadlock loop correspond to
@@ -627,12 +627,13 @@ if it is not available, performs voting among all nodes.
 ```plpgsql
 wipe_state(drop_slots_with_fire bool DEFAULT true)
 ```
-Remove unilaterally all publications, subscriptions and replication slots
-created on the worker node by `pg_shardman`. PostgreSQL forbids to drop
-replication slot with active connection; if `drop_slots_with_fire` is true, we
-will try to kill the walsenders before dropping the slots. Also, immediately
-after transaction commit set `synchronous_standby_names` GUC to empty string --
-this is a non-transactional action and there is a very small chance it won't be
+Remove unilaterally all publications, subscriptions, replication slots, foreign
+servers and user mappings created on the worker node by
+`pg_shardman`. PostgreSQL forbids to drop replication slot with active
+connection; if `drop_slots_with_fire` is true, we will try to kill the
+walsenders before dropping the slots. Also, immediately after transaction commit
+set `synchronous_standby_names` GUC to empty string -- this is a
+non-transactional action and there is a very small chance it won't be
 completed. You probably want to run it before `DROP EXTENSION pg_shardman`.
 Data is not touched by this command.
 
