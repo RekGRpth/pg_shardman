@@ -265,7 +265,7 @@ it between replication groups. Functions
 `shardman.rebalance_replicas(replica_pattern text = '%')` try to
 distribute partitions/replicas which names are `LIKE` given pattern uniformly
 between all nodes of their replication groups. In `pg_shardman`, partitions are
-called `${sharded_table_num}_${part_num}`. For instance, if you have sharded
+called `$sharded_table_num_$part_num`. For instance, if you have sharded
 table `horns`, issuing `shardman.rebalance('horns%')` should be enough to
 rebalance its partitions. These functions move partitions/replicas sequentially,
 one at time. We pretend that is was done to minimize the impact on the normal
@@ -284,8 +284,8 @@ destination node; for replica it is also necessary to specify the source node.
 
 ### Transactions
 
-Atomicity and durability of transactions touching only single node is handled as
-usual in PostgreSQL, which does a pretty good job at that. However, without
+Atomicity and durability of transactions touching only single node is handled by
+vanilla PostgreSQL, which does a pretty good job at that. However, without
 special arrangments result of cross-node transaction might be non-atomic: if
 coordinator (node where transaction started) has committed it on some nodes and
 then something went wrong (e.g. it failed), the transaction will be aborted on
@@ -302,10 +302,10 @@ consistent behaviour of all nodes.
 The problem is that presently `PREPARE` is not transferred via logical
 replication to replicas, which means that in case of permanent node failure we
 still might lost part of distributed transaction and get non-atomic result if
-primary has prepared the transaction, but failed without committing it and now
-replica has no idea about it. Properly implemented `PREPARE` going over logical
-replication will also mitigate the possibilty of losing transactions described
-in 'Replication' section, and we plan to do that.
+primary has prepared the transaction, but died without committing it and now
+replica has no idea about the xact. Properly implemented `PREPARE` going over
+logical replication will also mitigate the possibilty of losing transactions
+described in 'Replication' section, and we plan to do that.
 
 Similarly, if transactions affect only single nodes, plain PostgreSQL isolation
 rules are applicable. However, for distributed transactions we need distributed
@@ -336,7 +336,7 @@ is the following.
 * Make sure failed node is really turned off, and never make it online without
   erasing its state -- otherwise stale reads and inconsistent writes on it
   are possible.
-* Run `select shardman.rm_node(${failed_node_id}, force => true)` to exclude it
+* Run `select shardman.rm_node($failed_node_id, force => true)` to exclude it
   and promote replicas. The most advanced replica is choosen and state of other
   replicas is synchronized.
 * Run `select shardman.recover_xacts()` to resolve possibly hanged 2PC
@@ -626,16 +626,26 @@ If some node is unreachable then monitor function prints correspondent error
 message and retries access until `rm_node_timeout_sec` timeout expiration. After
 it node is removed from the cluster using `shardman.rm_node` function.  If
 redundancy level is non-zero, then primary partitions from the disabled node are
-replaced with replicas.  Finally shardman performs recovery of distributed
+replaced with replicas.  Finally `pg_shardman` performs recovery of distributed
 transactions which coordinators were at failed node.  It is done using
-`shardman.recover_xacts` function which collects status of distributed
+`shardman.recover_xacts()` function which collects status of distributed
 transaction at all participants and tries to make decision whether it should be
 committed or aborted.
 If `rm_node_timeout_sec` is `NULL`, `monitor` will not remove nodes.
 
-Function `shardman.recover_xacts` can be also implicitly invoked by database administrator after abnormal cluster restart to recover
-not completed distributed transactions. First of all it tries to obtain status of distributed transaction from its coordinator and only
-if it is not available, performs voting among all nodes.
+Function `shardman.recover_xacts()` can be also manually invoked by database
+administrator on shardlord after abnormal cluster restart to recover not
+completed distributed transactions. If the coordinator is still in the cluster,
+we ask it about transaction outcome. Otherwise, we inquire every node's opinion
+on the xact; if there is at least one commit (and no aborts), we commit it, if
+there is at least one abort (and no commits), we abort it. All nodes in the
+cluster must be online to let this function resolve the transaction. Patched
+Postgres is needed for proper work of this function.
+
+Another limitation of `shardman.recover_xacts` is that we currently don't
+control recycling of WAL and clog used to check for completed transaction
+status. Though unlikely, theoretically it is possible that we won't be able to
+learn it and resolve the transaction.
 
 ```plpgsql
 wipe_state(drop_slots_with_fire bool DEFAULT true)

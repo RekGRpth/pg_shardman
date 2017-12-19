@@ -1562,7 +1562,19 @@ END
 $$ LANGUAGE plpgsql;
 
 
--- Commit or rollback not completed distributed transactions
+-- Commit or rollback not completed distributed transactions.
+-- All nodes must be alive for this to do something.
+-- If coordinator is still in the cluster, we just try asking it.
+-- If not, and there is only one participant, we simply commit the xact.
+-- If n_participants > 1, and xact is prepared everywhere, commit it.
+-- Otherwise, check WAL of every node; if COMMIT is found, COMMIT, if ABORT
+-- is found, ABORT.
+--
+-- Currently this function is not too hasty because
+-- * We make totally independent decisions for each 'prepare'.
+-- * We never know the participants and poll all nodes in the cluster.
+-- * If coordinator is excluded, we sequentially examine WAL of *all* nodes to
+--   learn the outcome, even where xact is prepared.
 CREATE FUNCTION recover_xacts() RETURNS void AS $$
 DECLARE
 	node_id int;
@@ -1590,7 +1602,9 @@ BEGIN
 
 	FOR node_id IN SELECT id FROM shardman.nodes
 	LOOP
-		cmds := format('%s%s:SELECT string_agg(''%s=>''||gid, '','') FROM pg_prepared_xacts;', cmds, node_id, node_id);
+		cmds := format($cmd$
+			%s%s:SELECT coalesce(string_agg('%s=>' || gid, ','), '') FROM pg_prepared_xacts;$cmd$,
+			cmds, node_id, node_id);
 	END LOOP;
 
 	-- Collected prepared xacts from all nodes
@@ -1625,7 +1639,7 @@ BEGIN
 					n_prepared := n_prepared + counter::int;
 				END LOOP;
 
-				IF n_prepared=n_participants
+				IF n_prepared = n_participants
 				THEN
 					RAISE NOTICE 'Commit distributed transaction % which is prepared at all participant nodes', gid;
 					finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
@@ -1635,16 +1649,19 @@ BEGIN
 
 					IF EXISTS (SELECT * FROM pg_proc WHERE proname='pg_prepared_xact_status')
 					THEN
-						-- Without coordinator there is no standard way to get status of this distributed transaction.
-						-- Use PGPRO-EE pg_prepared_xact_status() function if available
+						-- Without coordinator there is no standard way to get
+						-- status of this distributed transaction. Use PGPRO-EE
+						-- pg_prepared_xact_status() function if available
 						cmds := '';
 						FOR node_id IN SELECT id FROM shardman.nodes
 						LOOP
-							cmds := format('%s%s:SELECT pg_prepared_xact_status(%L);', cmds, node_id, gid);
+							cmds := format('%s%s:SELECT pg_prepared_xact_status(%L);',
+										   cmds, node_id, gid);
 						END LOOP;
 						SELECT shardman.broadcast(cmds) INTO resp;
 
-						-- Collect information about distributed transaction status at all nodes
+						-- Collect information about distributed transaction
+						-- status at all nodes
 						do_commit := false;
 						do_rollback := false;
 						FOREACH status IN ARRAY string_to_array(resp, ',')
@@ -1662,9 +1679,10 @@ BEGIN
 						THEN
 							IF do_rollack
 							THEN
-								RAISE NOTICE 'Inconsistent state of transaction %', gid;
+								RAISE WARNING 'Inconsistent state of transaction %',
+								gid;
 							ELSE
-								RAISE NOTICE 'Commit transaction %s at node % because if was committed at one of participants',
+								RAISE NOTICE 'Committing transaction %s at node % because it was committed at one of participants',
 									gid, xact_node_id;
 								finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
 							END IF;
@@ -1674,24 +1692,29 @@ BEGIN
 								gid, xact_node_id;
 							finish := format('%s%s:ROLLBACK PREPARED %L;', finish, xact_node_id, gid);
 						ELSE
-							RAISE NOTICE 'Can not make any decision concerning distributes transaction %', gid;
+							RAISE NOTICE 'Can''t make any decision concerning distributed transaction %', gid;
 						END IF;
 					END IF;
 				END IF;
 			ELSE
-				RAISE NOTICE 'Commit transaction % with single participant %', gid, xact_node_id;
+				RAISE NOTICE 'Committing transaction % with single participant %', gid, xact_node_id;
 				finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
 			END IF;
 		ELSE
 			-- Check status of transaction at coordinator
-			SELECT shardman.broadcast(format('%s:SELECT txid_status(%s);', coordinator, xid)) INTO status;
-			RAISE NOTICE 'Status of distributed transaction % is % at coordinator %', gid, status, coordinator;
+			SELECT shardman.broadcast(format('%s:SELECT txid_status(%s);', coordinator, xid))
+			  INTO status;
+			RAISE NOTICE 'Status of distributed transaction % is % at coordinator %',
+				gid, status, coordinator;
 			IF status='committed'
 			THEN
 				finish := format('%s%s:COMMIT PREPARED %L;', finish, xact_node_id, gid);
 			ELSIF status='aborted'
 			THEN
 				finish := format('%s%s:ROLLBACK PREPARED %L;', finish, xact_node_id, gid);
+			ELSEIF status IS NULL
+			THEN
+				RAISE WARNING ''
 			END IF;
 		END IF;
 	END LOOP;
