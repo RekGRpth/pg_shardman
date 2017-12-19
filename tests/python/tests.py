@@ -249,6 +249,11 @@ class ShardmanTests(unittest.TestCase):
                     DBNAME, sum_query(part_name))
                 self.assertEqual(part_sum, replica_sum)
 
+    def pt_cleanup(self):
+        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
+        self.lord.safe_psql(DBNAME, "drop table pt;")
+        self.lord.destroy_cluster();
+
     # tests
 
     def test_add_node(self):
@@ -361,9 +366,7 @@ class ShardmanTests(unittest.TestCase):
         # must be exactly two replicas for each partition
         self.pt_replicas_integrity(required_replicas=2)
 
-        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
-        self.lord.safe_psql(DBNAME, "drop table pt;")
-        self.lord.destroy_cluster()
+        self.pt_cleanup()
 
     def test_rebalance(self):
         self.lord.create_cluster(2, 2)
@@ -413,9 +416,7 @@ class ShardmanTests(unittest.TestCase):
         self.pt_everyone_sees_the_whole()
         self.pt_replicas_integrity()
 
-        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
-        self.lord.safe_psql(DBNAME, "drop table pt;")
-        self.lord.destroy_cluster()
+        self.pt_cleanup()
 
     def test_deadlock_detector(self):
         self.lord.create_cluster(2)
@@ -486,7 +487,7 @@ class ShardmanTests(unittest.TestCase):
         try:
             with self.lord.connect() as con:
                 con.execute("set statement_timeout = '3s'")
-                con.execute("select shardman.monitor(deadlock_check_timeout_sec => 1)")
+                con.execute("select shardman.monitor(check_timeout_sec => 1)")
         except:
             pass
         t1.join(5)
@@ -495,12 +496,11 @@ class ShardmanTests(unittest.TestCase):
         self.assertTrue(not t2.is_alive())
         self.assertTrue(xact_1_aborted or xact_2_aborted)
 
-        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
-        self.lord.safe_psql(DBNAME, "drop table pt;")
-        self.lord.destroy_cluster();
+        self.pt_cleanup()
 
+    # WIP
     def test_worker_failover(self):
-        self.lord.create_cluster(3, 2)
+        self.lord.create_cluster(2, 2)
         self.lord.safe_psql(
             DBNAME, 'create table pt(id int primary key, payload int default 1);')
         self.lord.safe_psql(

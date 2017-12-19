@@ -172,7 +172,7 @@ on shardlord with usual `CREATE TABLE` DDL and execute
 `shardman.create_hash_partitions` function, for example
 
 ```plpgsql
-CRATE TABLE horns (id int, branchness int);
+CRATE TABLE horns (id int primary key, branchness int);
 select create_hash_partitions('horns', 'id', 30, redundancy = 1)
 ```
 
@@ -181,7 +181,7 @@ On successfull execution, table `horns` will be hash-sharded into 30 partitions
 replica will be spawn and added to logical replication channel between nodes
 holding primary and replica.
 
-After table was sharded, each `pg_shardman` node can execute any DML statement
+After table was sharded, each `pg_shardman` worker node can execute any DML statement
 involving it. You are free to issue queries involving data from more than one
 shard, remote or local. It works using standard Postgres inheritance mechanism:
 all partitions are derived from parent table. If a partition is located at some
@@ -193,6 +193,9 @@ merge partial aggregate values from different nodes. Also it can't execute query
 on all nodes in parallel: foreign data wrappers do not support parallel scan
 because of using cursors. Execution of OLAP queries at `pg_shardman` might not
 be that efficient. `pg_shardman` is oriented mainly on OLTP workload.
+
+Shardlord doesn't hold any data and can't read it, this node is used only for
+managing the cluster.
 
 Presently internal Postgres function is used for hashing; there is no easy way
 for client app to determine the node for particular record to perform local
@@ -248,6 +251,10 @@ Though this situation is rather unlikely in practice, it is possible.
 We don't track replication mode for each table separately, and changing
 `shardman.sync_replication` GUC during cluster operation might lead to a mess.
 It is better to set it permanently for now.
+
+`pg_shardman` currently doesn't bothers itself with configuring replication
+identities. It is strongly recommended to use primary key as sharding key to
+avoid problems with `UPDATE` and `DELETE` operations.
 
 ### Balancing the load
 
@@ -388,8 +395,11 @@ also create new indices. It must be done per each partition separately,
 see
 [pathman docs](https://github.com/postgrespro/pg_pathman/wiki/How-do-I-create-indexes)
 
+`monitor` function on shardlord can continiously track failed nodes and resolve
+distributed deadlocks, see the reference.
+
 If shardlord has failed during command execution or you just feel that something
-goes wrong, run `shadman.recover()` function. It will verify nodes state
+goes wrong, run `shardman.recover()` function. It will verify nodes state
 against current shardlord's metadata and try to fix up things, i.e. reconfigure
 LR channels, repair FDW, etc.
 
@@ -504,6 +514,9 @@ randomly chosen within replication group, but with a guarantee that there is no
 more than one copy of the partition per node. Distributed table is always
 created empty, it doesn't matter had the original table on shardlord had any
 data or not.
+
+Column(s) participating in `expr` must be marked `NOT NULL`, as in
+`pg_pathman`. Generally we strongly recommend to use primary key there.
 
 ```plpgsql
 rm_table(rel_name name)
@@ -640,7 +653,7 @@ Data is not touched by this command.
 ## Some limitations:
   * You should not touch `synchronous_standby_names` manually while using pg_shardman.
   * The shardlord itself can't be worker node for now.
-  * All [limitations of `pg_pathman`](https://github.com/postgrespro/pg_pathman/wiki/Known-limitations),
+  * All [limitations](https://github.com/postgrespro/pg_pathman/wiki/Known-limitations)  (and some features) of `pg_pathman`,
 	e.g. we don't support global primary keys and foreign keys to sharded tables.
   * All [limitations of logical replications](https://www.postgresql.org/docs/10/static/logical-replication-restrictions.html).
     `TRUNCATE` statements on sharded tables will not be replicated.
