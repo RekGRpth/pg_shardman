@@ -287,6 +287,7 @@ DECLARE
 	fdw_part_name text;
     new_master_id int;
 	sync_standbys text[];
+	sync_standby_names text;
 	repl_group text;
 	master_node_id int;
 BEGIN
@@ -322,45 +323,42 @@ BEGIN
 			 	   rm_node_id, node.id,
 				   node.id, rm_node_id,
 				   rm_node_id, node.id);
-		-- Subscription with associated slot can not be dropped inside block, but if we do not override synchronous_commit policy,
-		-- then this command will be blocked waiting for sync replicas. So we need first do unbound slot from subscription.
-		-- But it is possible only for disabled subscriptions. So we have to perform three steps: disable subscription, unbound slot, drop subscription.
-		alts := format('%s{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}{%s:ALTER SUBSCRIPTION sub_%s_%s DISABLE;ALTER SUBSCRIPTION sub_%s_%s SET (slot_name=NONE)}',
-			 alts, rm_node_id, rm_node_id, node.id, rm_node_id, node.id,
-			       node.id, node.id, rm_node_id, node.id, rm_node_id);
-		subs := format('%s%s:DROP SUBSCRIPTION sub_%s_%s;
-			 			  %s:DROP SUBSCRIPTION sub_%s_%s;',
-			 subs, rm_node_id, rm_node_id, node.id,
-			       node.id, node.id, rm_node_id);
+
+		subs := format('%s%s:SELECT shardman.eliminate_sub(''sub_%s_%s'');
+					    %s:SELECT shardman.eliminate_sub(''sub_%s_%s'');',
+						alts, rm_node_id, rm_node_id, node.id,
+						      node.id, node.id, rm_node_id);
 
 		-- Construct new synchronous standby list
+		-- TODO: now we construct it differently in 3 places. This should be
+		-- united.
 		sync_standbys :=
-			coalesce(ARRAY(SELECT format('sub_%s_%s', id, node.id) FROM shardman.nodes
-							WHERE replication_group = repl_group AND id <> node.id AND
-								  id<>rm_node_id),
-								  '{}'::text[]);
-		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to ''FIRST %s (%s)'';',
-					   sync, node.id, array_length(sync_standbys, 1),
-					   array_to_string(sync_standbys, ','));
+			ARRAY(SELECT format('sub_%s_%s', id, node.id) FROM shardman.nodes
+				   WHERE replication_group = repl_group AND id <> node.id AND
+						 id<>rm_node_id);
+		sync_standby_names := CASE WHEN sync_standbys = '{}'::text[] THEN
+			''
+			ELSE
+			format('FIRST %s (%s)', array_length(sync_standbys, 1),
+				   array_to_string(sync_standbys, ','))
+			END;
+		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
+					   sync, node.id, sync_standby_names);
 		conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
 	END LOOP;
 
 	-- Drop shared tables subscriptions
-	FOR master_node_id IN SELECT DISTINCT master_node from shardman.tables WHERE master_node IS NOT NULL
+	FOR master_node_id IN SELECT DISTINCT master_node FROM shardman.tables
+		WHERE master_node IS NOT NULL
 	LOOP
-		alts := format('%s{%s:ALTER SUBSCRIPTION share_%s_%s DISABLE;ALTER SUBSCRIPTION share_%s_%s SET (slot_name=NONE)}',
-			 alts, rm_node_id, rm_node_id, master_node_id, rm_node_id, master_node_id);
-		subs := format('%s%s:DROP SUBSCRIPTION share_%s_%s;',
-			 subs, rm_node_id, rm_node_id, master_node_id);
+		subs := format('%s%s:SELECT shardman.eliminate_sub(share_%s_%s);',
+					   subs, rm_node_id, rm_node_id, master_node_id);
 		pubs := format('%s%s:SELECT pg_drop_replication_slot(''share_%s_%s'');',
-			 pubs, master_node_id, rm_node_id, master_node_id);
+					   pubs, master_node_id, rm_node_id, master_node_id);
 	END LOOP;
 
-	-- Broadcast alter subscription commands, ignore errors because removed node may be not available
-	PERFORM shardman.broadcast(alts,
-							   ignore_errors => true,
-							   super_connstr => true);
-	-- Broadcast drop subscription commands, ignore errors because removed node may be not available
+	-- Broadcast drop subscription commands, ignore errors because removed node
+	-- might be not available
 	PERFORM shardman.broadcast(subs,
 							   ignore_errors => true,
 							   super_connstr => true);
@@ -380,27 +378,12 @@ BEGIN
 								   super_connstr => true);
 	    PERFORM shardman.broadcast(conf, ignore_errors:=true, super_connstr => true);
 	END IF;
-/* To correctly remove foreign servers we need to update pg_depend table, otherwise
- * our hack with direct update pg_foreign_table leaves deteriorated dependencies
-	-- Remove foreign servers at all nodes for the removed node
-    FOR node IN SELECT * FROM shardman.nodes WHERE id<>rm_node_id
-	LOOP
-		-- Drop server for all nodes at the removed node and drop server at all nodes for the removed node
-		fdws := format('%s%s:DROP SERVER node_%s;
-			 			  %s:DROP SERVER node_%s;',
-			 fdws, node.id, rm_node_id,
-			 	   rm_node_id, node.id);
-		drps := format('%s%s:DROP USER MAPPING FOR CURRENT_USER SERVER node_%s;
-			 			  %s:DROP USER MAPPING FOR CURRENT_USER SERVER node_%s;',
-			 drps, node.id, rm_node_id,
-			 	   rm_node_id, node.id);
-	END LOOP;
-*/
-	-- Exclude partitions of removed node
-	FOR part in SELECT * from shardman.partitions where node_id=rm_node_id
+
+	-- Exclude partitions of removed node, promote them on replicas, if any
+	FOR part IN SELECT * from shardman.partitions WHERE node_id=rm_node_id
 	LOOP
 		-- If there are more than one replica of this partition, we need to synchronize them
-		IF shardman.get_redundancy_of_partition(part.part_name)>1
+		IF shardman.get_redundancy_of_partition(part.part_name) > 1
 		THEN
 			PERFORM shardman.synchronize_replicas(part.part_name);
 		END IF;
@@ -408,8 +391,9 @@ BEGIN
 		-- Is there some replica of this node?
 		SELECT node_id INTO new_master_id FROM shardman.replicas WHERE part_name=part.part_name ORDER BY random() LIMIT 1;
 		IF new_master_id IS NOT NULL
-		THEN -- exists some replica for this node: redirect foreign table to this replica and refresh LR channels for this replication group
-			-- Update partitions table: now replica is promoted to master...
+		THEN -- exists some replica for this node: redirect foreign table to
+			 -- this replica and refresh LR channels for this replication group
+			 -- Update partitions table: now replica is promoted to master...
 		    UPDATE shardman.partitions SET node_id=new_master_id WHERE part_name=part.part_name;
 			-- ... and is not a replica any more
 			DELETE FROM shardman.replicas WHERE part_name=part.part_name AND node_id=new_master_id;
@@ -417,7 +401,7 @@ BEGIN
 			pubs := '';
 			subs := '';
 			-- Refresh LR channels for this replication group
-			FOR repl in SELECT * FROM shardman.replicas WHERE part_name=part.part_name
+			FOR repl IN SELECT * FROM shardman.replicas WHERE part_name=part.part_name
 			LOOP
 				-- Publish this partition at new master
 			    pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
@@ -447,21 +431,46 @@ BEGIN
 				fdws := format('%s%s:DROP FOREIGN TABLE %I;',
 					fdws, node.id, fdw_part_name);
 			ELSE
-				-- At all other nodes adjust foreign server for foreign table to refer to new master node.
-				-- It is not possible to alter foreign server for foreign table so we have to do it in such "hackers" way:
-				prts := format('%s%s:UPDATE pg_foreign_table SET ftserver = (SELECT oid FROM pg_foreign_server WHERE srvname = ''node_%s'') WHERE ftrelid = (SELECT oid FROM pg_class WHERE relname=%L);',
-		   			prts, node.id, new_master_id, fdw_part_name);
+				-- At all other nodes adjust foreign server for foreign table to
+				-- refer to new master node.
+				prts := format(
+					'%s%s:SELECT shardman.alter_ftable_set_server(%L, ''node_%s'');',
+		   			prts, node.id, fdw_part_name, new_master_id);
 			END IF;
 		END LOOP;
 	END LOOP;
 
 	-- Broadcast changes of pathman mapping
-	PERFORM shardman.broadcast(prts, ignore_errors:=true);
+	PERFORM shardman.broadcast(prts, ignore_errors := true);
 	-- Broadcast drop server commands
-    PERFORM shardman.broadcast(fdws, ignore_errors:=true);
+    PERFORM shardman.broadcast(fdws, ignore_errors := true);
+
+	-- Clean removed node, if it is reachable
+	PERFORM shardman.broadcast(format('%s:SELECT shardman.wipe_state();',
+									  rm_node_id),
+							   ignore_errors := true);
 
 	-- Finally delete node from nodes table and all dependent tables
 	DELETE from shardman.nodes WHERE id=rm_node_id;
+END
+$$ LANGUAGE plpgsql;
+
+-- Since PG doesn't support it, mess with catalogs directly. If no more foreign
+-- tables use old server, drop it.
+CREATE FUNCTION alter_ftable_set_server(ftable name, new_fserver name) RETURNS void AS $$
+DECLARE
+	new_fserver_oid oid := oid FROM pg_foreign_server WHERE srvname = new_fserver;
+	old_fserver name := srvname FROM pg_foreign_server
+		WHERE oid = (SELECT ftserver FROM pg_foreign_table WHERE ftrelid = ftable::regclass);
+	old_fserver_oid oid := oid FROM pg_foreign_server WHERE srvname = old_fserver;
+BEGIN
+	UPDATE pg_foreign_table SET ftserver = new_fserver_oid WHERE ftrelid = ftable::regclass;
+	UPDATE pg_depend SET refobjid = new_fserver_oid
+		WHERE objid = ftable::regclass AND refobjid = old_fserver_oid;
+	IF (SELECT count(*) FROM pg_foreign_table WHERE ftserver = old_fserver_oid) = 0
+	THEN
+		EXECUTE format('DROP SERVER %s CASCADE', old_fserver);
+	END IF;
 END
 $$ LANGUAGE plpgsql;
 

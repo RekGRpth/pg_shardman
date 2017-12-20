@@ -692,6 +692,7 @@ def suite():
     suite.addTest(ShardmanTests('test_create_hash_partitions_and_rm_table'))
     suite.addTest(ShardmanTests('test_set_redundancy'))
     suite.addTest(ShardmanTests('test_rebalance'))
+    suite.addTest(ShardmanTests('test_deadlock_detector'))
     suite.addTest(ShardmanTests('test_copy_from'))
     return suite
 

@@ -319,7 +319,7 @@ using `monitor` function, see the reference below.
 
 ## Worker failover
 
-Shardman doesn't support presently automatic failure detection and recovery. It
+`pg_shardman` doesn't support presently automatic failure detection and recovery. It
 has to be done manually by the DBA. If some node is down, its data is not
 available until either node rises or it is ruled out from the cluster by
 `rm_node` command. Moreover, if failed node holds replicas and sync replication
