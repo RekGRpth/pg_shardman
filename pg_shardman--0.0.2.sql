@@ -1694,6 +1694,9 @@ BEGIN
 						ELSE
 							RAISE NOTICE 'Can''t make any decision concerning distributed transaction %', gid;
 						END IF;
+					ELSE
+						RAISE WARNING 'Can''t perform 2PC resolution of xact % at node % with vanilla PostgreSQL',
+							gid, xact_node_id;
 					END IF;
 				END IF;
 			ELSE
@@ -1714,7 +1717,8 @@ BEGIN
 				finish := format('%s%s:ROLLBACK PREPARED %L;', finish, xact_node_id, gid);
 			ELSEIF status IS NULL
 			THEN
-				RAISE WARNING ''
+				RAISE WARNING 'Transaction % at coordinator % is too old to perform 2PC resolution',
+				gid, coordinator;
 			END IF;
 		END IF;
 	END LOOP;
