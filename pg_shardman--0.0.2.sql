@@ -1617,7 +1617,9 @@ BEGIN
 	END LOOP;
 
 	-- Collected prepared xacts from all nodes
-	SELECT string_to_array(shardman.broadcast(cmds), ',') INTO xacts;
+	xacts := string_to_array(shardman.broadcast(cmds), ',');
+	-- empty string means no prepared xacts
+	xacts := array_remove(xacts, '');
 
 	FOREACH xact IN ARRAY xacts
 	LOOP
