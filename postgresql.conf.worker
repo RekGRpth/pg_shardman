@@ -22,7 +22,7 @@ synchronous_commit = on
 # for 2pc
 max_prepared_transactions = 1000
 postgres_fdw.use_2pc = on
-# only for testing performace; setting this to 'on' violates visibility
+# only for testing performance; setting this to 'off' violates visibility
 postgres_fdw.use_repeatable_read = off
 
 # This node is shardlord?
