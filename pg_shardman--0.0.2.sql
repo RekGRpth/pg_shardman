@@ -389,12 +389,14 @@ BEGIN
 		END IF;
 
 		-- Is there some replica of this node?
-		SELECT node_id INTO new_master_id FROM shardman.replicas WHERE part_name=part.part_name ORDER BY random() LIMIT 1;
+		SELECT node_id INTO new_master_id FROM shardman.replicas
+		  WHERE part_name=part.part_name ORDER BY random() LIMIT 1;
 		IF new_master_id IS NOT NULL
 		THEN -- exists some replica for this node: redirect foreign table to
 			 -- this replica and refresh LR channels for this replication group
 			 -- Update partitions table: now replica is promoted to master...
-		    UPDATE shardman.partitions SET node_id=new_master_id WHERE part_name=part.part_name;
+		    UPDATE shardman.partitions SET node_id=new_master_id
+			  WHERE part_name=part.part_name;
 			-- ... and is not a replica any more
 			DELETE FROM shardman.replicas WHERE part_name=part.part_name AND node_id=new_master_id;
 
@@ -415,9 +417,12 @@ BEGIN
 			PERFORM shardman.broadcast(pubs, super_connstr => true);
 			-- Broadcast refresh alter subscription commands
 			PERFORM shardman.broadcast(subs, super_connstr => true);
-		ELSE -- there is no replica: we have to create new empty partition at random mode and redirect all FDWs to it
-			SELECT id INTO new_master_id FROM shardman.nodes WHERE id<>rm_node_id ORDER BY random() LIMIT 1;
-		    INSERT INTO shardman.partitions (part_name,node_id,relation) VALUES (part.part.name,new_master_id,part.relation);
+		ELSE -- there is no replica: we have to create new empty partition at
+			 -- random mode and redirect all FDWs to it
+			SELECT id INTO new_master_id FROM shardman.nodes
+			  WHERE id<>rm_node_id ORDER BY random() LIMIT 1;
+		    INSERT INTO shardman.partitions (part_name,node_id,relation)
+			  VALUES (part.part.name,new_master_id,part.relation);
 		END IF;
 
 		-- Update pathman partition map at all nodes
@@ -434,7 +439,7 @@ BEGIN
 				-- At all other nodes adjust foreign server for foreign table to
 				-- refer to new master node.
 				prts := format(
-					'%s%s:SELECT shardman.alter_ftable_set_server(%L, ''node_%s'');',
+					'%s%s:SELECT shardman.alter_ftable_set_server(%L, ''node_%s'', true);',
 		   			prts, node.id, fdw_part_name, new_master_id);
 			END IF;
 		END LOOP;
@@ -455,9 +460,10 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Since PG doesn't support it, mess with catalogs directly. If no more foreign
--- tables use old server, drop it.
-CREATE FUNCTION alter_ftable_set_server(ftable name, new_fserver name) RETURNS void AS $$
+-- Since PG doesn't support it, mess with catalogs directly. If asked and no one
+-- uses this server, drop it.
+CREATE FUNCTION alter_ftable_set_server(ftable name, new_fserver name,
+										server_not_needed bool DEFAULT false) RETURNS void AS $$
 DECLARE
 	new_fserver_oid oid := oid FROM pg_foreign_server WHERE srvname = new_fserver;
 	old_fserver name := srvname FROM pg_foreign_server
@@ -467,7 +473,8 @@ BEGIN
 	UPDATE pg_foreign_table SET ftserver = new_fserver_oid WHERE ftrelid = ftable::regclass;
 	UPDATE pg_depend SET refobjid = new_fserver_oid
 		WHERE objid = ftable::regclass AND refobjid = old_fserver_oid;
-	IF (SELECT count(*) FROM pg_foreign_table WHERE ftserver = old_fserver_oid) = 0
+	IF server_not_needed AND
+	   ((SELECT count(*) FROM pg_foreign_table WHERE ftserver = old_fserver_oid) = 0)
 	THEN
 		EXECUTE format('DROP SERVER %s CASCADE', old_fserver);
 	END IF;
@@ -862,8 +869,8 @@ BEGIN
 			drop_fdws := format('%s%s:DROP FOREIGN TABLE %I;',
 				drop_fdws, node.id, fdw_part_name);
 		ELSE
-			replace_parts := format('%s%s:UPDATE pg_foreign_table SET ftserver = (SELECT oid FROM pg_foreign_server WHERE srvname = ''node_%s'') WHERE ftrelid = (SELECT oid FROM pg_class WHERE relname=%L);',
-		   		replace_parts, node.id, dst_node_id, fdw_part_name);
+			replace_parts := format('%s%s:SELECT shardman.alter_ftable_set_server(%L, ''node_%s'');',
+		   							replace_parts, node.id, fdw_part_name, dst_node_id);
 		END IF;
 	END LOOP;
 
@@ -2032,23 +2039,26 @@ BEGIN
 		IF seqno <> max_seqno
 		THEN
 		   RAISE NOTICE 'Advance node % from %', replica.node_id, advanced_node;
-		   PERFORM shardman.remote_copy(replica.relation, replica.part_name, replica.node_id, advanced_node, seqno);
+		   PERFORM shardman.remote_copy(replica.relation, pname, replica.node_id,
+										advanced_node, seqno);
 		END IF;
 	END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
--- Get relation primary key. There can be table with no primary key or with compound primary key.
--- But logical replication and hash partitioning in any case requires single primary key.
+-- Get relation primary key. There can be table with no primary key or with
+-- compound primary key. But logical replication and hash partitioning in any
+-- case requires single primary key.
 CREATE FUNCTION get_primary_key(rel regclass, out pk_name text, out pk_type text) AS $$
-	SELECT a.attname::text,a.atttypid::regtype::text FROM pg_index i
+	SELECT a.attname::text, a.atttypid::regtype::text FROM pg_index i
 	JOIN   pg_attribute a ON a.attrelid = i.indrelid
                      AND a.attnum = ANY(i.indkey)
     WHERE  i.indrelid = rel
     AND    i.indisprimary;
 $$ LANGUAGE sql;
 
--- Copy missing data from one node to another. This function us using change_log table to determine records which need to be copied.
+-- Copy missing data from one node to another. This function uses change_log
+-- table to determine records which need to be copied.
 -- See explanations in synchronize_replicas.
 -- Parameters:
 --   rel_name:   name of parent relation
@@ -2056,16 +2066,19 @@ $$ LANGUAGE sql;
 --   dst_node:   lagging node
 --   src_node:   advanced node
 --   last_seqno: maximal seqno at lagging node
-CREATE FUNCTION remote_copy(rel_name text, part_name text, dst_node int, src_node int, last_seqno bigint) RETURNS void AS $$
+CREATE FUNCTION remote_copy(rel_name text, part_name text, dst_node int,
+							src_node int, last_seqno bigint) RETURNS void AS $$
 DECLARE
 	script text;
 	conn_string text;
 	pk_name text;
 	pk_type text;
 BEGIN
-	SELECT * FROM shardman.get_primary_key(rel_name) INTO pk_name,pk_type;
+	SELECT * FROM shardman.get_primary_key(rel_name) INTO pk_name, pk_type;
+	ASSERT pk_name IS NOT NULL, 'Can''t sync replicas without primary key';
 	SELECT connection_string INTO conn_string FROM shardman.nodes WHERE id=src_node;
-	-- We need to execute all this three statements in one transaction to exclude inconsistencies in case of failure
+	-- We need to execute all this three statements in one transaction to
+	-- exclude inconsistencies in case of failure
 	script := format('{%s:COPY %s_change_log FROM PROGRAM ''psql "%s" -c "COPY (SELECT * FROM %s_change_log WHERE seqno>%s) TO stdout"'';
 		   	  		      DELETE FROM %I USING %s_change_log cl WHERE cl.seqno>%s AND cl.old_pk=%I;
 						  COPY %I FROM PROGRAM ''psql "%s" -c "COPY (SELECT DISTINCT ON (%I) %I.* FROM %I,%s_change_log cl WHERE cl.seqno>%s AND cl.new_pk=%I ORDER BY %I) TO stdout"''}',

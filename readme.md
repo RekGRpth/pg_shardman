@@ -252,9 +252,10 @@ We don't track replication mode for each table separately, and changing
 `shardman.sync_replication` GUC during cluster operation might lead to a mess.
 It is better to set it permanently for now.
 
-`pg_shardman` currently doesn't bothers itself with configuring replication
+`pg_shardman` currently doesn't bother itself with configuring replication
 identities. It is strongly recommended to use primary key as sharding key to
-avoid problems with `UPDATE` and `DELETE` operations.
+avoid problems with `UPDATE` and `DELETE` operations. Besides, primary key is
+necessary to synchronize multiple replicas after failure.
 
 ### Balancing the load
 
