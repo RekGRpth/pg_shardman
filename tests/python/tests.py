@@ -498,19 +498,64 @@ class ShardmanTests(unittest.TestCase):
 
         self.pt_cleanup()
 
-    # WIP
-    def test_worker_failover(self):
+    # dummiest test with no actual 2PC
+    def test_recover_xacts_no_xacts(self):
         self.lord.create_cluster(2, 2)
+        self.lord.safe_psql(DBNAME, "select shardman.recover_xacts()")
+        self.lord.destroy_cluster()
+
+    # WIP
+    # def test_worker_failover(self):
+    #     self.lord.create_cluster(2, 2)
+    #     self.lord.safe_psql(
+    #         DBNAME, 'create table pt(id int primary key, payload int default 1);')
+    #     self.lord.safe_psql(
+    #         DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+    #     self.lord.workers[0].safe_psql(
+    #         DBNAME,
+    #         "insert into pt select generate_series(1, 10000), (random() * 100)::int")
+
+    #     # turn off some node
+    #     # self.lord.workers[0].stop()
+    #     # sleep(432423)
+
+    #     # let monitor remove it
+    #     try:
+    #         with self.lord.connect() as con:
+    #             con.execute("set statement_timeout = '3s'")
+    #             con.execute("select shardman.monitor(check_timeout_sec => 1, rm_node_timeout_sec => 1)")
+    #     except Exception as e:
+    #         # make sure it was statement_timeout
+    #         self.assertTrue("canceling statement due to statement timeout" in str(e))
+
+    #     self.pt_cleanup()
+
+    def test_recover(self):
+        self.lord.create_cluster(2, 3)
         self.lord.safe_psql(
             DBNAME, 'create table pt(id int primary key, payload int default 1);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 2);")
         self.lord.workers[0].safe_psql(
             DBNAME,
             "insert into pt select generate_series(1, 10000), (random() * 100)::int")
-        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
-        self.lord.safe_psql(DBNAME, "drop table pt;")
-        self.lord.destroy_cluster();
+
+        # now accidently remove state from everywhere
+        for worker in self.lord.workers:
+            worker.safe_psql(DBNAME, "set local synchronous_commit to local; select shardman.wipe_state();")
+        # repair things back
+        self.lord.safe_psql(DBNAME, "select shardman.recover()")
+
+        # write some more data
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(10001, 20000), (random() * 100)::int")
+
+        # and make sure data is still consistent
+        self.pt_everyone_sees_the_whole()
+        self.pt_replicas_integrity()
+
+        self.pt_cleanup()
 
     def test_copy_from(self):
         self.lord.create_cluster(3, 2)
@@ -693,6 +738,7 @@ def suite():
     suite.addTest(ShardmanTests('test_set_redundancy'))
     suite.addTest(ShardmanTests('test_rebalance'))
     suite.addTest(ShardmanTests('test_deadlock_detector'))
+    suite.addTest(ShardmanTests('test_recover_xacts_no_xacts'))
     suite.addTest(ShardmanTests('test_copy_from'))
     return suite
 

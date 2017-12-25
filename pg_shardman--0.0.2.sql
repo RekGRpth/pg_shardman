@@ -163,19 +163,14 @@ BEGIN
 	-- Broadcast create subscription commands
 	PERFORM shardman.broadcast(subs, super_connstr => true);
 
-	-- In case of synchronous replication broadcast update synchronous standby list commands
+	-- In case of synchronous replication broadcast update synchronous standby
+	-- list commands
 	IF shardman.synchronous_replication() AND
 		(SELECT COUNT(*) FROM shardman.nodes WHERE replication_group = repl_group) > 1
 	THEN
-		-- Take all nodes in replication group excluding myself
 		FOR node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group LOOP
-			-- Construct list of synchronous standbyes=subscriptions to this node
-			sync_standbys :=
-				 coalesce(ARRAY(SELECT format('sub_%s_%s', id, node.id) sby_name FROM shardman.nodes
-				   WHERE replication_group = repl_group AND id <> node.id ORDER BY sby_name), '{}'::text[]);
-			sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to ''FIRST %s (%s)'';',
-				 sync, node.id, array_length(sync_standbys, 1),
-				 array_to_string(sync_standbys, ','));
+			sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
+				 sync, node.id, shardman.construct_ssnames(node.id));
 			conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
 		END LOOP;
 
@@ -268,6 +263,25 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Construct synchronous_standby_names for node 'src_node'
+CREATE FUNCTION construct_ssnames(src_node int) RETURNS text AS $$
+DECLARE
+	repl_group text := replication_group FROM shardman.nodes WHERE id = src_node;
+	sync_standbys text[];
+BEGIN
+	sync_standbys :=
+		-- format is sub_$dst_$src
+		ARRAY(SELECT format('sub_%s_%s', id, src_node) ssn FROM shardman.nodes
+			  WHERE replication_group = repl_group AND id <> src_node
+			  ORDER BY ssn); -- to be able compare it
+	RETURN CASE WHEN sync_standbys = '{}'::text[] THEN
+		''
+		ELSE
+		format('FIRST %s (%s)', array_length(sync_standbys, 1),
+			   array_to_string(sync_standbys, ','))
+		END;
+END
+$$ LANGUAGE plpgsql;
 
 -- Remove node: try to choose alternative from one of replicas of this nodes,
 -- exclude node from replication channels and remove foreign servers.
@@ -456,7 +470,7 @@ BEGIN
 							   ignore_errors := true);
 
 	-- Finally delete node from nodes table and all dependent tables
-	DELETE from shardman.nodes WHERE id=rm_node_id;
+	DELETE FROM shardman.nodes WHERE id=rm_node_id;
 END
 $$ LANGUAGE plpgsql;
 
@@ -825,8 +839,7 @@ BEGIN
 	RAISE NOTICE 'Copy of partition % from node % to % is completed',
 		 mv_part_name, src_node_id, dst_node_id;
 
-	pubs := format('%s:DROP PUBLICATION copy_%s;',
-		 src_node_id, mv_part_name);
+	pubs := format('%s:DROP PUBLICATION copy_%s;', src_node_id, mv_part_name);
 	subs := '';
 
 	-- Update replication channels
@@ -1265,6 +1278,7 @@ DECLARE
 	conf text = '';
 	old_replicated_tables text;
 	new_replicated_tables text;
+	replicated_tables text;
 	node_id int;
 	sync_standbys text[];
 	old_sync_policy text;
@@ -1285,14 +1299,18 @@ BEGIN
 			THEN
 				-- Create foreign server if not exists
 				srv_name := format('node_%s', dst_node.id);
-				IF shardman.not_exists(src_node.id, format('pg_foreign_server WHERE srvname=%L', srv_name))
+				IF shardman.not_exists(src_node.id, format(
+					'pg_foreign_server WHERE srvname=%L', srv_name))
 				THEN
-					SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(dst_node.connection_string) INTO server_opts, um_opts;
-					RAISE NOTICE 'Create foreign server % at node %', srv_name, src_node.id;
-					PERFORM shardman.broadcast(format('{%s:CREATE SERVER %I FOREIGN DATA WRAPPER postgres_fdw %s;
-			 			        CREATE USER MAPPING FOR CURRENT_USER SERVER %I %s}',
-						  src_node.id, srv_name, server_opts,
-			 	   		  srv_name, um_opts));
+					SELECT * FROM shardman.conninfo_to_postgres_fdw_opts(dst_node.connection_string)
+						INTO server_opts, um_opts;
+					RAISE NOTICE 'Creating foreign server % at node %',
+						srv_name, src_node.id;
+					PERFORM shardman.broadcast(format(
+						'{%s:CREATE SERVER %I FOREIGN DATA WRAPPER postgres_fdw %s;
+			 			CREATE USER MAPPING FOR CURRENT_USER SERVER %I %s}',
+						src_node.id, srv_name, server_opts,
+			 	   		srv_name, um_opts));
 				END IF;
 			END IF;
 		END LOOP;
@@ -1301,65 +1319,94 @@ BEGIN
 		FOR part IN SELECT * from shardman.partitions
 		LOOP
 			-- Create parent table if not exists
-			IF shardman.not_exists(src_node.id, format('pg_class WHERE relname=%L', part.relation))
+			IF shardman.not_exists(src_node.id,
+								   format('pg_class WHERE relname=%L', part.relation))
 			THEN
-				RAISE NOTICE 'Create table % at node %', part.relation, src_node_id;
+				RAISE NOTICE 'Creating table % at node %', part.relation, src_node_id;
 				SELECT create_sql INTO create_table FROM sharman.tables WHERE relation=part.relation;
 				PERFORM shardman.broadcast(format('{%s:%s}', src_node.id, create_table));
 			END IF;
 
-			IF part.node_id<>src_node.id
+			IF part.node_id <> src_node.id
 			THEN -- foreign partition
 				fdw_part_name := format('%s_fdw', part.part_name);
 				srv_name := format('node_%s', part.node_id);
 
 				-- Create foreign table if not exists
-				IF shardman.not_exists(src_node.id, format('pg_class c,pg_foreign_table f WHERE c.oid=f.ftrelid AND c.relname=%L', fdw_part_name))
+				IF shardman.not_exists(src_node.id, format(
+					'pg_class c, pg_foreign_table f WHERE c.oid=f.ftrelid AND c.relname=%L',
+					fdw_part_name))
 				THEN
-					RAISE NOTICE 'Create foreign table %I at node %', fdw_part_name, src_node.id;
+					RAISE NOTICE 'Creating foreign table % at node %', fdw_part_name, src_node.id;
 					SELECT shardman.reconstruct_table_attrs(part.relation) INTO table_attrs;
-					PERFORM shardman.broadcast(format('%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
+					PERFORM shardman.broadcast(format(
+						'%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
 						src_node.id, fdw_part_name, table_attrs, srv_name, part.part_name));
-				ELSIF shardman.not_exists(src_node.id, format('pg_class c,pg_foreign_table f,pg_foreign_server s WHERE c.oid=f.ftrelid AND c.relname=%L AND f.ftserver=s.oid AND s.srvname = %L', fdw_part_name, srv_name))
+				ELSIF shardman.not_exists(src_node.id, format(
+					'pg_class c, pg_foreign_table f, pg_foreign_server s
+					 WHERE c.oid=f.ftrelid AND c.relname=%L AND
+					f.ftserver=s.oid AND s.srvname = %L',
+					fdw_part_name, srv_name))
 				THEN
-					RAISE NOTICE 'Bind foreign table % to server % at node %', fdw_part_name, srv_name, src_node.id;
-					PERFORM shardman.broadcast(format('%s:UPDATE pg_foreign_table SET ftserver = (SELECT oid FROM pg_foreign_server WHERE srvname = %L) WHERE ftrelid = (SELECT oid FROM pg_class WHERE relname=%L);',
-						src_node.id, srv_name, fdw_part_name));
+					RAISE NOTICE 'Binding foreign table % to server % at node %',
+					fdw_part_name, srv_name, src_node.id;
+					PERFORM shardman.broadcast(format(
+						'%s:SELECT shardman.alter_ftable_set_server(%L, %L);',
+		   				src_node.id, fdw_part_name, srv_name));
 				END IF;
 
-				-- Check if parent table contains foreign table as c child
-				IF shardman.not_exists(src_node.id, format('pg_class p,pg_inherits i,pg_class c WHERE p.relname=%L AND p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
-				   						          		   part.relation, fdw_part_name))
+				-- Check if parent table contains foreign table as child
+				IF shardman.not_exists(src_node.id, format(
+					'pg_class p, pg_inherits i, pg_class c WHERE p.relname=%L AND
+					p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
+				   	part.relation, fdw_part_name))
 				THEN
-					-- If parent table contains neither local neither foreign partitions, then assume that table was not partitioned at all
-					IF shardman.not_exists(src_node.id, format('pg_class p,pg_inherits i,pg_class c WHERE p.relname=%L AND p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
-				   						          			   part.relation, part.part_name))
+					-- If parent table contains neither local nor foreign
+					-- partitions, then assume that table was not partitioned at
+					-- all
+					IF shardman.not_exists(src_node.id, format(
+						'pg_class p, pg_inherits i, pg_class c WHERE p.relname=%L AND
+						p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
+				   		part.relation, part.part_name))
 					THEN
-						RAISE NOTICE 'Create hash partitions for table % at node %', part.relation, src_node.id;
+						RAISE NOTICE 'Create hash partitions for table % at node %',
+							part.relation, src_node.id;
 						SELECT * INTO t FROM shardman.tables WHERE relation=part.relation;
-						PERFORM shardman.broadcast(format('%s:SELECT create_hash_partitions(%L,%L,%L);',
+						PERFORM shardman.broadcast(format(
+							'%s:SELECT create_hash_partitions(%L,%L,%L);',
 							src_node.id, t.relation, t.sharding_key, t.partitions_count));
 					END IF;
-					RAISE NOTICE 'Replace % with % at node %', part.part_name, fdw_part_name, src_node.id;
-					PERFORM shardman.broadcast(format('%s:SELECT replace_hash_partition(%L,%L);',
+					RAISE NOTICE 'Replace % with % at node %',
+						part.part_name, fdw_part_name, src_node.id;
+					PERFORM shardman.broadcast(format(
+						'%s:SELECT replace_hash_partition(%L,%L);',
 						src_node.id, part.part_name, fdw_part_name));
 				END IF;
 			ELSE -- local partition
 				-- Check if parent table contains local partition as a child
-				IF shardman.not_exists(src_node.id, format('pg_class p,pg_inherits i,pg_class c WHERE p.relname=%L AND p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
-			   	   					   		  			   part.relation, part.part_name))
+				IF shardman.not_exists(src_node.id, format(
+					'pg_class p, pg_inherits i, pg_class c
+					WHERE p.relname=%L AND p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
+			   	   	part.relation, part.part_name))
 				THEN
-					-- If parent table contains neither local neither foreign partitions, then assume that table was not partitioned at all
-					IF shardman.not_exists(src_node.id, format('pg_class p,pg_inherits i,pg_class c WHERE p.relname=%L AND p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
-					   						          		   part.relation, fdw_part_name))
+					-- If parent table contains neither local neither foreign
+					-- partitions, then assume that table was not partitioned at
+					-- all
+					IF shardman.not_exists(src_node.id, format(
+						'pg_class p,pg_inherits i,pg_class c WHERE p.relname=%L AND
+						p.oid=i.inhparent AND i.inhrelid=c.oid AND c.relname=%L',
+					   	part.relation, fdw_part_name))
 				    THEN
 						RAISE NOTICE 'Create hash partitions for table % at node %', part.relation, src_node.id;
 						SELECT * INTO t FROM shardman.tables WHERE relation=part.relation;
-						PERFORM shardman.broadcast(format('%s:SELECT create_hash_partitions(%L,%L,%L);',
+						PERFORM shardman.broadcast(format(
+							'%s:SELECT create_hash_partitions(%L,%L,%L);',
 							src_node.id, t.relation, t.sharding_key, t.partitions_count));
 					ELSE
-						RAISE NOTICE 'Replace % with % at node %', fdw_part_name, part.part_name, src_node.id;
-						PERFORM shardman.broadcast(format('%s:SELECT replace_hash_partition(%L,%L);',
+						RAISE NOTICE 'Replace % with % at node %',
+							fdw_part_name, part.part_name, src_node.id;
+						PERFORM shardman.broadcast(format(
+							'%s:SELECT replace_hash_partition(%L,%L);',
 							src_node.id, fdw_part_name, part.part_name));
 					END IF;
 				END IF;
@@ -1370,44 +1417,31 @@ BEGIN
 	-- Restore replication channels
 	FOR repl_group IN SELECT DISTINCT replication_group FROM shardman.nodes
 	LOOP
-		FOR src_node IN SELECT * from shardman.nodes WHERE replication_group = repl_group
+		FOR src_node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group
 		LOOP
-			FOR dst_node IN SELECT * from shardman.nodes WHERE replication_group = repl_group AND id<>src_node.id
+			FOR dst_node IN SELECT * FROM shardman.nodes
+				WHERE replication_group = repl_group AND id <> src_node.id
 			LOOP
 				pub_name := format('node_%s', dst_node.id);
 				sub_name := format('sub_%s_%s', dst_node.id, src_node.id);
 
-				-- Construct list of partitions published by this node
-				SELECT string_agg(pname, ',') INTO new_replicated_tables FROM
-				(SELECT p.part_name pname FROM shardman.partitions p,shardman.replicas r WHERE p.node_id=src_node.id AND p.part_name=r.part_name ORDER BY p.part_name) parts;
-				SELECT string_agg(pname, ',') INTO old_replicated_tables FROM
-				(SELECT c.relname pname FROM pg_publication p,pg_publication_rel r,pg_class c WHERE p.pubname=pub_name AND p.oid=r.prpubid AND r.prrelid=c.oid ORDER BY c.relname) parts;
+				-- Construct list of partitions which need to be published from
+				-- src node to dst node
+				SELECT coalesce(string_agg(pname, ','), '') INTO replicated_tables FROM
+					(SELECT p.part_name pname FROM shardman.partitions p, shardman.replicas r
+					  WHERE p.node_id = src_node.id AND r.node_id = dst_node.id AND
+							p.part_name = r.part_name ORDER BY p.part_name) parts;
 
-				-- Create publication if not exists
-				IF shardman.not_exists(src_node.id, format('pg_publication WHERE pubname=%L', pub_name))
-				THEN
-					RAISE NOTICE 'Create publication % at node %', pub_name, src_node.id;
-					pubs := format('%s%s:CREATE PUBLICATION %I FOR TABLE %s;',
-						pubs, src_node.id, pub_name, new_replicated_tables);
-				ELSIF new_replicated_tables<>old_replicated_tables
-				THEN
-					RAISE NOTICE 'Alter publication % at node %', pub_name, src_node.id;
-					pubs := format('%s%s:ALTER PUBLICATION %I SET TABLE %s;',
-					 	pubs, src_node.id, pub_name, new_replicated_tables);
-				END IF;
-
-				-- Create replication slot if not exists
-				IF shardman.not_exists(src_node.id, format('pg_replication_slots WHERE slot_name=%L', pub_name))
-				THEN
-					RAISE NOTICE 'Create replication slot % at node %', pub_name, src_node.id;
-					pubs := format('%s%s:SELECT pg_create_logical_replication_slot(%L, ''pgoutput'');',
-						 pubs, src_node.id, pub_name);
-				END IF;
+				pubs := format('%s%s:SELECT shardman.recover_pub(%L, %L);',
+							   pubs, src_node.id, pub_name, replicated_tables);
 
 				-- Create subscription if not exists
-				IF shardman.not_exists(dst_node.id, format('pg_subscription WHERE subname=%L', sub_name))
+				-- FIXME: we ought to recreate sub anyway if slot/pub was
+				-- recreated
+				IF shardman.not_exists(dst_node.id, format(
+					'pg_subscription WHERE subname=%L', sub_name))
 				THEN
-					RAISE NOTICE 'Create subscription % at node %', sub_name, drc_node.id;
+					RAISE NOTICE 'Creating subscription % at node %', sub_name, dst_node.id;
 					subs := format('%s%s:CREATE SUBSCRIPTION %I CONNECTION %L PUBLICATION %I WITH (copy_data=false, create_slot=false, slot_name=%L, synchronous_commit=local);',
 						 subs, dst_node.id, sub_name, src_node.connection_string, pub_name, pub_name);
 				END IF;
@@ -1416,32 +1450,27 @@ BEGIN
 			-- Restore synchronous standby list
 			IF shardman.synchronous_replication()
 			THEN
-				sync_standbys := ARRAY(SELECT format('sub_%s_%s', id, src_node.id) sby_name FROM shardman.nodes
-				   				       WHERE replication_group = repl_group AND id <> src_node.id ORDER BY sby_name);
-				IF sync_standbys IS NOT NULL
-				THEN
-					new_sync_policy := format('FIRST %s (%s)', array_length(sync_standbys, 1), array_to_string(sync_standbys, ','));
-				ELSE
-					new_sync_policy := '';
-				END IF;
+				new_sync_policy := shardman.construct_ssnames(src_node.id);
 
-				SELECT shardman.broadcast(format('%s:SELECT setting from pg_settings WHERE name=''synchronous_standby_names'';', src_node.id))
+				SELECT shardman.broadcast(format(
+					'%s:SELECT setting from pg_settings
+					WHERE name=''synchronous_standby_names'';', src_node.id))
 				INTO old_sync_policy;
 
-				IF old_sync_policy<>new_sync_policy
+				IF old_sync_policy <> new_sync_policy
 				THEN
 					RAISE NOTICE 'Alter synchronous_standby_names to ''%'' at node %', new_sync_policy, src_node.id;
 					sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
-						 sync, src_node.id, new_sync_policy);
+								   sync, src_node.id, new_sync_policy);
 					conf := format('%s%s:SELECT pg_reload_conf();', conf, src_node.id);
 				END IF;
 			END IF;
 		END LOOP;
 	END LOOP;
 
-	-- Create not existed publications
+	-- Create missing publications
 	PERFORM shardman.broadcast(pubs, super_connstr => true);
-	-- Create not existed subscriptions
+	-- Create missing subscriptions
 	PERFORM shardman.broadcast(subs, super_connstr => true);
 
 	IF sync <> ''
@@ -1531,6 +1560,36 @@ BEGIN
 
 	-- Create not existed on_change triggers
 	PERFORM shardman.generate_on_change_triggers();
+END
+$$ LANGUAGE plpgsql;
+
+-- Make sure pub & slot on the node exists and proper parts are published.
+-- 'replicated_tables' is comma-separated list of tables to publish, probably
+-- empty string. It is ordered for easier comparison.
+-- If everything is ok, we don't touch it.
+CREATE FUNCTION recover_pub(pub_name name, replicated_tables text) RETURNS void AS $$
+DECLARE
+	currently_replicated_tables text := COALESCE(string_agg(pname, ','), '') FROM
+		(SELECT c.relname pname FROM pg_publication p, pg_publication_rel r, pg_class c
+		  WHERE p.pubname = pub_name AND p.oid = r.prpubid AND r.prrelid=c.oid ORDER BY c.relname) parts;
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=pub_name) THEN
+		PERFORM pg_create_logical_replication_slot(pub_name, 'pgoutput');
+	END IF;
+
+	-- in this case it is simpler to recreate the pub, 'alter pub set table to;'
+	-- is not allowed
+	IF replicated_tables = '' AND currently_replicated_tables <> replicated_tables THEN
+		EXECUTE format('DROP PUBLICATION IF EXISTS %I', pub_name);
+	END IF;
+	IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = pub_name) THEN
+		RAISE LOG '[SHMN] recovery: creating publication %s', pub_name;
+		EXECUTE format('CREATE PUBLICATION %I', pub_name);
+	END IF;
+	IF replicated_tables <> '' AND currently_replicated_tables <> replicated_tables THEN
+		RAISE LOG '[SHMN] recovery: alter publication %s set table %s', pub_name, replicated_tables;
+		EXECUTE format('ALTER PUBLICATION %I SET TABLE %s', pub_name, replicated_tables);
+	END IF;
 END
 $$ LANGUAGE plpgsql;
 
@@ -1899,7 +1958,8 @@ BEGIN
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 
--- Parse connection string. This function is used by conninfo_to_postgres_fdw_opts to construct postgres_fdw options list.
+-- Parse connection string. This function is used by
+-- conninfo_to_postgres_fdw_opts to construct postgres_fdw options list.
 CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals text[])
 	RETURNS record AS 'pg_shardman' LANGUAGE C STRICT;
 
@@ -1942,7 +2002,8 @@ END
 $$ LANGUAGE plpgsql;
 
 
--- Wait completion of partition copy using LR
+-- Wait completion of partition copy using LR. After successfull execution,
+-- parts are fully synced and src part is locked.
 CREATE FUNCTION wait_copy_completion(src_node_id int, dst_node_id int, part_name text) RETURNS void AS $$
 DECLARE
 	slot text = format('copy_%s', part_name);
@@ -1957,30 +2018,39 @@ BEGIN
 	LOOP
 		IF NOT synced
 		THEN
-		    response := shardman.broadcast(format('%s:SELECT shardman.is_subscription_ready(%L);',
-				 dst_node_id, slot));
+		    response := shardman.broadcast(format(
+				'%s:SELECT shardman.is_subscription_ready(%L);',
+				dst_node_id, slot));
 			IF response::bool THEN
 			    synced := true;
-				RAISE DEBUG '[SHMN] Table % sync completed', part_name;
+				RAISE DEBUG '[SHMN] Table % initial sync completed', part_name;
 				CONTINUE;
 			END IF;
 	    ELSE
-    	    IF NOT locked THEN
-			    response := shardman.broadcast(format('%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=%L;', src_node_id, slot));
-			ELSE
-				response := shardman.broadcast(format('%s:SELECT %L - confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=%L;', src_node_id, wal_lsn, slot));
+    	    IF locked THEN -- waiting for final sync
+				response := shardman.broadcast(format(
+					'%s:SELECT %L - confirmed_flush_lsn FROM pg_replication_slots
+					WHERE slot_name=%L;', src_node_id, wal_lsn, slot));
+			ELSE -- waiting for the lag < catchup threshold to lock
+			    response := shardman.broadcast(format(
+					'%s:SELECT pg_current_wal_lsn() - confirmed_flush_lsn
+					FROM pg_replication_slots WHERE slot_name=%L;',
+					src_node_id, slot));
 			END IF;
 			lag := response::bigint;
 
 			RAISE DEBUG '[SHMN] Replication lag %', lag;
 			IF locked THEN
-		        IF lag<=0 THEN
+		        IF lag <= 0 THEN
 			   	    RETURN;
 			    END IF;
 			ELSIF lag < caughtup_threshold THEN
-	   	        PERFORM shardman.broadcast(format('%s:CREATE TRIGGER write_protection BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH STATEMENT EXECUTE PROCEDURE shardman.deny_access();',
+	   	        PERFORM shardman.broadcast(format(
+					'%s:CREATE TRIGGER write_protection BEFORE INSERT OR UPDATE OR DELETE ON
+					%I FOR EACH STATEMENT EXECUTE PROCEDURE shardman.deny_access();',
 					src_node_id, part_name));
-				SELECT shardman.broadcast(format('%s:SELECT pg_current_wal_lsn();', src_node_id)) INTO wal_lsn;
+				SELECT shardman.broadcast(format('%s:SELECT pg_current_wal_lsn();',
+												 src_node_id)) INTO wal_lsn;
 				locked := true;
 				CONTINUE;
 			END IF;
@@ -2462,7 +2532,7 @@ END
 $$ LANGUAGE plpgsql STRICT;
 
 
--- Remove all shardman state (LR stuff, synchronous_standby_names). If
+-- Remove all shardman state (LR stuff, foreign servers). If
 -- drop_slots_with_fire is true, we will kill walsenders before dropping LR
 -- slots.
 -- We reset synchronous_standby_names to empty string after commit,
@@ -2474,9 +2544,23 @@ DECLARE
 	pub record;
 	sub record;
 	rs record;
+	ftable_name name;
 BEGIN
 	-- otherwise we might hang
 	SET LOCAL synchronous_commit TO LOCAL;
+
+	-- It is a bad idea to drop foreign tables which are partitions, because
+	-- currently there is no way in pathman to attach partition again later and
+	-- we won't be able to recover the node. We would better create dummy
+	-- foreign server and bind ftables to it.
+	CREATE SERVER IF NOT EXISTS shardman_dummy FOREIGN DATA WRAPPER postgres_fdw;
+	FOR ftable_name IN SELECT ftrelid::regclass::name FROM
+		pg_foreign_table ft, pg_foreign_server fs WHERE srvname LIKE 'node_%' AND
+		ft.ftserver = fs.oid
+	LOOP
+		PERFORM shardman.alter_ftable_set_server(ftable_name, 'shardman_dummy',
+												 server_not_needed => true);
+	END LOOP;
 
 	FOR srv IN SELECT srvname FROM pg_foreign_server WHERE srvname LIKE 'node_%' LOOP
 		EXECUTE format('DROP SERVER %I CASCADE', srv.srvname);
