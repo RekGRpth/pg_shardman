@@ -57,6 +57,7 @@ class Shardlord(PostgresNode):
             log_min_messages = DEBUG1
             client_min_messages = NOTICE
             log_replication_commands = on
+            log_statement = none
             TimeZone = 'Europe/Moscow'
             log_timezone = 'Europe/Moscow'
             """
@@ -372,7 +373,6 @@ class ShardmanTests(unittest.TestCase):
         self.lord.create_cluster(2, 2)
         self.lord.safe_psql(
             DBNAME, 'create table pt(id int primary key, payload int);')
-        # shard table
         self.lord.safe_psql(
             DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
         self.lord.workers[0].safe_psql(
@@ -530,7 +530,7 @@ class ShardmanTests(unittest.TestCase):
 
     #     self.pt_cleanup()
 
-    def test_recover(self):
+    def test_recover_basic(self):
         self.lord.create_cluster(2, 3)
         self.lord.safe_psql(
             DBNAME, 'create table pt(id int primary key, payload int default 1);')
@@ -554,6 +554,59 @@ class ShardmanTests(unittest.TestCase):
         # and make sure data is still consistent
         self.pt_everyone_sees_the_whole()
         self.pt_replicas_integrity()
+
+        self.pt_cleanup()
+
+    # Move part between two nodes with the 3rd node killed. Insert some data,
+    # remember sum. Then run recover and make sure data is consistent.
+    def test_mv_partition_with_offline_node(self):
+        self.lord.start_lord()
+        src, src_id = self.lord.add_node()
+        dst, dst_id = self.lord.add_node()
+        watcher, watcher_id = self.lord.add_node()
+
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 5);")
+        src.safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int")
+        luke_sum_before_move = int(src.execute(DBNAME, sum_query("pt"))[0][0])
+
+        part_to_move = self.lord.execute(
+            DBNAME,
+            "select part_name from shardman.partitions where node_id = {};" \
+            .format(src_id))[0][0]
+        watcher.stop() # shut down watcher
+        ret, out, err = self.lord.psql(
+            DBNAME, "select shardman.mv_partition('{}', {})" \
+            .format(part_to_move, dst_id))
+        self.assertTrue(ret == 0)
+        self.assertTrue('FDW mappings update failed on some nodes' in err.decode())
+
+        # Insert some more data. This will fail for keys belonging to watcher,
+        # so insert one-by-one
+        with src.connect() as con:
+            for key in range(1001, 1200):
+                try:
+                    src.execute(
+                        DBNAME,
+                        "insert into pt values ({}, (random() * 100)::int);".format(key))
+                except Exception:
+                    pass
+        watcher.start() # get watcher back online
+        luke_sum = int(src.execute(DBNAME, sum_query("pt"))[0][0])
+        # make sure we actually inserted something
+        self.assertTrue(luke_sum > luke_sum_before_move)
+        # and another node confirms that
+        self.assertTrue(luke_sum == int(dst.execute(DBNAME, sum_query("pt"))[0][0]))
+
+        self.lord.safe_psql(DBNAME, "select shardman.recover()") # let it know about mv
+
+        for worker in [src, dst, watcher]:
+            worker_sum = int(worker.execute(DBNAME, sum_query("pt"))[0][0])
+            self.assertEqual(luke_sum, worker_sum)
 
         self.pt_cleanup()
 
@@ -739,6 +792,8 @@ def suite():
     suite.addTest(ShardmanTests('test_rebalance'))
     suite.addTest(ShardmanTests('test_deadlock_detector'))
     suite.addTest(ShardmanTests('test_recover_xacts_no_xacts'))
+    suite.addTest(ShardmanTests('test_recover_basic'))
+    suite.addTest(ShardmanTests('test_mv_partition_with_offline_node'))
     suite.addTest(ShardmanTests('test_copy_from'))
     return suite
 
