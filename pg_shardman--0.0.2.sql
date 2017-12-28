@@ -840,11 +840,11 @@ BEGIN
 	END IF;
 
 	-- Copy partition data to new location
-	pubs := format('%s:CREATE PUBLICATION copy_%s FOR TABLE %I;
-		 			%s:SELECT pg_create_logical_replication_slot(''copy_%s'', ''pgoutput'');',
+	pubs := format('%s:CREATE PUBLICATION shardman_copy_%s FOR TABLE %I;
+		 			%s:SELECT pg_create_logical_replication_slot(''shardman_copy_%s'', ''pgoutput'');',
 		 src_node_id, mv_part_name, mv_part_name,
 		 src_node_id, mv_part_name);
-	subs := format('%s:CREATE SUBSCRIPTION copy_%s CONNECTION %L PUBLICATION copy_%s with (create_slot=false, slot_name=''copy_%s'', synchronous_commit=local);',
+	subs := format('%s:CREATE SUBSCRIPTION shardman_copy_%s CONNECTION %L PUBLICATION shardman_copy_%s with (create_slot=false, slot_name=''shardman_copy_%s'', synchronous_commit=local);',
 		 dst_node_id, mv_part_name, conn_string, mv_part_name, mv_part_name);
 
 	-- Create publication and slot for copying
@@ -857,11 +857,28 @@ BEGIN
 	RAISE NOTICE 'Copy of partition % from node % to % is completed',
 		 mv_part_name, src_node_id, dst_node_id;
 
-	pubs := format('%s:DROP PUBLICATION copy_%s;', src_node_id, mv_part_name);
+	pubs := '';
 	subs := '';
 
-	-- Update replication channels
-	FOR repl_node_id IN SELECT node_id from shardman.replicas WHERE part_name=mv_part_name
+	-- Drop temporary LR channel
+	PERFORM shardman.broadcast(format('%s:DROP PUBLICATION shardman_copy_%s;',
+									  src_node_id, mv_part_name),
+									  super_connstr => true);
+	-- drop sub cannot be executed in multi-command string, so don't set
+	-- synchronous_commit to local
+	PERFORM shardman.broadcast(format(
+		'%s:DROP SUBSCRIPTION shardman_copy_%s;',
+		dst_node_id, mv_part_name), super_connstr => true, sync_commit_on => true);
+
+	-- Drop old channels and establish new ones. We don't care much about the
+	-- order of actions: if recover() initially fixes LR channels and only then
+	-- repairs mappings, we will be fine anyway: all nodes currently see old
+	-- location which is locked for writes, and will be unlocked (if needed)
+	-- only after fixing channels and mappings. Ideally we should also block
+	-- reads of old partition to prevent returning stale data.
+	pubs := '';
+	subs := '';
+	FOR repl_node_id IN SELECT node_id FROM shardman.replicas WHERE part_name=mv_part_name
 	LOOP
 		pubs := format('%s%s:ALTER PUBLICATION node_%s DROP TABLE %I;
 			 			  %s:ALTER PUBLICATION node_%s ADD TABLE %I;',
@@ -877,9 +894,6 @@ BEGIN
 	PERFORM shardman.broadcast(pubs, super_connstr => true);
 	-- Broadcast alter subscription commands
 	PERFORM shardman.broadcast(subs, super_connstr => true);
-	-- Drop copy subscription
-	PERFORM shardman.broadcast(format('%s:DROP SUBSCRIPTION copy_%s;',
-		 dst_node_id, mv_part_name), sync_commit_on => true, super_connstr => true);
 
     -- Now, with source part locked and dst part fully copied, update owner of
     -- this partition: we consider move as completed at this point. We must make
@@ -1278,7 +1292,8 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Check consistency of cluster with metadata and perform recovery
+-- Check consistency of cluster against metadata and perform recovery. All nodes
+-- must be up for successfull completion.
 CREATE FUNCTION recover() RETURNS void AS $$
 DECLARE
 	dst_node shardman.nodes;
@@ -1307,17 +1322,118 @@ DECLARE
 	sync_standbys text[];
 	old_sync_policy text;
 	new_sync_policy text;
+	node record;
+	prim name;
+	foreign_part name;
 BEGIN
 	IF shardman.redirect_to_shardlord('recover()')
 	THEN
 		RETURN;
 	END IF;
 
+	-- Remove potentially hanged temporary pub and sub used for mv_partition,
+	-- truncate & forbid writes to not used partitions, unlock used partitions
+	-- to fix up things after suddenly failed mv_partition. Yeah, since
+	-- currently we don't log executed commands, we have to do that everywhere.
+	FOR node IN SELECT n.id,
+		ARRAY(SELECT prims.part_name FROM shardman.partitions prims WHERE n.id = prims.node_id) primary_parts,
+		ARRAY(SELECT part_name FROM shardman.partitions
+			   WHERE part_name NOT IN
+					 (SELECT prims.part_name FROM shardman.partitions prims WHERE n.id = prims.node_id)
+				 AND part_name NOT IN
+					 (SELECT repls.part_name FROM shardman.replicas repls WHERE n.id = repls.node_id)) foreign_parts
+		FROM shardman.nodes n
+	LOOP
+		subs := format('%s{%s:SELECT shardman.drop_copy_sub();', subs, node.id);
+		FOREACH prim IN ARRAY node.primary_parts LOOP -- unlock local parts
+			subs := format('%s SELECT shardman.write_protection_off(%L::regclass);',
+						   subs, prim);
+		END LOOP;
+		FOREACH foreign_part IN ARRAY node.foreign_parts LOOP -- lock foreign parts
+			subs := format('%s SELECT shardman.write_protection_on(%L::regclass);
+						   TRUNCATE %I;',
+						   subs, foreign_part, foreign_part);
+		END LOOP;
+		subs := subs || '}';
+
+		pubs := format('%s%s:SELECT shardman.drop_copy_pub();', pubs, node.id);
+	END LOOP;
+	PERFORM shardman.broadcast(subs, super_connstr => true);
+	PERFORM shardman.broadcast(pubs, super_connstr => true);
+
+	-- Fix replication channels
+	pubs := '';
+	subs := '';
+	FOR repl_group IN SELECT DISTINCT replication_group FROM shardman.nodes
+	LOOP
+		FOR src_node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group
+		LOOP
+			FOR dst_node IN SELECT * FROM shardman.nodes
+				WHERE replication_group = repl_group AND id <> src_node.id
+			LOOP
+				pub_name := format('node_%s', dst_node.id);
+				sub_name := format('sub_%s_%s', dst_node.id, src_node.id);
+
+				-- Construct list of partitions which need to be published from
+				-- src node to dst node
+				SELECT coalesce(string_agg(pname, ','), '') INTO replicated_tables FROM
+					(SELECT p.part_name pname FROM shardman.partitions p, shardman.replicas r
+					  WHERE p.node_id = src_node.id AND r.node_id = dst_node.id AND
+							p.part_name = r.part_name ORDER BY p.part_name) parts;
+
+				pubs := format('%s%s:SELECT shardman.recover_pub(%L, %L);',
+							   pubs, src_node.id, pub_name, replicated_tables);
+
+				-- Create subscription if not exists
+				-- FIXME: we ought to recreate sub anyway if slot/pub was
+				-- recreated
+				IF shardman.not_exists(dst_node.id, format(
+					'pg_subscription WHERE subname=%L', sub_name))
+				THEN
+					RAISE NOTICE 'Creating subscription % at node %', sub_name, dst_node.id;
+					subs := format('%s%s:CREATE SUBSCRIPTION %I CONNECTION %L PUBLICATION %I WITH (copy_data=false, create_slot=false, slot_name=%L, synchronous_commit=local);',
+						 subs, dst_node.id, sub_name, src_node.connection_string, pub_name, pub_name);
+				END IF;
+			END LOOP;
+
+			-- Restore synchronous standby list
+			IF shardman.synchronous_replication()
+			THEN
+				new_sync_policy := shardman.construct_ssnames(src_node.id);
+
+				SELECT shardman.broadcast(format(
+					'%s:SELECT setting from pg_settings
+					WHERE name=''synchronous_standby_names'';', src_node.id))
+				INTO old_sync_policy;
+
+				IF old_sync_policy <> new_sync_policy
+				THEN
+					RAISE NOTICE 'Alter synchronous_standby_names to ''%'' at node %', new_sync_policy, src_node.id;
+					sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
+								   sync, src_node.id, new_sync_policy);
+					conf := format('%s%s:SELECT pg_reload_conf();', conf, src_node.id);
+				END IF;
+			END IF;
+		END LOOP;
+	END LOOP;
+
+	-- Create missing publications and repslots
+	PERFORM shardman.broadcast(pubs, super_connstr => true);
+	-- Create missing subscriptions
+	PERFORM shardman.broadcast(subs, super_connstr => true);
+
+	IF sync <> ''
+	THEN -- Alter synchronous_standby_names if needed
+		-- alter system must be one-line command, don't set synchronous_commit
+		PERFORM shardman.broadcast(sync, super_connstr => true, sync_commit_on => true);
+    	PERFORM shardman.broadcast(conf, super_connstr => true);
+	END IF;
+
 	-- Restore FDWs
-	FOR src_node in SELECT * FROM shardman.nodes
+	FOR src_node IN SELECT * FROM shardman.nodes
 	LOOP
 		-- Restore foreign servers
-		FOR dst_node in SELECT * FROM shardman.nodes
+		FOR dst_node IN SELECT * FROM shardman.nodes
 		LOOP
 			IF src_node.id<>dst_node.id
 			THEN
@@ -1438,72 +1554,6 @@ BEGIN
 		END LOOP;
 	END LOOP;
 
-	-- Restore replication channels
-	FOR repl_group IN SELECT DISTINCT replication_group FROM shardman.nodes
-	LOOP
-		FOR src_node IN SELECT * FROM shardman.nodes WHERE replication_group = repl_group
-		LOOP
-			FOR dst_node IN SELECT * FROM shardman.nodes
-				WHERE replication_group = repl_group AND id <> src_node.id
-			LOOP
-				pub_name := format('node_%s', dst_node.id);
-				sub_name := format('sub_%s_%s', dst_node.id, src_node.id);
-
-				-- Construct list of partitions which need to be published from
-				-- src node to dst node
-				SELECT coalesce(string_agg(pname, ','), '') INTO replicated_tables FROM
-					(SELECT p.part_name pname FROM shardman.partitions p, shardman.replicas r
-					  WHERE p.node_id = src_node.id AND r.node_id = dst_node.id AND
-							p.part_name = r.part_name ORDER BY p.part_name) parts;
-
-				pubs := format('%s%s:SELECT shardman.recover_pub(%L, %L);',
-							   pubs, src_node.id, pub_name, replicated_tables);
-
-				-- Create subscription if not exists
-				-- FIXME: we ought to recreate sub anyway if slot/pub was
-				-- recreated
-				IF shardman.not_exists(dst_node.id, format(
-					'pg_subscription WHERE subname=%L', sub_name))
-				THEN
-					RAISE NOTICE 'Creating subscription % at node %', sub_name, dst_node.id;
-					subs := format('%s%s:CREATE SUBSCRIPTION %I CONNECTION %L PUBLICATION %I WITH (copy_data=false, create_slot=false, slot_name=%L, synchronous_commit=local);',
-						 subs, dst_node.id, sub_name, src_node.connection_string, pub_name, pub_name);
-				END IF;
-			END LOOP;
-
-			-- Restore synchronous standby list
-			IF shardman.synchronous_replication()
-			THEN
-				new_sync_policy := shardman.construct_ssnames(src_node.id);
-
-				SELECT shardman.broadcast(format(
-					'%s:SELECT setting from pg_settings
-					WHERE name=''synchronous_standby_names'';', src_node.id))
-				INTO old_sync_policy;
-
-				IF old_sync_policy <> new_sync_policy
-				THEN
-					RAISE NOTICE 'Alter synchronous_standby_names to ''%'' at node %', new_sync_policy, src_node.id;
-					sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
-								   sync, src_node.id, new_sync_policy);
-					conf := format('%s%s:SELECT pg_reload_conf();', conf, src_node.id);
-				END IF;
-			END IF;
-		END LOOP;
-	END LOOP;
-
-	-- Create missing publications
-	PERFORM shardman.broadcast(pubs, super_connstr => true);
-	-- Create missing subscriptions
-	PERFORM shardman.broadcast(subs, super_connstr => true);
-
-	IF sync <> ''
-	THEN -- Alter synchronous_standby_names if needed
-		PERFORM shardman.broadcast(sync, sync_commit_on => true, super_connstr => true);
-    	PERFORM shardman.broadcast(conf, super_connstr => true);
-	END IF;
-
-
 	-- Restore shared tables
 	pubs := '';
 	subs := '';
@@ -1584,6 +1634,33 @@ BEGIN
 
 	-- Create not existed on_change triggers
 	PERFORM shardman.generate_on_change_triggers();
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION drop_copy_sub() RETURNS void AS $$
+DECLARE
+	sub_name name;
+BEGIN
+	FOR sub_name IN SELECT subname FROM pg_subscription WHERE subname LIKE 'shardman_copy_%'
+	LOOP
+		PERFORM shardman.eliminate_sub(sub_name);
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION drop_copy_pub() RETURNS void AS $$
+DECLARE
+	pub_name name;
+	slotname name;
+BEGIN
+	FOR pub_name IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'shardman_copy_%'
+	LOOP
+		EXECUTE format('DROP PUBLICATION %I', pub_name);
+	END LOOP;
+	FOR slotname IN SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'shardman_copy_%'
+	LOOP
+		PERFORM pg_drop_replication_slot(slotname);
+	END LOOP;
 END
 $$ LANGUAGE plpgsql;
 
@@ -2030,7 +2107,7 @@ $$ LANGUAGE plpgsql;
 -- parts are fully synced and src part is locked.
 CREATE FUNCTION wait_copy_completion(src_node_id int, dst_node_id int, part_name text) RETURNS void AS $$
 DECLARE
-	slot text = format('copy_%s', part_name);
+	slot text = format('shardman_copy_%s', part_name);
 	lag bigint;
 	response text;
 	caughtup_threshold bigint = 1024*1024;
@@ -2085,7 +2162,8 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Disable writes to the partition
+-- Disable writes to the partition, if we are not replica. This is handy because
+-- we use replication to copy table.
 CREATE FUNCTION write_protection_on(part regclass) RETURNS void AS $$
 BEGIN
 	IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'write_protection' AND
@@ -2110,7 +2188,7 @@ $$ LANGUAGE plpgsql;
 -- Trigger procedure prohibiting modification of the table
 CREATE FUNCTION deny_access() RETURNS trigger AS $$
 BEGIN
-    RAISE EXCEPTION 'This partition was moved to another node. Run shardman.recovery(), if this error persists.';
+    RAISE EXCEPTION 'This partition was moved to another node. Run shardman.recover(), if this error persists.';
 END
 $$ LANGUAGE plpgsql;
 
@@ -2527,7 +2605,7 @@ DECLARE
 	kill_ws_times int := 3;
 BEGIN
 	RAISE DEBUG '[SHMN] Dropping repslot %', slot_name;
-	EXECUTE format('SELECT EXISTS (SELECT * FROM pg_replication_slots
+	EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_replication_slots
 				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
 		IF with_fire THEN -- kill walsender several times
