@@ -470,13 +470,13 @@ BEGIN
 			IF node.id=new_master_id THEN
 			    -- At new master node replace foreign link with local partition
 				prts := format('%s%s:SELECT shardman.replace_foreign_with_real(%L);',
-			 				   part.part_name);
+			 				   prts, node.id, part.part_name);
 			ELSE
 				-- At all other nodes adjust foreign server for foreign table to
 				-- refer to new master node.
 				prts := format(
 					'%s%s:SELECT shardman.alter_ftable_set_server(%L, ''node_%s'', true);',
-		   			prts, node.id, fdw_part_name, new_master_id);
+		   			prts, node.id, part.part_name || '_fdw', new_master_id);
 			END IF;
 		END LOOP;
 	END LOOP;
