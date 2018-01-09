@@ -22,6 +22,9 @@ from testgres import PostgresNode, TestgresConfig, NodeStatus
 DBNAME = "postgres"
 NODE_NAMES = ["Luke", "C3PO", "Palpatine", "DarthMaul", "jabba", "bobafett"]
 
+def common_conn_string(port):
+    return "dbname={} port={}".format(DBNAME, port)
+
 class Shardlord(PostgresNode):
     def __init__(self, name, port=None):
         # worker_id (int) -> PostgresNode
@@ -38,12 +41,8 @@ class Shardlord(PostgresNode):
                                         use_logging=True)
         super(Shardlord, self).init()
 
-    @staticmethod
-    def _common_conn_string(port):
-        return "dbname={} port={}".format(DBNAME, port)
-
     def _shardlord_connstring(self):
-        return self._common_conn_string(self.port)
+        return common_conn_string(self.port)
 
     def _common_conf_lines(self):
         return (
@@ -82,12 +81,14 @@ class Shardlord(PostgresNode):
         return self
 
     # create fresh cluster with given num of repgroups and nodes in each one
-    def create_cluster(self, num_repgroups, nodes_in_repgroup=1):
+    def create_cluster(self, num_repgroups, nodes_in_repgroup=1,
+                       worker_creation_cbk=None):
         self.destroy_cluster()
         self.start_lord()
         for rgnum in range(num_repgroups):
             for nodenum in range(nodes_in_repgroup):
-                self.add_node(repl_group="rg_{}".format(rgnum))
+                self.add_node(repl_group="rg_{}".format(rgnum),
+                              worker_creation_cbk=worker_creation_cbk)
 
     # destroy and shutdown everything, but keep nodes
     def destroy_cluster(self):
@@ -177,19 +178,26 @@ class Shardlord(PostgresNode):
         node.append_conf("postgresql.conf", config_lines)
         return node;
 
-    # Add worker using reserved node, returns node instance, node id pair
-    def add_node(self, repl_group=None, additional_conf=""):
+    # Add worker using reserved node, returns node instance, node id pair.
+    # Callback is called when node is started, but not yet registred. It might
+    # return conn_string, uh.
+    def add_node(self, repl_group=None, additional_conf="", worker_creation_cbk=None):
         node = self.pop_worker()
 
         # start this node
         node.append_conf("postgresql.conf", additional_conf) \
             .start() \
-            .safe_psql(DBNAME, "drop extension if exists pg_shardman; create extension pg_shardman cascade;")
+            .safe_psql(DBNAME, "create extension pg_shardman cascade;")
+        # call callback, if needed
+        conn_string = None
+        if worker_creation_cbk:
+            conn_string = worker_creation_cbk(node)
+        conn_string = "'{}'".format(conn_string) if conn_string else 'NULL';
+        repl_group = "'{}'".format(repl_group) if repl_group else 'NULL';
         # and register this node
-        conn_string = self._common_conn_string(node.port)
-        add_node_cmd = "select shardman.add_node('{}' {})".format(
-            conn_string, ", repl_group => '{}'".format(repl_group) if repl_group
-            else '')
+        super_conn_string = common_conn_string(node.port)
+        add_node_cmd = "select shardman.add_node('{}', conn_string => {}, " "repl_group => {})" \
+            .format(super_conn_string, conn_string, repl_group)
         new_node_id = int(self.execute(DBNAME, add_node_cmd)[0][0])
         self.workers_dict[new_node_id] = node
 
@@ -417,6 +425,57 @@ class ShardmanTests(unittest.TestCase):
         self.pt_replicas_integrity()
 
         self.pt_cleanup()
+
+    # perform basic steps: add nodes, shard table, rebalance it and rm table
+    # with non-super user.
+    def test_non_super_user(self):
+        self.lord.start_lord()
+
+        # shard some table, make sure everyone sees it and replicas are good
+        os.environ["PGPASSWORD"] = "12345"
+        self.lord.create_cluster(3, 2, worker_creation_cbk=non_super_user_cbk)
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 12, redundancy => 1);")
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int",
+            username='joe')
+
+        # everyone sees the whole
+        luke_sum = int(self.lord.workers[0].execute(
+            DBNAME, sum_query("pt"), username='joe')[0][0])
+        for worker in self.lord.workers[1:]:
+            worker_sum = int(worker.execute(
+                DBNAME, sum_query("pt"), username='joe')[0][0])
+            self.assertEqual(luke_sum, worker_sum)
+
+        # replicas integrity
+        parts = self.lord.execute(
+            DBNAME, "select part_name, node_id from shardman.partitions")
+        for part_name, node_id in parts:
+            part_sum = self.lord.workers_dict[int(node_id)].execute(
+                DBNAME, sum_query(part_name), username='joe')
+            replicas = self.lord.execute(
+                DBNAME,
+                "select node_id from shardman.replicas where part_name = '{}'" \
+                .format(part_name))
+            for replica in replicas:
+                replica_id = int(replica[0])
+                replica_sum = self.lord.workers_dict[replica_id].execute(
+                    DBNAME, sum_query(part_name), username='joe')
+                self.assertEqual(part_sum, replica_sum)
+
+        # now rm table
+        self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
+        for worker in self.lord.workers:
+            ptrels = worker.execute(
+                DBNAME, "select relname from pg_class where relname ~ '^pt.*';")
+            self.assertEqual(len(ptrels), 0)
+
+        self.lord.safe_psql(DBNAME, "drop table pt;")
+        self.lord.destroy_cluster()
 
     def test_deadlock_detector(self):
         self.lord.create_cluster(2)
@@ -779,6 +838,35 @@ b"""1
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt_text');")
         self.lord.safe_psql(DBNAME, "drop table pt_text;")
         self.lord.destroy_cluster()
+
+# Create user joe and allow it to use shardman; configure pg_hba accordingly.
+# Unfortunately, we must use password, because postgres_fdw forbids passwordless
+# access for non-superusers
+def non_super_user_cbk(worker):
+    worker.safe_psql(DBNAME,
+                     """
+                     set synchronous_commit to local;
+	             drop role if exists joe;
+	             create role joe login password '12345';
+	             grant usage on foreign data wrapper postgres_fdw to joe;
+	             grant all privileges on schema shardman to group joe;
+                     """)
+    worker.stop()
+    hba_conf_path = os.path.join(worker.data_dir, "pg_hba.conf")
+    with open(hba_conf_path, "w") as hba_conf_file:
+        pg_hba = [
+            "local\tall\tjoe\tpassword\n",
+            "local\tall\tall\ttrust\n",
+            "host\tall\tall\t127.0.0.1/32\ttrust\n",
+            "local\treplication\tall\ttrust\n",
+            "host\treplication\tall\t127.0.0.1/32\ttrust\n"
+            "host\treplication\tall\t::1/128\ttrust\n"
+        ]
+        hba_conf_file.writelines(pg_hba)
+    worker.start()
+    conn_string = common_conn_string(worker.port) + " user=joe password=12345"
+    return conn_string
+
 
 # We violate good practices and order the tests -- it doesn't make sense to
 # e.g. test copy_from if add_node doesn't work.
