@@ -469,8 +469,6 @@ former is used for configuring logical replication, the latter for DDL and for
 setting up FDW, i.e. accessing the data. This separation serves two purposes:
   * It allows to work with the data without requiring superuser privileges.
   * It allows to set up pgbouncer, as replication can't go through it.
-If `conn_string` is employed, PostgreSQL user it allows to authenticate as must
-have `USAGE` permission on `postgres_fdw` FDW  and on `shardman` schema.
 If `conn_string` is `NULL`, `super_conn_string` is used everywhere.
 
 `repl_group` is the name of node's replication group. We have no explicit

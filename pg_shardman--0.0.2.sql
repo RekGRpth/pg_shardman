@@ -105,6 +105,7 @@ DECLARE
 	master_node_id int;
 	sys_id bigint;
 	conn_string_effective text = COALESCE(conn_string, super_conn_string);
+	conn_string_effective_user text;
 BEGIN
 	IF NOT shardman.is_shardlord()
 	THEN
@@ -113,18 +114,19 @@ BEGIN
 				   super_conn_string, conn_string, repl_group))::int;
 	END IF;
 
-	-- Insert new node in nodes table
+	-- Insert new node in nodes table.
+	-- We have to update system_id (and repl_group, for which we probably need
+	-- system_id) only after insert, because broadcast fetches connstring from
+	-- shardman.nodes itself.
 	INSERT INTO shardman.nodes (system_id, super_connection_string,
 								connection_string, replication_group)
 	VALUES (0, super_conn_string, conn_string_effective, '')
 		   RETURNING id INTO new_node_id;
 
-	-- We have to update system_id along with dependant repl_group after insert,
-	-- because otherwise broadcast will not work.
 	sys_id := shardman.broadcast(
 		format('%s:SELECT shardman.get_system_identifier();',
-			   new_node_id))::bigint;
-	IF EXISTS(SELECT 1 FROM shardman.nodes where system_id = sys_id) THEN
+			   new_node_id), super_connstr => true)::bigint;
+	IF EXISTS(SELECT 1 FROM shardman.nodes WHERE system_id = sys_id) THEN
 		RAISE EXCEPTION 'Node with system id % is already in the cluster', sys_id;
 	END IF;
 	UPDATE shardman.nodes SET system_id = sys_id WHERE id = new_node_id;
@@ -132,6 +134,19 @@ BEGIN
 	UPDATE shardman.nodes SET replication_group =
 		(CASE WHEN repl_group IS NULL THEN sys_id::text ELSE repl_group END)
 		WHERE id = new_node_id;
+
+	-- If conn_string is provided, make sure effective user has permissions on
+	-- shardman schema and postgres_fdw.
+	IF conn_string IS NOT NULL THEN
+		conn_string_effective_user := shardman.broadcast(
+			format('%s:SELECT current_user;', new_node_id),
+			super_connstr => false);
+		PERFORM shardman.broadcast(
+			format('{%s:GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO %s;
+				   GRANT USAGE ON SCHEMA shardman TO %s;}',
+				   new_node_id, conn_string_effective_user, conn_string_effective_user),
+			super_connstr => true);
+	END IF;
 
 	-- Adjust replication channels within replication group.
 	-- We need all-to-all replication channels between all group members.

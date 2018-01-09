@@ -839,7 +839,7 @@ b"""1
         self.lord.safe_psql(DBNAME, "drop table pt_text;")
         self.lord.destroy_cluster()
 
-# Create user joe and allow it to use shardman; configure pg_hba accordingly.
+# Create user joe for accessing data; configure pg_hba accordingly.
 # Unfortunately, we must use password, because postgres_fdw forbids passwordless
 # access for non-superusers
 def non_super_user_cbk(worker):
@@ -848,8 +848,6 @@ def non_super_user_cbk(worker):
                      set synchronous_commit to local;
 	             drop role if exists joe;
 	             create role joe login password '12345';
-	             grant usage on foreign data wrapper postgres_fdw to joe;
-	             grant all privileges on schema shardman to group joe;
                      """)
     worker.stop()
     hba_conf_path = os.path.join(worker.data_dir, "pg_hba.conf")
