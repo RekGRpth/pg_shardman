@@ -49,8 +49,9 @@ CREATE TABLE tables (
 -- Main partitions
 CREATE TABLE partitions (
 	part_name text PRIMARY KEY,
-	 -- node on which partition lies
-	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+	 -- Node on which partition lies. NULL, if node was removed and replica is
+	 -- not yet promoted.
+	node_id int REFERENCES nodes(id),
 	relation text NOT NULL REFERENCES tables(relation) ON DELETE CASCADE
 );
 
@@ -343,13 +344,14 @@ DECLARE
 	sync_standby_names text;
 	repl_group text;
 	master_node_id int;
+	err text;
 BEGIN
 	IF shardman.redirect_to_shardlord(format('rm_node(%L, %L)', rm_node_id, force))
 	THEN
 		RETURN;
 	END IF;
 
-	IF NOT EXISTS(SELECT * from shardman.nodes WHERE id=rm_node_id)
+	IF NOT EXISTS(SELECT * FROM shardman.nodes WHERE id=rm_node_id)
 	THEN
 	   	RAISE EXCEPTION 'Node % does not exist', rm_node_id;
  	END IF;
@@ -364,67 +366,67 @@ BEGIN
 
 	SELECT replication_group INTO repl_group FROM shardman.nodes WHERE id=rm_node_id;
 
-	-- Remove all subscriptions and publications of this node
-    FOR node IN SELECT * FROM shardman.nodes WHERE replication_group=repl_group AND id<>rm_node_id
-	LOOP
-		-- Drop publication and subscriptions for replicas
+	-- Clean removed node, if it is reachable. Better to do that before removing
+	-- pubs on other nodes to avoid 'with_fire' pub removal. However, it is also
+	-- would be good to do that *after* removing the node from metadata to avoid
+	-- recover() run if rm_node fails without touching metadata. We currently
+	-- can't do that, though, because broadcast would not know where to find
+	-- conn string.
+	PERFORM shardman.broadcast(format('%s:SELECT shardman.wipe_state();',
+									  rm_node_id),
+									  ignore_errors := true);
+
+	-- Remove node from metadata right away. We require from the user that after
+	-- calling rm_node the node must never be accessed, so it makes sense to
+	-- reflect metadata accordingly -- otherwise, we if fail somewhere down the
+	-- road below, the user would have been tempted to change her mind and not
+	-- to call rm_node again; it should be our responsibility to clean the things
+	-- up in recovery() in case of failure.
+	-- We want to see this change, so make sure we are running in READ COMMITTED.
+	-- We set node_id of node's parts to NULL, meaning they are waiting for
+	-- promotion. Replicas are removed with cascade.
+	ASSERT current_setting('transaction_isolation') = 'read committed',
+		'rm_node must be executed with READ COMMITTED isolation level';
+	PERFORM shardman.broadcast(format(
+		'{0:UPDATE shardman.partitions SET node_id=null WHERE node_id=%s;
+		DELETE FROM shardman.nodes WHERE id=%s;}',
+		rm_node_id, rm_node_id));
+
+	-- Remove all subscriptions and publications related to removed node
+    FOR node IN SELECT * FROM shardman.nodes WHERE replication_group=repl_group
+		LOOP
+		-- We don't remove pubs on removed node; wipe_state will handle that.
+		-- on other members of replication group
 		pubs := format('%s%s:DROP PUBLICATION node_%s;
-			 			  %s:DROP PUBLICATION node_%s;
-						  %s:SELECT pg_drop_replication_slot(''node_%s'');
 						  %s:SELECT pg_drop_replication_slot(''node_%s'');',
 			 pubs, node.id, rm_node_id,
-			 	   rm_node_id, node.id,
-				   node.id, rm_node_id,
-				   rm_node_id, node.id);
+				   node.id, rm_node_id);
 
-		subs := format('%s%s:SELECT shardman.eliminate_sub(''sub_%s_%s'');
-					    %s:SELECT shardman.eliminate_sub(''sub_%s_%s'');',
-						alts, rm_node_id, rm_node_id, node.id,
-						      node.id, node.id, rm_node_id);
+		subs := format('%s%s:SELECT shardman.eliminate_sub(''sub_%s_%s'');',
+						subs, node.id, node.id, rm_node_id);
 
 		-- Construct new synchronous standby list
-		-- TODO: now we construct it differently in 3 places. This should be
-		-- united.
-		sync_standbys :=
-			ARRAY(SELECT format('sub_%s_%s', id, node.id) FROM shardman.nodes
-				   WHERE replication_group = repl_group AND id <> node.id AND
-						 id<>rm_node_id);
-		sync_standby_names := CASE WHEN sync_standbys = '{}'::text[] THEN
-			''
-			ELSE
-			format('FIRST %s (%s)', array_length(sync_standbys, 1),
-				   array_to_string(sync_standbys, ','))
-			END;
 		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to %L;',
-					   sync, node.id, sync_standby_names);
+					   sync, node.id, shardman.construct_ssnames(node.id));
 		conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
-	END LOOP;
-
-	-- Drop shared tables subscriptions
-	FOR master_node_id IN SELECT DISTINCT master_node FROM shardman.tables
-		WHERE master_node IS NOT NULL
-	LOOP
-		subs := format('%s%s:SELECT shardman.eliminate_sub(share_%s_%s);',
-					   subs, rm_node_id, rm_node_id, master_node_id);
-		pubs := format('%s%s:SELECT pg_drop_replication_slot(''share_%s_%s'');',
-					   pubs, master_node_id, rm_node_id, master_node_id);
 	END LOOP;
 
 	-- Broadcast drop subscription commands, ignore errors because removed node
 	-- might be not available
-	PERFORM shardman.broadcast(subs,
-							   ignore_errors => true,
-							   super_connstr => true);
-
-    -- Broadcast drop replication commands
-    PERFORM shardman.broadcast(pubs, ignore_errors => true, super_connstr => true);
+	err := shardman.broadcast(subs, ignore_errors => true, super_connstr => true);
+	IF position('<error>' IN err) <> 0 THEN
+		RAISE WARNING 'Failed to rm subs taking changes from removed node % on some nodes',
+		  rm_node_id;
+	END IF;
+	err := shardman.broadcast(pubs, ignore_errors => true, super_connstr => true);
+	IF position('<error>' IN err) <> 0 THEN
+		RAISE WARNING 'Failed to rm pubs publishing changes to removed node % on some nodes',
+		  rm_node_id;
+	END IF;
 
 	-- In case of synchronous replication update synchronous standbys list
 	IF shardman.synchronous_replication()
 	THEN
-		-- On removed node, reset synchronous standbys list
-		sync := format('%s%s:ALTER SYSTEM SET synchronous_standby_names to '''';',
-			 sync, rm_node_id, sync_standbys);
 	    PERFORM shardman.broadcast(sync,
 								   ignore_errors => true,
 								   sync_commit_on => true,
@@ -433,31 +435,32 @@ BEGIN
 	END IF;
 
 	-- Exclude partitions of removed node, promote them on replicas, if any
-	FOR part IN SELECT * from shardman.partitions WHERE node_id=rm_node_id
+	FOR part IN SELECT * FROM shardman.partitions prts WHERE prts.node_id IS NULL
 	LOOP
-		-- If there are more than one replica of this partition, we need to
-		-- synchronize them
-		IF shardman.get_redundancy_of_partition(part.part_name) > 1
-		THEN
-			PERFORM shardman.synchronize_replicas(part.part_name);
-		END IF;
-
-		-- Is there some replica of this node?
+		-- Is there some replica of this part?
 		SELECT node_id INTO new_master_id FROM shardman.replicas
 		  WHERE part_name=part.part_name ORDER BY random() LIMIT 1;
 		IF new_master_id IS NOT NULL
-		THEN -- exists some replica for this node: redirect foreign table to
-			 -- this replica and refresh LR channels for this replication group
-			 -- Update partitions table: now replica is promoted to master...
-		    UPDATE shardman.partitions SET node_id=new_master_id
-			  WHERE part_name=part.part_name;
-			-- ... and is not a replica any more
-			DELETE FROM shardman.replicas WHERE part_name=part.part_name AND node_id=new_master_id;
+		THEN -- exists some replica for this part, promote it
+			-- If there are more than one replica of this partition, we need to
+			-- synchronize them
+			IF shardman.get_redundancy_of_partition(part.part_name) > 1
+			THEN
+				BEGIN
+					PERFORM shardman.synchronize_replicas(part.part_name);
+				EXCEPTION
+					WHEN external_routine_invocation_exception THEN
+						RAISE WARNING 'Failed to promote replicas after node % removal: couldn''t synchronize replicas',
+						rm_node_id USING DETAIL = SQLERRM, HINT = 'You should run recover() after resolving the problem';
+						EXIT;
+				END;
+			END IF;
 
 			pubs := '';
 			subs := '';
 			-- Refresh LR channels for this replication group
-			FOR repl IN SELECT * FROM shardman.replicas WHERE part_name=part.part_name
+			FOR repl IN SELECT * FROM shardman.replicas
+				WHERE part_name=part.part_name AND node_id != new_master_id
 			LOOP
 				-- Publish this partition at new master
 			    pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
@@ -467,17 +470,35 @@ BEGIN
 					 subs, repl.node_id, repl.node_id, new_master_id);
 			END LOOP;
 
-			-- Broadcast alter publication commands
-			PERFORM shardman.broadcast(pubs, super_connstr => true);
-			-- Broadcast refresh alter subscription commands
-			PERFORM shardman.broadcast(subs, super_connstr => true);
+			BEGIN
+				-- Broadcast alter publication commands
+				PERFORM shardman.broadcast(pubs, super_connstr => true);
+				-- Broadcast refresh alter subscription commands
+				PERFORM shardman.broadcast(subs, super_connstr => true);
+			EXCEPTION
+				WHEN external_routine_invocation_exception THEN
+					RAISE WARNING 'Failed to promote replicas after node % removal: couldn''t update LR channels',
+					rm_node_id USING DETAIL = SQLERRM, HINT = 'You should run recover() after resolving the problem';
+					EXIT;
+			END;
 		ELSE -- there is no replica: we have to create new empty partition at
 			 -- random mode and redirect all FDWs to it
+			RAISE WARNING 'Data of partition % was lost, creating empty partition.',
+				part.part_name;
 			SELECT id INTO new_master_id FROM shardman.nodes
 			  WHERE id<>rm_node_id ORDER BY random() LIMIT 1;
-		    INSERT INTO shardman.partitions (part_name,node_id,relation)
-			  VALUES (part.part.name,new_master_id,part.relation);
 		END IF;
+
+		-- Partition is successfully promoted, update metadata. It is important
+		-- to commit that before sending new mappings, because otherwise if we
+		-- fail during the latter, news about promoted replica will be lost;
+		-- next time we might choose another replica to promote with some new
+		-- data already written to previously promoted replica. Syncing
+		-- replicas doesn't help us much here if we don't lock tables.
+		PERFORM shardman.broadcast(format(
+			'{0:UPDATE shardman.partitions SET node_id=%s WHERE part_name = %L;
+			DELETE FROM shardman.replicas WHERE part_name = %L AND node_id = %s}',
+			new_master_id, part.part_name, part.part_name, new_master_id));
 
 		-- Update pathman partition map at all nodes
 		FOR node IN SELECT * FROM shardman.nodes WHERE id<>rm_node_id
@@ -497,15 +518,13 @@ BEGIN
 	END LOOP;
 
 	-- Broadcast changes of pathman mapping
-	PERFORM shardman.broadcast(prts, ignore_errors := true);
-
-	-- Clean removed node, if it is reachable
-	PERFORM shardman.broadcast(format('%s:SELECT shardman.wipe_state();',
-									  rm_node_id),
-							   ignore_errors := true);
-
-	-- Finally delete node from nodes table and all dependent tables
-	DELETE FROM shardman.nodes WHERE id=rm_node_id;
+	BEGIN
+		PERFORM shardman.broadcast(prts);
+	EXCEPTION
+		WHEN external_routine_invocation_exception THEN
+			RAISE WARNING 'Failed to update FDW mappings after node % removal',
+			rm_node_id USING DETAIL = SQLERRM, HINT = 'You should run recover() after resolving the problem';
+	END;
 END
 $$ LANGUAGE plpgsql;
 
@@ -942,7 +961,6 @@ BEGIN
 	END LOOP;
 
 	-- Broadcast replace hash partition commands
-	raise notice 'replace_parts is %s', replace_parts;
 	err := shardman.broadcast(replace_parts, ignore_errors => true);
 	IF position('<error>' IN err) <> 0 THEN
 		RAISE WARNING 'Partition % was successfully moved from % to %, but FDW mappings update failed on some nodes.',
@@ -1308,7 +1326,9 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Check consistency of cluster against metadata and perform recovery. All nodes
--- must be up for successfull completion.
+-- must be up for successfull completion. In general, at first we repair LR,
+-- i.e. make sure tables with data are replicated properly, and only then fix
+-- FDW mappings.
 CREATE FUNCTION recover() RETURNS void AS $$
 DECLARE
 	dst_node shardman.nodes;
@@ -1333,6 +1353,7 @@ DECLARE
 	old_replicated_tables text;
 	new_replicated_tables text;
 	replicated_tables text;
+	subscribed_tables text;
 	node_id int;
 	sync_standbys text[];
 	old_sync_policy text;
@@ -1340,6 +1361,7 @@ DECLARE
 	node record;
 	prim name;
 	foreign_part name;
+	new_master_id int;
 BEGIN
 	IF shardman.redirect_to_shardlord('recover()')
 	THEN
@@ -1376,6 +1398,45 @@ BEGIN
 	PERFORM shardman.broadcast(subs, super_connstr => true);
 	PERFORM shardman.broadcast(pubs, super_connstr => true);
 
+	-- Promote replica for parts without primary (or create new empty primary)
+	-- To fix LR, we need to see parts as promoted,
+	-- so make sure we are running in READ COMMITTED.
+	ASSERT current_setting('transaction_isolation') = 'read committed',
+		'recover must be executed with READ COMMITTED isolation level';
+	FOR part IN SELECT * FROM shardman.partitions prts WHERE prts.node_id IS NULL
+	LOOP
+		-- Is there some replica of this part?
+		SELECT r.node_id INTO new_master_id FROM shardman.replicas r
+		  WHERE r.part_name=part.part_name ORDER BY random() LIMIT 1;
+		IF new_master_id IS NOT NULL
+		THEN -- exists some replica for this part, promote it
+			-- If there are more than one replica of this partition, we need to
+			-- synchronize them
+			IF shardman.get_redundancy_of_partition(part.part_name) > 1
+			THEN
+				PERFORM shardman.synchronize_replicas(part.part_name);
+			END IF;
+			-- LR channels will be fixed below
+		ELSE -- there is no replica: we have to create new empty partition at
+			 -- random mode and redirect all FDWs to it
+			RAISE WARNING 'Data of partition % was lost, creating empty partition.',
+				part.part_name;
+			SELECT id INTO new_master_id FROM shardman.nodes
+				WHERE id<>rm_node_id ORDER BY random() LIMIT 1;
+		END IF;
+
+		-- Update metadata. It is important to commit that before sending new
+		-- mappings, because otherwise if we fail during the latter, news about
+		-- promoted replica will be lost; next time we might choose another
+		-- replica to promote with some new data already written to previously
+		-- promoted replica. Syncing replicas doesn't help us much here if we
+		-- don't lock tables.
+		PERFORM shardman.broadcast(format(
+			'{0:UPDATE shardman.partitions SET node_id=%s WHERE part_name = %L;
+			DELETE FROM shardman.replicas WHERE part_name = %L AND node_id = %s}',
+			new_master_id, part.part_name, part.part_name, new_master_id));
+	END LOOP;
+
 	-- Fix replication channels
 	pubs := '';
 	subs := '';
@@ -1399,15 +1460,26 @@ BEGIN
 				pubs := format('%s%s:SELECT shardman.recover_pub(%L, %L);',
 							   pubs, src_node.id, pub_name, replicated_tables);
 
-				-- Create subscription if not exists
-				-- FIXME: we ought to recreate sub anyway if slot/pub was
-				-- recreated
+				-- Create subscription if not exists. Otherwise, if list of
+				-- subscribed tables is not up-to-date, refresh it.
 				IF shardman.not_exists(dst_node.id, format(
 					'pg_subscription WHERE subname=%L', sub_name))
 				THEN
 					RAISE NOTICE 'Creating subscription % at node %', sub_name, dst_node.id;
 					subs := format('%s%s:CREATE SUBSCRIPTION %I CONNECTION %L PUBLICATION %I WITH (copy_data=false, create_slot=false, slot_name=%L, synchronous_commit=local);',
 						 subs, dst_node.id, sub_name, src_node.connection_string, pub_name, pub_name);
+				ELSE
+					subscribed_tables := shardman.broadcast(format(
+						$subrels$%s:SELECT coalesce(string_agg(srrelid::regclass::name, ','
+															   ORDER BY srrelid::regclass::name), '')
+						FROM pg_subscription_rel sr, pg_subscription s
+						WHERE sr.srsubid = s.oid AND s.subname = %L
+						GROUP BY srrelid;$subrels$,
+						dst_node.id, sub_name));
+					IF subscribed_tables <> replicated_tables THEN
+						subs := format('%s%s:ALTER SUBSCRIPTION %I REFRESH PUBLICATION WITH (copy_data=false);',
+									   subs, dst_node.id, sub_name, pub_name);
+					END IF;
 				END IF;
 			END LOOP;
 
@@ -1471,7 +1543,7 @@ BEGIN
 		END LOOP;
 
 		-- Restore foreign tables
-		FOR part IN SELECT * from shardman.partitions
+		FOR part IN SELECT * FROM shardman.partitions
 		LOOP
 			fdw_part_name := format('%s_fdw', part.part_name);
 			-- Create parent table if not exists
@@ -1997,9 +2069,11 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- Don't specify node id twice with 2pc, we use only one prepared_xact name.
 -- Node id '0' means shardlord, shardlord_connstring guc is used.
 -- No escaping is performed, so ';', '{' and '}' inside queries are not supported.
--- By default function throws error if execution has failed at some of the
--- nodes. With ignore_errors=true errors are ignored and each error is appended
--- to the function result in form of "<error>${node_id}:Something bad</error>"
+-- By default function throws error of type
+-- 'external_routine_invocation_exception' if execution has failed at some of
+-- the nodes. With ignore_errors=true errors are ignored and each error is
+-- appended to the function result in form of "<error>${node_id}:Something
+-- bad</error>"
 -- In case of normal completion this function returns comma-separated results
 -- for each run. A "result" is the first column of the first row of last
 -- statement.
@@ -2683,7 +2757,8 @@ BEGIN
 	-- currently there is no way in pathman to attach partition again later and
 	-- we won't be able to recover the node. We would better create dummy
 	-- foreign server and bind ftables to it.
-	CREATE SERVER IF NOT EXISTS shardman_dummy FOREIGN DATA WRAPPER postgres_fdw;
+	CREATE SERVER IF NOT EXISTS shardman_dummy FOREIGN DATA WRAPPER postgres_fdw
+		OPTIONS (hostaddr '192.0.2.42'); -- invalid ip
 	FOR ftable_name IN SELECT ftrelid::regclass::name FROM
 		pg_foreign_table ft, pg_foreign_server fs WHERE srvname LIKE 'node_%' AND
 		ft.ftserver = fs.oid
@@ -2698,6 +2773,9 @@ BEGIN
 
 	FOR pub IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'node_%' LOOP
 		EXECUTE format('DROP PUBLICATION %I', pub.pubname);
+	END LOOP;
+	FOR sub IN SELECT subname FROM pg_subscription WHERE subname LIKE 'share_%' LOOP
+		PERFORM shardman.eliminate_sub(sub.subname);
 	END LOOP;
 	FOR sub IN SELECT subname FROM pg_subscription WHERE subname LIKE 'sub_%' LOOP
 		PERFORM shardman.eliminate_sub(sub.subname);

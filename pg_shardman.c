@@ -176,7 +176,7 @@ broadcast(PG_FUNCTION_ARGS)
 	PGconn* con;
 	StringInfoData resp;
 
-	char const* errmsg = "";
+	char const* errstr = "";
 
 	elog(DEBUG1, "Broadcast commmand '%s'",  cmd);
 
@@ -237,12 +237,12 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s<error>%d:Connection failure: %s</error>",
-								  errmsg, node_id, PQerrorMessage(con));
+				errstr = psprintf("%s<error>%d:Connection failure: %s</error>",
+								  errstr, node_id, PQerrorMessage(con));
 				chan[n_cmds-1].sql = NULL;
 				continue;
 			}
-			errmsg = psprintf("Failed to connect to node %d: %s", node_id,
+			errstr = psprintf("Failed to connect to node %d: %s", node_id,
 							  PQerrorMessage(con));
 			goto cleanup;
 		}
@@ -264,12 +264,12 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s<error>%d:Failed to send query '%s': %s</error>",
-								  errmsg, node_id, sql, PQerrorMessage(con));
+				errstr = psprintf("%s<error>%d:Failed to send query '%s': %s</error>",
+								  errstr, node_id, sql, PQerrorMessage(con));
 				chan[n_cmds-1].sql = NULL;
 				continue;
 			}
-			errmsg = psprintf("Failed to send query '%s' to node %d: %s'", sql,
+			errstr = psprintf("Failed to send query '%s' to node %d: %s'", sql,
 							  node_id, PQerrorMessage(con));
 			goto cleanup;
 		}
@@ -311,11 +311,11 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s<error>%d:Failed to received response for '%s': %s</error>",
-								  errmsg, chan[i].node, chan[i].sql, PQerrorMessage(con));
+				errstr = psprintf("%s<error>%d:Failed to received response for '%s': %s</error>",
+								  errstr, chan[i].node, chan[i].sql, PQerrorMessage(con));
 				continue;
 			}
-			errmsg = psprintf("Failed to receive response for query %s from node %d: %s",
+			errstr = psprintf("Failed to receive response for query %s from node %d: %s",
 							  chan[i].sql, chan[i].node, PQerrorMessage(con));
 			goto cleanup;
 		}
@@ -326,12 +326,12 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (ignore_errors)
 			{
-				errmsg = psprintf("%s<error>%d:Command %s failed: %s</error>",
-								  errmsg, chan[i].node, chan[i].sql, PQerrorMessage(con));
+				errstr = psprintf("%s<error>%d:Command %s failed: %s</error>",
+								  errstr, chan[i].node, chan[i].sql, PQerrorMessage(con));
 				PQclear(res);
 				continue;
 			}
-			errmsg = psprintf("Command %s failed at node %d: %s",
+			errstr = psprintf("Command %s failed at node %d: %s",
 							  chan[i].sql, chan[i].node, PQerrorMessage(con));
 			PQclear(res);
 			goto cleanup;
@@ -352,7 +352,7 @@ broadcast(PG_FUNCTION_ARGS)
 				}
 				else
 				{
-					errmsg = psprintf("Query '%s' doesn't return single tuple at node %d",
+					errstr = psprintf("Query '%s' doesn't return single tuple at node %d",
 									  chan[i].sql, chan[i].node);
 					PQclear(res);
 					goto cleanup;
@@ -376,7 +376,7 @@ broadcast(PG_FUNCTION_ARGS)
 		con = chan[i].con;
 		if (two_phase)
 		{
-			if (*errmsg)
+			if (*errstr)
 			{
 				res = PQexec(con, "ROLLBACK PREPARED 'shardlord'");
 				if (PQresultStatus(res) != PGRES_COMMAND_OK)
@@ -400,17 +400,19 @@ broadcast(PG_FUNCTION_ARGS)
 		PQfinish(con);
 	}
 
-	if (*errmsg)
+	if (*errstr)
 	{
 		if (ignore_errors)
 		{
 			resetStringInfo(&resp);
-			appendStringInfoString(&resp, errmsg);
-			elog(WARNING, "SHARDMAN: %s", errmsg);
+			appendStringInfoString(&resp, errstr);
+			elog(WARNING, "SHARDMAN: %s", errstr);
 		}
 		else
 		{
-			elog(ERROR, "SHARDMAN: %s", errmsg);
+			ereport(ERROR,
+					(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+					 errmsg("SHARDMAN: %s", errstr)));
 		}
 	}
 

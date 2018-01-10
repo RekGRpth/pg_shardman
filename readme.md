@@ -335,8 +335,8 @@ excluded from the cluster with `rm_node` command. This function also promotes
 replicas of partitions held by removed node. The general procedure for failover
 is the following.
 * Make sure failed node is really turned off, and never make it online without
-  erasing its state -- otherwise stale reads and inconsistent writes on it
-  are possible.
+  erasing data on it, or make sure no one tries to access the node -- otherwise
+  stale reads and inconsistent writes on it are possible.
 * Run `select shardman.rm_node($failed_node_id, force => true)` to exclude it
   and promote replicas. The most advanced replica is choosen and state of other
   replicas is synchronized.
@@ -344,8 +344,7 @@ is the following.
   transactions.
 
 Note that presently some recent transactions (or parts of distributed
-transactions) transactions still might be lost as explained in 'Transactions'
-section.
+transactions) still might be lost as explained in 'Transactions' section.
 
 ## Shardlord failover
 
@@ -490,14 +489,13 @@ Get this worker's id. Executed on any worker node. Fails on shardlord.
 rm_node(rm_node_id int, force bool = false)
 ```
 Remove node from the cluster. If `force` is true, we don't care whether node
-contains any partitions. Otherwise we won't allow to rm node holding shards.
-We will try to remove shardman's stuff (pubs, subs, repslots) on deleted node if
-node is alive, but the command succeeds even if we can't. Currently we don't
-remove tables with data on removed node.
+contains any partitions. Otherwise we won't allow to rm node holding shards. We
+will try to execute `wipe_state` on deleted node if node is alive, but the
+command succeeds even if we can't. We don't remove tables with data on
+removed node.
 
 If node contained partitions, for each one we automatically promote random
-replica. NOTE: currently promotion procedure is not safe if there are more than
-1 replica because we don't handle different state of replicas.
+replica.
 
 ### Shards and replicas
 
@@ -628,11 +626,15 @@ message and retries access until `rm_node_timeout_sec` timeout expiration. After
 it node is removed from the cluster using `shardman.rm_node` function.  If
 redundancy level is non-zero, then primary partitions from the disabled node are
 replaced with replicas.  Finally `pg_shardman` performs recovery of distributed
-transactions which coordinators were at failed node.  It is done using
+transactions for which failed node was the coordinator. It is done using
 `shardman.recover_xacts()` function which collects status of distributed
 transaction at all participants and tries to make decision whether it should be
 committed or aborted.
 If `rm_node_timeout_sec` is `NULL`, `monitor` will not remove nodes.
+
+```plpgsql
+recover_xacts()
+```
 
 Function `shardman.recover_xacts()` can be also manually invoked by database
 administrator on shardlord after abnormal cluster restart to recover not
@@ -645,7 +647,7 @@ Postgres is needed for proper work of this function.
 
 Another limitation of `shardman.recover_xacts` is that we currently don't
 control recycling of WAL and clog used to check for completed transaction
-status. Though unlikely, theoretically it is possible that we won't be able to
+status. Though unlikely, in theory it is possible that we won't be able to
 learn it and resolve the transaction.
 
 ```plpgsql
