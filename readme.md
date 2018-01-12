@@ -667,6 +667,6 @@ Data is not touched by this command.
   * You should not touch `synchronous_standby_names` manually while using pg_shardman.
   * The shardlord itself can't be worker node for now.
   * All [limitations](https://github.com/postgrespro/pg_pathman/wiki/Known-limitations)  (and some features) of `pg_pathman`,
-	e.g. we don't support global primary keys and foreign keys to sharded tables.
+	e.g. we don't support global secondary indexes and foreign keys to sharded tables.
   * All [limitations of logical replications](https://www.postgresql.org/docs/10/static/logical-replication-restrictions.html).
     `TRUNCATE` statements on sharded tables will not be replicated.
