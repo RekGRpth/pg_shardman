@@ -5,3 +5,6 @@ bin/setup.sh
 
 *.pyc
 __pycache__
+
+env/
+venv/

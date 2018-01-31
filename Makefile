@@ -56,5 +56,9 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
 
+PYTHON = python3
 python_tests:
-	$(MAKE) -C tests/python
+	$(MAKE) -C tests/python PYTHON=$(PYTHON)
+
+# Special rule for PostgresPro
+testgres_check: python_tests
