@@ -161,6 +161,8 @@ broadcast(PG_FUNCTION_ARGS)
 	bool  sync_commit_on = PG_GETARG_BOOL(3);
 	bool  sequential = PG_GETARG_BOOL(4);
 	bool  super_connstr = PG_GETARG_BOOL(5);
+	char* iso_level = (PG_GETARG_POINTER(6) != NULL) ?
+		text_to_cstring(PG_GETARG_TEXT_PP(6)) : NULL;
 	char* sep;
 	char* sql;
 	PGresult *res;
@@ -175,6 +177,7 @@ broadcast(PG_FUNCTION_ARGS)
 	Channel* chan;
 	PGconn* con;
 	StringInfoData resp;
+	StringInfoData fin_sql;
 
 	char const* errstr = "";
 
@@ -246,30 +249,31 @@ broadcast(PG_FUNCTION_ARGS)
 							  PQerrorMessage(con));
 			goto cleanup;
 		}
+		/* Build the actual sql to send, mem freed with ctxt */
+		initStringInfo(&fin_sql);
 		if (!sync_commit_on)
-		{
-			/* mem freed with context */
-			if (two_phase)
-			{
-				sql = psprintf("SET SESSION synchronous_commit TO local; BEGIN; %s; PREPARE TRANSACTION 'shardlord';", sql);
-			}
-			else
-			{
-				sql = psprintf("SET SESSION synchronous_commit TO local; %s", sql);
-			}
-		}
-		elog(DEBUG1, "Sending command '%s' to node %d", sql, node_id);
-		if (!PQsendQuery(con, sql)
+			appendStringInfoString(&fin_sql, "SET SESSION synchronous_commit TO local; ");
+		if (iso_level)
+			appendStringInfo(&fin_sql, "BEGIN TRANSACTION ISOLATION LEVEL %s; ", iso_level);
+		appendStringInfoString(&fin_sql, sql);
+		appendStringInfoChar(&fin_sql, ';'); /* it was removed after strchr */
+		if (two_phase)
+			appendStringInfoString(&fin_sql, "PREPARE TRANSACTION 'shardlord';");
+		else if (iso_level)
+			appendStringInfoString(&fin_sql, "END;");
+
+		elog(DEBUG1, "Sending command '%s' to node %d", fin_sql.data, node_id);
+		if (!PQsendQuery(con, fin_sql.data)
 			|| (sequential && !wait_command_completion(con)))
 		{
 			if (ignore_errors)
 			{
 				errstr = psprintf("%s<error>%d:Failed to send query '%s': %s</error>",
-								  errstr, node_id, sql, PQerrorMessage(con));
+								  errstr, node_id, fin_sql.data, PQerrorMessage(con));
 				chan[n_cmds-1].sql = NULL;
 				continue;
 			}
-			errstr = psprintf("Failed to send query '%s' to node %d: %s'", sql,
+			errstr = psprintf("Failed to send query '%s' to node %d: %s'", fin_sql.data,
 							  node_id, PQerrorMessage(con));
 			goto cleanup;
 		}

@@ -262,7 +262,7 @@ BEGIN
     -- Broadcast create table commands
 	PERFORM shardman.broadcast(create_tables);
 	-- Broadcast create hash partitions command
-	PERFORM shardman.broadcast(create_partitions);
+	PERFORM shardman.broadcast(create_partitions, iso_level => 'read committed');
 	-- Broadcast create foreign table commands
 	PERFORM shardman.broadcast(create_fdws);
 	-- Broadcast replace hash partition commands
@@ -376,21 +376,11 @@ BEGIN
 									  rm_node_id),
 									  ignore_errors := true);
 
-	-- Remove node from metadata right away. We require from the user that after
-	-- calling rm_node the node must never be accessed, so it makes sense to
-	-- reflect metadata accordingly -- otherwise, we if fail somewhere down the
-	-- road below, the user would have been tempted to change her mind and not
-	-- to call rm_node again; it should be our responsibility to clean the things
-	-- up in recovery() in case of failure.
-	-- We want to see this change, so make sure we are running in READ COMMITTED.
 	-- We set node_id of node's parts to NULL, meaning they are waiting for
 	-- promotion. Replicas are removed with cascade.
-	ASSERT current_setting('transaction_isolation') = 'read committed',
-		'rm_node must be executed with READ COMMITTED isolation level';
-	PERFORM shardman.broadcast(format(
-		'{0:UPDATE shardman.partitions SET node_id=null WHERE node_id=%s;
-		DELETE FROM shardman.nodes WHERE id=%s;}',
-		rm_node_id, rm_node_id));
+	UPDATE shardman.partitions SET node_id = NULL WHERE node_id=rm_node_id;
+	DELETE FROM shardman.nodes WHERE id = rm_node_id;
+
 
 	-- Remove all subscriptions and publications related to removed node
     FOR node IN SELECT * FROM shardman.nodes WHERE replication_group=repl_group
@@ -489,16 +479,16 @@ BEGIN
 			  WHERE id<>rm_node_id ORDER BY random() LIMIT 1;
 		END IF;
 
-		-- Partition is successfully promoted, update metadata. It is important
-		-- to commit that before sending new mappings, because otherwise if we
-		-- fail during the latter, news about promoted replica will be lost;
-		-- next time we might choose another replica to promote with some new
-		-- data already written to previously promoted replica. Syncing
-		-- replicas doesn't help us much here if we don't lock tables.
-		PERFORM shardman.broadcast(format(
-			'{0:UPDATE shardman.partitions SET node_id=%s WHERE part_name = %L;
-			DELETE FROM shardman.replicas WHERE part_name = %L AND node_id = %s}',
-			new_master_id, part.part_name, part.part_name, new_master_id));
+		-- Partition is successfully promoted, update metadata. XXX: we should
+		-- commit that before sending new mappings, because otherwise if we fail
+		-- during the latter, news about promoted replica will be lost; next
+		-- time we might choose another replica to promote with some new data
+		-- already written to previously promoted replica. Syncing replicas
+		-- doesn't help us much here if we don't lock tables.
+		UPDATE shardman.partitions SET node_id = new_master_id
+		 WHERE part_name = part.part_name;
+		DELETE FROM shardman.replicas WHERE part_name = part.part_name AND
+											node_id = new_master_id;
 
 		-- Update pathman partition map at all nodes
 		FOR node IN SELECT * FROM shardman.nodes WHERE id<>rm_node_id
@@ -611,7 +601,6 @@ BEGIN
 		-- Create parent table at all nodes
 		create_tables := format('%s{%s:%s}',
 			create_tables, node.id, create_table);
-		-- Create partitions using pathman at all nodes
 		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
 			create_partitions, node.id, rel_name, expr, part_count);
 	END LOOP;
@@ -619,7 +608,7 @@ BEGIN
 	-- Broadcast create table commands
 	PERFORM shardman.broadcast(create_tables);
 	-- Broadcast create hash partitions command
-	PERFORM shardman.broadcast(create_partitions);
+	PERFORM shardman.broadcast(create_partitions, iso_level => 'read committed');
 
 	-- Get list of nodes in random order
 	SELECT ARRAY(SELECT id from shardman.nodes ORDER BY random()) INTO node_ids;
@@ -650,7 +639,7 @@ BEGIN
 	END LOOP;
 
 	-- Broadcast create foreign table commands
-	PERFORM shardman.broadcast(create_fdws);
+	PERFORM shardman.broadcast(create_fdws, iso_level => 'read committed');
 	-- Broadcast replace hash partition commands
 	PERFORM shardman.broadcast(replace_parts);
 
@@ -673,6 +662,7 @@ DECLARE
 	repl_group text;
 	pubs text = '';
 	subs text = '';
+	sub text = '';
 	sub_options text = '';
 BEGIN
 	IF shardman.redirect_to_shardlord(format('set_redundancy(%L, %L)', rel_name,
@@ -709,8 +699,12 @@ BEGIN
 				-- Establish publications and subscriptions for this partition
 				pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 					 pubs, part.node_id, repl_node, part.part_name);
-				subs := format('%s%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION%s;',
-					 subs, repl_node, repl_node, part.node_id, sub_options);
+				sub := format('%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION%s;',
+							  repl_node, repl_node, part.node_id, sub_options);
+				-- ignore duplicates
+				IF position(sub in subs) = 0 THEN
+					subs := subs || sub;
+				END IF;
 			END LOOP;
 		END IF;
 	END LOOP;
@@ -1410,6 +1404,7 @@ BEGIN
 		  WHERE r.part_name=part.part_name ORDER BY random() LIMIT 1;
 		IF new_master_id IS NOT NULL
 		THEN -- exists some replica for this part, promote it
+			RAISE DEBUG '[SHMN] Promoting part % on node %', part.part_name, new_master_id;
 			-- If there are more than one replica of this partition, we need to
 			-- synchronize them
 			IF shardman.get_redundancy_of_partition(part.part_name) > 1
@@ -1425,16 +1420,20 @@ BEGIN
 				WHERE id<>rm_node_id ORDER BY random() LIMIT 1;
 		END IF;
 
-		-- Update metadata. It is important to commit that before sending new
+		-- Update metadata. XXX We should commit that before sending new
 		-- mappings, because otherwise if we fail during the latter, news about
 		-- promoted replica will be lost; next time we might choose another
 		-- replica to promote with some new data already written to previously
 		-- promoted replica. Syncing replicas doesn't help us much here if we
 		-- don't lock tables.
-		PERFORM shardman.broadcast(format(
-			'{0:UPDATE shardman.partitions SET node_id=%s WHERE part_name = %L;
-			DELETE FROM shardman.replicas WHERE part_name = %L AND node_id = %s}',
-			new_master_id, part.part_name, part.part_name, new_master_id));
+		UPDATE shardman.partitions SET node_id=new_master_id
+		 WHERE part_name = part.part_name;
+		DELETE FROM shardman.replicas r WHERE r.part_name = part.part_name AND
+											  r.node_id = new_master_id;
+		-- PERFORM shardman.broadcast(format(
+			-- '{0:UPDATE shardman.partitions SET node_id=%s WHERE part_name = %L;
+			-- DELETE FROM shardman.replicas WHERE part_name = %L AND node_id = %s}',
+			-- new_master_id, part.part_name, part.part_name, new_master_id));
 	END LOOP;
 
 	-- Fix replication channels
@@ -1601,7 +1600,8 @@ BEGIN
 						SELECT * INTO t FROM shardman.tables WHERE relation=part.relation;
 						PERFORM shardman.broadcast(format(
 							'%s:SELECT create_hash_partitions(%L,%L,%L);',
-							src_node.id, t.relation, t.sharding_key, t.partitions_count));
+							src_node.id, t.relation, t.sharding_key, t.partitions_count),
+							iso_level => 'read committed');
 					END IF;
 					RAISE NOTICE 'Replace % with % at node %',
 						part.part_name, fdw_part_name, src_node.id;
@@ -1628,7 +1628,8 @@ BEGIN
 						SELECT * INTO t FROM shardman.tables WHERE relation=part.relation;
 						PERFORM shardman.broadcast(format(
 							'%s:SELECT create_hash_partitions(%L, %L, %L);',
-							src_node.id, t.relation, t.sharding_key, t.partitions_count));
+							src_node.id, t.relation, t.sharding_key, t.partitions_count),
+							iso_level => 'read committed');
 					ELSE
 						RAISE NOTICE 'Replace % with % at node %',
 							fdw_part_name, part.part_name, src_node.id;
@@ -1827,7 +1828,9 @@ $$ LANGUAGE plpgsql;
 
 -- Commit or rollback not completed distributed transactions.
 -- All nodes must be alive for this to do something.
--- If coordinator is still in the cluster, we just try asking it.
+-- If coordinator is still in the cluster, we just try asking it:
+--   if xact committed on it, we commit it everywhere, if aborted, abort
+--   everywhere.
 -- If not, and there is only one participant, we simply commit the xact.
 -- If n_participants > 1, and xact is prepared everywhere, commit it.
 -- Otherwise, check WAL of every node; if COMMIT is found, COMMIT, if ABORT
@@ -1870,7 +1873,8 @@ BEGIN
 			cmds, node_id, node_id);
 	END LOOP;
 
-	-- Collected prepared xacts from all nodes
+	-- Collected prepared xacts from all nodes. They arrive as comma-separated
+	-- $node_id=>$gid
 	xacts := string_to_array(shardman.broadcast(cmds), ',');
 	-- empty string means no prepared xacts
 	xacts := array_remove(xacts, '');
@@ -1880,7 +1884,7 @@ BEGIN
 		xact_node_id := split_part(xact, '=>', 1);
 		gid := split_part(xact, '=>', 2);
 		sysid := split_part(gid, ':', 3)::bigint;
-		xid := split_part(gid, ':', 4)::bigint;
+		xid := split_part(gid, ':', 4)::bigint; -- coordinator's xid
 		SELECT id INTO coordinator FROM shardman.nodes WHERE system_id=sysid;
 		IF coordinator IS NULL
 		THEN
@@ -1982,7 +1986,7 @@ BEGIN
 				finish := format('%s%s:ROLLBACK PREPARED %L;', finish, xact_node_id, gid);
 			ELSEIF status IS NULL
 			THEN
-				RAISE WARNING 'Transaction % at coordinator % is too old to perform 2PC resolution',
+				RAISE WARNING 'Transaction % at coordinator % is too old to perform 2PC resolution or still in progress',
 				gid, coordinator;
 			END IF;
 		END IF;
@@ -2085,13 +2089,19 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 -- previous was already executed.
 -- If super_connstr is true, super connstring is used everywhere, usual
 -- connstr otherwise.
+
+-- If iso_level is specified, cmd is wrapped in BEGIN TRANSACTION ISOLATION
+-- LEVEL iso_level;  ... END;
+-- this allows to set isolation level; however you won't be able to get results
+-- this way.
 CREATE FUNCTION broadcast(cmds text,
 						  ignore_errors bool = false,
 						  two_phase bool = false,
 						  sync_commit_on bool = false,
 						  sequential bool = false,
-						  super_connstr bool = false)
-RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
+						  super_connstr bool = false,
+						  iso_level text = null)
+RETURNS text AS 'pg_shardman' LANGUAGE C;
 
 -- Options to postgres_fdw are specified in two places: user & password in user
 -- mapping and everything else in create server. The problem is that we use
