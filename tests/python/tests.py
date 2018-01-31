@@ -10,6 +10,7 @@
 import unittest
 import os
 import threading
+from time import sleep
 
 import testgres
 from testgres import PostgresNode, TestgresConfig, NodeStatus
@@ -60,13 +61,13 @@ class Shardlord(PostgresNode):
             log_min_messages = DEBUG1
             client_min_messages = NOTICE
             log_replication_commands = on
-            log_statement = all
+            log_statement = none
             TimeZone = 'Europe/Moscow'
             log_timezone = 'Europe/Moscow'
         """).format(self._shardlord_connstring())
 
     # reset conf and start clean shardlord
-    def start_lord(self):
+    def start_lord(self, additional_conf=""):
         if self.status() == NodeStatus.Running:
             self.stop()
         self.default_conf()
@@ -74,6 +75,7 @@ class Shardlord(PostgresNode):
         config_lines += ("shardman.shardlord = on\n"
                          "shardman.shardlord_dbname = {}\n"
                          "shardman.sync_replication = on\n").format(DBNAME)
+        config_lines += additional_conf
         self.append_conf("postgresql.conf", config_lines)
         super(Shardlord, self).start()
         self.safe_psql(DBNAME, "create extension pg_shardman cascade")
@@ -92,13 +94,15 @@ class Shardlord(PostgresNode):
     def create_cluster(self,
                        num_repgroups,
                        nodes_in_repgroup=1,
-                       worker_creation_cbk=None):
-        self.start_lord()
+                       worker_creation_cbk=None,
+                       additional_lord_conf="",
+                       additional_worker_conf=""):
+        self.start_lord(additional_conf=additional_lord_conf)
         for rgnum in range(num_repgroups):
             for nodenum in range(nodes_in_repgroup):
-                self.add_node(
-                    repl_group="rg_{}".format(rgnum),
-                    worker_creation_cbk=worker_creation_cbk)
+                self.add_node(repl_group="rg_{}".format(rgnum),
+                              worker_creation_cbk=worker_creation_cbk,
+                              additional_conf=additional_worker_conf)
 
     # destroy and shutdown everything, but keep nodes
     def destroy_cluster(self):
@@ -217,7 +221,11 @@ $$;
         super_conn_string = common_conn_string(node.port)
         add_node_cmd = "select shardman.add_node('{}', conn_string => {}, " "repl_group => {})" \
             .format(super_conn_string, conn_string, repl_group)
-        new_node_id = int(self.execute(DBNAME, add_node_cmd)[0][0])
+        try:
+            new_node_id = int(self.execute(DBNAME, add_node_cmd)[0][0])
+        except Exception as e:
+            print(str(e))
+            sleep(434232)
         self.workers_dict[new_node_id] = node
 
         # create symlink to this node's log
@@ -235,6 +243,28 @@ $$;
     def workers(self):
         return list(self.workers_dict.values())
 
+    # generate a bunch of keys belonging to given node
+    def gen_keys_for_node(self, table_name, node_id, start_probe=1, end_probe=50):
+        with self.connect() as con:
+            numparts = int(con.execute(
+                "select partitions_count from shardman.tables where relation = '{}';"
+                .format(table_name))[0][0])
+            parts_tups = con.execute(
+                "select part_name from shardman.partitions where relation = '{}' and node_id = {};"
+                .format(table_name, node_id))
+            # parts lying on this node
+            parts = [int(part_tup[0].split('_')[-1]) for part_tup in parts_tups]
+            condition = "get_hash_part_idx(hashint4(key), {}) = {}" \
+                .format(numparts, parts[0])
+            for p in parts[1:]:
+                condition += " or get_hash_part_idx(hashint4(key), {}) = {}" \
+                    .format(numparts, p)
+
+            sql = "select key, {} from generate_series({}, {}) key;" \
+                .format(condition, start_probe, end_probe)
+            keys = con.execute(sql)
+        keys = [k[0] for k in keys if k[1]]
+        return keys
 
 def sum_query(rel):
     return "select sum(payload) from {}".format(rel)
@@ -706,6 +736,52 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(DBNAME, "select shardman.recover_xacts()")
         self.lord.destroy_cluster()
 
+    # 2PC sanity check
+    def test_twophase_sanity(self):
+        additional_worker_conf = (
+            "postgres_fdw.use_twophase = on\n"
+        )
+        self.lord.start_lord()
+        apple, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+        mango, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+        watermelon, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 4)")
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 100), 0")
+
+        apple_key = self.lord.gen_keys_for_node("pt", 1)[0]
+        mango_key = self.lord.gen_keys_for_node("pt", 2)[0]
+        watermelon_key = self.lord.gen_keys_for_node("pt", 3)[0]
+
+        with apple.connect() as con:
+            # xact 1 started
+            con.begin()
+            con.execute("update pt set payload = 42 where id = {};".format(apple_key))
+            con.execute("update pt set payload = -20 where id = {};".format(mango_key))
+            con.execute("update pt set payload = -22 where id = {};".format(watermelon_key))
+            # stop one node, let's hope coordinator will start committing not
+            # from it (otherwise this test is almost useless)
+            mango.stop()
+            # commit the xact, ignoring error
+            try:
+                con.commit()
+            except Exception as e:
+                pass
+
+        # get the node back
+        mango.start()
+        # resolve prepared xacts
+        self.lord.safe_psql(DBNAME, "select shardman.recover_xacts()")
+        # and check the balance
+        balance = int(mango.execute(DBNAME, "select sum(payload) from pt;")[0][0])
+        self.assertTrue(balance == 0, msg=('balance={}'.format(balance)))
+        self.pt_cleanup()
+
     # test that monitor removes failed node
     def test_monitor_rm_node(self):
         self.lord.create_cluster(2, 2)
@@ -748,11 +824,7 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(
             DBNAME, 'create table pt(id int primary key, payload int);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 4)")
-        self.lord.workers[0].safe_psql(
-            DBNAME,
-            "insert into pt select generate_series(1, 100), (random() * 100)::int"
-        )
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 2)")
 
         node_1_part = self.lord.execute(
             DBNAME,
@@ -761,18 +833,11 @@ class ShardmanTests(unittest.TestCase):
 
         # take parts & keys from node 1 and node 2 to work with
         node_1, node_2 = self.lord.workers_dict[1], self.lord.workers_dict[2]
-        node_1_part = self.lord.execute(
+        node_1_key = self.lord.gen_keys_for_node("pt", 1)[0]
+        node_2_key = self.lord.gen_keys_for_node("pt", 2)[0]
+        self.lord.workers[0].safe_psql(
             DBNAME,
-            "select part_name from shardman.partitions where node_id = 1;")[0][
-                0]
-        node_1_key = node_1.execute(
-            DBNAME, "select id from {} limit 1;".format(node_1_part))[0][0]
-        node_2_part = self.lord.execute(
-            DBNAME,
-            "select part_name from shardman.partitions where node_id = 2;")[0][
-                0]
-        node_2_key = node_2.execute(
-            DBNAME, "select id from {} limit 1;".format(node_2_part))[0][0]
+            "insert into pt values ({}, 0), ({}, 0)".format(node_1_key, node_2_key))
 
         # Induce deadlock. It would be much better to use async db connections,
         # but pg8000 doesn't support them, and we generally aim at portability
@@ -791,7 +856,7 @@ class ShardmanTests(unittest.TestCase):
                         xact_1_aborted = True
 
         def xact_2():
-            with node_1.connect() as con:
+            with node_2.connect() as con:
                 con.begin()
                 con.execute("update pt set payload = 42 where id = {}"
                             .format(node_2_key))
@@ -815,15 +880,109 @@ class ShardmanTests(unittest.TestCase):
         # monitor for some time
         try:
             with self.lord.connect() as con:
-                con.execute("set statement_timeout = '3s'")
+                con.execute("set statement_timeout = '10s'")
                 con.execute("select shardman.monitor(check_timeout_sec => 1)")
-        except Exception:
+        except Exception as e:
             pass
         t1.join(10)
         self.assertTrue(not t1.is_alive())
         t2.join(10)
         self.assertTrue(not t2.is_alive())
         self.assertTrue(xact_1_aborted or xact_2_aborted)
+
+        self.pt_cleanup()
+
+    # global snapshot sanity check, simple bank transfer. Without global
+    # snapshot, read skew will arise.
+    def test_global_snapshot(self):
+        additional_worker_conf = (
+            "track_global_snapshots = on\n"
+            "postgres_fdw.use_global_snapshots = on\n"
+            "postgres_fdw.use_twophase = on\n"
+            "default_transaction_isolation = 'repeatable read'\n"
+            "log_min_messages = DEBUG3\n"
+            "shared_preload_libraries = 'pg_shardman, pg_pathman, postgres_fdw'\n"
+        )
+        self.lord.start_lord()
+        apple, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+        mango, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 4)")
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 200), 0")
+
+        apple_key = self.lord.gen_keys_for_node("pt", 1)[0]
+        mango_key = self.lord.gen_keys_for_node("pt", 2)[0]
+        # print("apple_key is {}, mango key is {}".format(apple_key, mango_key));
+
+        with apple.connect() as balance_con, mango.connect() as transfer_con:
+            # xact 1 started
+            balance_con.begin()
+            apple_balance = int(balance_con.execute("select payload from pt where id = {}" \
+                                                    .format(apple_key))[0][0])
+            # and only then xact 2 started, so xact 1 must not see xact 2 effects
+            transfer_con.begin()
+            transfer_con.execute("update pt set payload = 42 where id = {}".format(mango_key))
+            # Though we already read apple_key, we must do that.
+            transfer_con.execute("update pt set payload = -42 where id = {}".format(apple_key))
+            transfer_con.commit()
+            mango_balance = int(balance_con.execute("select payload from pt where id = {}" \
+                                                    .format(mango_key))[0][0])
+
+        balances = 'apple balance is {}, mango balance is {}'.format(apple_balance, mango_balance)
+        self.assertTrue(apple_balance + mango_balance == 0, balances)
+
+        self.pt_cleanup()
+
+    # Same simple bank transfer, but connect from third-party observer
+    def test_global_snapshot_external(self):
+        additional_worker_conf = (
+            "track_global_snapshots = on\n"
+            "postgres_fdw.use_global_snapshots = on\n"
+            "postgres_fdw.use_twophase = on\n"
+            "default_transaction_isolation = 'repeatable read'\n"
+            "log_min_messages = DEBUG3\n"
+            "shared_preload_libraries = 'pg_shardman, pg_pathman, postgres_fdw'\n"
+        )
+        self.lord.start_lord()
+        apple, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+        mango, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+        watermelon, _ = self.lord.add_node(additional_conf=additional_worker_conf)
+
+        self.lord.safe_psql(
+            DBNAME, 'create table pt(id int primary key, payload int);')
+        self.lord.safe_psql(
+            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 4)")
+
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 200), 0")
+
+        apple_key = self.lord.gen_keys_for_node("pt", 1)[0]
+        mango_key = self.lord.gen_keys_for_node("pt", 1)[0]
+        # print('apple_key is {}, mango key is {}'.format(apple_key, mango_key))
+        # print('inserted keys are {}'.format(watermelon.execute(DBNAME, 'select id from pt order by id;')))
+
+        with watermelon.connect() as balance_con, watermelon.connect() as transfer_con:
+            # xact 1 started
+            balance_con.begin()
+            apple_balance = int(balance_con.execute("select payload from pt where id = {};" \
+                                                    .format(apple_key))[0][0])
+            # and only then xact 2 started, so xact 1 must not see xact 2 effects
+            transfer_con.begin()
+            transfer_con.execute("update pt set payload = 42 where id = {};".format(mango_key))
+            # Though we already read apple_key, we must do that.
+            transfer_con.execute("update pt set payload = -42 where id = {};".format(apple_key))
+            transfer_con.commit()
+            mango_balance = int(balance_con.execute("select payload from pt where id = {};" \
+                                                    .format(mango_key))[0][0])
+            balances = 'apple balance is {}, mango balance is {}'.format(apple_balance, mango_balance)
+            balance_con.commit()
+            self.assertTrue(apple_balance + mango_balance == 0, balances)
 
         self.pt_cleanup()
 
@@ -1073,8 +1232,11 @@ def suite():
     suite.addTest(ShardmanTests('test_worker_failover_basic'))
     suite.addTest(ShardmanTests('test_worker_failover_with_offline_neighbour'))
     suite.addTest(ShardmanTests('test_recover_xacts_no_xacts'))
+    suite.addTest(ShardmanTests('test_twophase_sanity'))
     suite.addTest(ShardmanTests('test_monitor_rm_node'))
     suite.addTest(ShardmanTests('test_deadlock_detector'))
+    suite.addTest(ShardmanTests('test_global_snapshot'))
+    suite.addTest(ShardmanTests('test_global_snapshot_external'))
     suite.addTest(ShardmanTests('test_copy_from'))
 
     return suite
