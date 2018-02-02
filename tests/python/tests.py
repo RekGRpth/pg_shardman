@@ -150,7 +150,7 @@ $$;
         if self.reserved_workers:
             node = self.reserved_workers.pop()
             if node.status() == NodeStatus.Running:
-                worker.stop()  # FIXME: replace with 'node'?
+                node.stop()
         else:
             # time to create a new one
 
@@ -640,8 +640,8 @@ class ShardmanTests(unittest.TestCase):
 
         # now there should be only 3 nodes
         self.assertTrue(3 == int(
-            self.lord.execute(DBNAME, 'select count(*) from shardman.nodes;')[
-                0][0]))
+            self.lord.execute(
+                DBNAME, 'select count(*) from shardman.nodes;')[0][0]))
 
         # but the data is still consistent
         luke_sum = int(self.lord.workers_dict[1].execute(
