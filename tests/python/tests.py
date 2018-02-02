@@ -262,6 +262,7 @@ $$;
         keys = [k[0] for k in keys if k[1]]
         return keys
 
+
 def sum_query(rel):
     return "select sum(payload) from {}".format(rel)
 
@@ -822,11 +823,6 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(
             DBNAME, "select shardman.create_hash_partitions('pt', 'id', 2)")
 
-        node_1_part = self.lord.execute(
-            DBNAME,
-            "select part_name from shardman.partitions where node_id = 1;")[0][
-                0]
-
         # take parts & keys from node 1 and node 2 to work with
         node_1, node_2 = self.lord.workers_dict[1], self.lord.workers_dict[2]
         node_1_key = self.lord.gen_keys_for_node("pt", 1)[0]
@@ -918,7 +914,7 @@ class ShardmanTests(unittest.TestCase):
         with apple.connect() as balance_con, mango.connect() as transfer_con:
             # xact 1 started
             balance_con.begin()
-            apple_balance = int(balance_con.execute("select payload from pt where id = {}" \
+            apple_balance = int(balance_con.execute("select payload from pt where id = {}"
                                                     .format(apple_key))[0][0])
             # and only then xact 2 started, so xact 1 must not see xact 2 effects
             transfer_con.begin()
@@ -926,7 +922,7 @@ class ShardmanTests(unittest.TestCase):
             # Though we already read apple_key, we must do that.
             transfer_con.execute("update pt set payload = -42 where id = {}".format(apple_key))
             transfer_con.commit()
-            mango_balance = int(balance_con.execute("select payload from pt where id = {}" \
+            mango_balance = int(balance_con.execute("select payload from pt where id = {}"
                                                     .format(mango_key))[0][0])
 
         balances = 'apple balance is {}, mango balance is {}'.format(apple_balance, mango_balance)
@@ -966,7 +962,7 @@ class ShardmanTests(unittest.TestCase):
         with watermelon.connect() as balance_con, watermelon.connect() as transfer_con:
             # xact 1 started
             balance_con.begin()
-            apple_balance = int(balance_con.execute("select payload from pt where id = {};" \
+            apple_balance = int(balance_con.execute("select payload from pt where id = {};"
                                                     .format(apple_key))[0][0])
             # and only then xact 2 started, so xact 1 must not see xact 2 effects
             transfer_con.begin()
@@ -974,7 +970,7 @@ class ShardmanTests(unittest.TestCase):
             # Though we already read apple_key, we must do that.
             transfer_con.execute("update pt set payload = -42 where id = {};".format(apple_key))
             transfer_con.commit()
-            mango_balance = int(balance_con.execute("select payload from pt where id = {};" \
+            mango_balance = int(balance_con.execute("select payload from pt where id = {};"
                                                     .format(mango_key))[0][0])
             balances = 'apple balance is {}, mango balance is {}'.format(apple_balance, mango_balance)
             balance_con.commit()
