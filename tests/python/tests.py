@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 # coding: utf-8
-
 """
  tests.py
-	pg_shardman tests.
+        pg_shardman tests.
 
-	Copyright (c) 2017, Postgres Professional
+        Copyright (c) 2017, Postgres Professional
 """
 
 import unittest
-import logging
 import os
 import threading
-import time
-from time import sleep
-from contextlib import contextmanager
 
 import testgres
 from testgres import PostgresNode, TestgresConfig, NodeStatus
@@ -22,8 +17,10 @@ from testgres import PostgresNode, TestgresConfig, NodeStatus
 DBNAME = "postgres"
 NODE_NAMES = ["Luke", "C3PO", "Palpatine", "DarthMaul", "jabba", "bobafett"]
 
+
 def common_conn_string(port):
     return "dbname={} port={}".format(DBNAME, port)
+
 
 class Shardlord(PostgresNode):
     def __init__(self, name, port=None):
@@ -43,17 +40,17 @@ class Shardlord(PostgresNode):
         if not os.path.exists(self.tests_logs_dir):
             os.makedirs(self.tests_logs_dir)
 
-        super(Shardlord, self).__init__(name=name,
-                                        port = self.get_next_port(),
-                                        use_logging=False)
+        super(Shardlord, self).__init__(
+            name=name, port=self.get_next_port(), use_logging=False)
         super(Shardlord, self).init()
 
     def _shardlord_connstring(self):
         return common_conn_string(self.port)
 
     def _common_conf_lines(self):
-        return (
-            """shared_preload_libraries = 'pg_shardman, pg_pathman'
+        # yapf: disable
+        return ("""
+            shared_preload_libraries = 'pg_shardman, pg_pathman'
             shardman.shardlord_connstring = '{}'
 
             shared_buffers = 512MB
@@ -66,8 +63,7 @@ class Shardlord(PostgresNode):
             log_statement = all
             TimeZone = 'Europe/Moscow'
             log_timezone = 'Europe/Moscow'
-            """
-        ).format(self._shardlord_connstring())
+        """).format(self._shardlord_connstring())
 
     # reset conf and start clean shardlord
     def start_lord(self):
@@ -75,11 +71,9 @@ class Shardlord(PostgresNode):
             self.stop()
         self.default_conf()
         config_lines = self._common_conf_lines()
-        config_lines += (
-            "shardman.shardlord = on\n"
-            "shardman.shardlord_dbname = {}\n"
-            "shardman.sync_replication = on\n"
-        ).format(DBNAME)
+        config_lines += ("shardman.shardlord = on\n"
+                         "shardman.shardlord_dbname = {}\n"
+                         "shardman.sync_replication = on\n").format(DBNAME)
         self.append_conf("postgresql.conf", config_lines)
         super(Shardlord, self).start()
         self.safe_psql(DBNAME, "create extension pg_shardman cascade")
@@ -88,20 +82,23 @@ class Shardlord(PostgresNode):
         log_path = os.path.join(self.tests_logs_dir, "lord.log")
         try:
             os.remove(log_path)
-        except FileNotFoundError:
+        except OSError:
             pass
         os.symlink(self.pg_log_name, log_path)
 
         return self
 
     # create fresh cluster with given num of repgroups and nodes in each one
-    def create_cluster(self, num_repgroups, nodes_in_repgroup=1,
+    def create_cluster(self,
+                       num_repgroups,
+                       nodes_in_repgroup=1,
                        worker_creation_cbk=None):
         self.start_lord()
         for rgnum in range(num_repgroups):
             for nodenum in range(nodes_in_repgroup):
-                self.add_node(repl_group="rg_{}".format(rgnum),
-                              worker_creation_cbk=worker_creation_cbk)
+                self.add_node(
+                    repl_group="rg_{}".format(rgnum),
+                    worker_creation_cbk=worker_creation_cbk)
 
     # destroy and shutdown everything, but keep nodes
     def destroy_cluster(self):
@@ -109,22 +106,21 @@ class Shardlord(PostgresNode):
             # start node to cleanup if it was shut down during the test
             if worker.status() != NodeStatus.Running:
                 worker.start()
-            worker.safe_psql(DBNAME,
-                             """
+            worker.safe_psql(DBNAME, """
 set local synchronous_commit to local;
 select shardman.wipe_state();
 drop extension pg_shardman cascade;
 do language plpgsql $$
-	declare
-		rel_name name;
-	begin
-		for rel_name in select relname from pg_class where relname like 'pt%' and relkind = 'r' loop
-			execute format('drop table if exists %I cascade', rel_name);
-		end loop;
-		for rel_name in select relname from pg_class where relname like 'pt%' and relkind = 'f' loop
-			execute format('drop foreign table %I cascade', rel_name);
-		end loop;
-	end
+        declare
+                rel_name name;
+        begin
+                for rel_name in select relname from pg_class where relname like 'pt%' and relkind = 'r' loop
+                        execute format('drop table if exists %I cascade', rel_name);
+                end loop;
+                for rel_name in select relname from pg_class where relname like 'pt%' and relkind = 'f' loop
+                        execute format('drop foreign table %I cascade', rel_name);
+                end loop;
+        end
 $$;
                              """)
             worker.stop()
@@ -154,7 +150,7 @@ $$;
         if self.reserved_workers:
             node = self.reserved_workers.pop()
             if node.status() == NodeStatus.Running:
-                worker.stop()
+                worker.stop()  # FIXME: replace with 'node'?
         else:
             # time to create a new one
 
@@ -196,12 +192,15 @@ $$;
         shardman.shardlord = off
         """
         node.append_conf("postgresql.conf", config_lines)
-        return node;
+        return node
 
     # Add worker using reserved node, returns node instance, node id pair.
     # Callback is called when node is started, but not yet registred. It might
     # return conn_string, uh.
-    def add_node(self, repl_group=None, additional_conf="", worker_creation_cbk=None):
+    def add_node(self,
+                 repl_group=None,
+                 additional_conf="",
+                 worker_creation_cbk=None):
         node = self.pop_worker()
 
         # start this node
@@ -212,8 +211,8 @@ $$;
         conn_string = None
         if worker_creation_cbk:
             conn_string = worker_creation_cbk(node)
-        conn_string = "'{}'".format(conn_string) if conn_string else 'NULL';
-        repl_group = "'{}'".format(repl_group) if repl_group else 'NULL';
+        conn_string = "'{}'".format(conn_string) if conn_string else 'NULL'
+        repl_group = "'{}'".format(repl_group) if repl_group else 'NULL'
         # and register this node
         super_conn_string = common_conn_string(node.port)
         add_node_cmd = "select shardman.add_node('{}', conn_string => {}, " "repl_group => {})" \
@@ -222,10 +221,11 @@ $$;
         self.workers_dict[new_node_id] = node
 
         # create symlink to this node's log
-        log_path = os.path.join(self.tests_logs_dir, "{}.log".format(new_node_id))
+        log_path = os.path.join(self.tests_logs_dir,
+                                "{}.log".format(new_node_id))
         try:
             os.remove(log_path)
-        except FileNotFoundError:
+        except OSError:
             pass
         os.symlink(node.pg_log_name, log_path)
 
@@ -235,8 +235,10 @@ $$;
     def workers(self):
         return list(self.workers_dict.values())
 
+
 def sum_query(rel):
     return "select sum(payload) from {}".format(rel)
+
 
 class ShardmanTests(unittest.TestCase):
     @classmethod
@@ -255,11 +257,10 @@ class ShardmanTests(unittest.TestCase):
 
     # check that every node sees the whole table
     def pt_everyone_sees_the_whole(self):
-        luke_sum = int(self.lord.workers[0].execute(
-            DBNAME, sum_query("pt"))[0][0])
+        luke_sum = int(self.lord.workers[0].execute(DBNAME,
+                                                    sum_query("pt"))[0][0])
         for worker in self.lord.workers[1:]:
-            worker_sum = int(worker.execute(
-                DBNAME, sum_query("pt"))[0][0])
+            worker_sum = int(worker.execute(DBNAME, sum_query("pt"))[0][0])
             self.assertEqual(luke_sum, worker_sum)
 
     # check every replica integrity
@@ -271,7 +272,7 @@ class ShardmanTests(unittest.TestCase):
                 DBNAME, sum_query(part_name))
             replicas = self.lord.execute(
                 DBNAME,
-                "select node_id from shardman.replicas where part_name = '{}'" \
+                "select node_id from shardman.replicas where part_name = '{}'"
                 .format(part_name))
             # exactly required_replicas replicas?
             if required_replicas:
@@ -285,7 +286,7 @@ class ShardmanTests(unittest.TestCase):
     def pt_cleanup(self):
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
         self.lord.safe_psql(DBNAME, "drop table pt;")
-        self.lord.destroy_cluster();
+        self.lord.destroy_cluster()
 
     # tests
 
@@ -294,24 +295,34 @@ class ShardmanTests(unittest.TestCase):
         self.lord.add_node(repl_group="bananas")
         self.lord.add_node(repl_group="bananas")
         yellow_fellow, _ = self.lord.add_node(repl_group="mangos")
-        self.assertEqual(2, len(self.lord.execute(
-            DBNAME, "select * from shardman.nodes where replication_group = '{}'" \
-            .format("bananas"))))
-        self.assertEqual(1, len(self.lord.execute(
-            DBNAME, "select * from shardman.nodes where replication_group = '{}'" \
-            .format("mangos"))))
+        self.assertEqual(
+            2,
+            len(
+                self.lord.execute(
+                    DBNAME,
+                    "select * from shardman.nodes where replication_group = '{}'"
+                    .format("bananas"))))
+        self.assertEqual(
+            1,
+            len(
+                self.lord.execute(
+                    DBNAME,
+                    "select * from shardman.nodes where replication_group = '{}'"
+                    .format("mangos"))))
 
         # without specifying replication group, rg must be equal to sys id
         _, not_fruit_id = self.lord.add_node()
         sys_id_and_rep_group = self.lord.execute(
-            DBNAME, "select system_id, replication_group from shardman.nodes where id={}".format(not_fruit_id))[0]
+            DBNAME,
+            "select system_id, replication_group from shardman.nodes where id={}".
+            format(not_fruit_id))[0]
         self.assertEqual(sys_id_and_rep_group[0], int(sys_id_and_rep_group[1]))
 
         # try to add existing node
         with self.assertRaises(testgres.QueryException) as cm:
             # add some spaces to cheat that we have another connstring
             conn_string = common_conn_string(yellow_fellow.port) + "  "
-            add_node_cmd =  "select shardman.add_node('{}', repl_group => '{}')".format(
+            add_node_cmd = "select shardman.add_node('{}', repl_group => '{}')".format(
                 conn_string, "bananas")
             self.lord.safe_psql(DBNAME, add_node_cmd)
         self.assertIn("is already in the cluster", str(cm.exception))
@@ -321,9 +332,10 @@ class ShardmanTests(unittest.TestCase):
     def test_get_my_id(self):
         self.lord.start_lord()
         yellow_fellow, _ = self.lord.add_node(repl_group="bananas")
-        self.assertTrue(int(
-            yellow_fellow.execute(DBNAME,
-                                  "select shardman.get_my_id()")[0][0]) > 0)
+        self.assertTrue(
+            int(
+                yellow_fellow.execute(DBNAME, "select shardman.get_my_id()")[0]
+                [0]) > 0)
         self.lord.destroy_cluster()
 
     def test_create_hash_partitions_and_rm_table(self):
@@ -342,10 +354,13 @@ class ShardmanTests(unittest.TestCase):
         # shard some table, make sure everyone sees it and replicas are good
         self.lord.create_cluster(3, 2)
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+        )
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 1000), (random() * 100)::int")
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int"
+        )
 
         self.pt_everyone_sees_the_whole()
         self.pt_replicas_integrity()
@@ -354,7 +369,8 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
         for worker in self.lord.workers:
             ptrels = worker.execute(
-                DBNAME, "select relname from pg_class where relname ~ '^pt.*';")
+                DBNAME,
+                "select relname from pg_class where relname ~ '^pt.*';")
             self.assertEqual(len(ptrels), 0)
 
         # now request too many replicas
@@ -377,14 +393,17 @@ class ShardmanTests(unittest.TestCase):
             DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30);")
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 1000), (random() * 100)::int")
-        self.assertEqual(0, int(self.lord.execute(
-            DBNAME, "select count(*) from shardman.replicas;")[0][0]))
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int"
+        )
+        self.assertEqual(
+            0,
+            int(
+                self.lord.execute(
+                    DBNAME, "select count(*) from shardman.replicas;")[0][0]))
 
         # now add two replicas to each part (2 replicas need changelog table
         # creation, better to go through that code path too)
-        self.lord.safe_psql(
-            DBNAME, "select shardman.set_redundancy('pt', 2);")
+        self.lord.safe_psql(DBNAME, "select shardman.set_redundancy('pt', 2);")
         # wait for sync
         self.lord.safe_psql(DBNAME, "select shardman.ensure_redundancy();")
         # and ensure their integrity
@@ -398,10 +417,13 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(
             DBNAME, 'create table pt(id int primary key, payload int);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+        )
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 1000), (random() * 100)::int")
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int"
+        )
 
         # now add new node to each repgroup
         self.lord.add_node(repl_group="rg_0")
@@ -409,29 +431,32 @@ class ShardmanTests(unittest.TestCase):
 
         # rebalance parts and replicas
         self.lord.safe_psql(DBNAME, "select shardman.rebalance('pt%')")
-        self.lord.safe_psql(DBNAME, "select shardman.rebalance_replicas('pt%')")
+        self.lord.safe_psql(DBNAME,
+                            "select shardman.rebalance_replicas('pt%')")
 
         # make sure partitions are balanced
         for rg in ["rg_0", "rg_1"]:
             # max parts on node - min parts on node
-            diff = int(self.lord.execute(DBNAME, """
+            diff = int(
+                self.lord.execute(DBNAME, """
             with parts_count as (
-	      select count(*) from shardman.partitions parts
-	      join shardman.nodes nodes on parts.node_id = nodes.id
-	      where nodes.replication_group = '{}'
-	      group by node_id
-	    )
+                select count(*) from shardman.partitions parts
+                join shardman.nodes nodes on parts.node_id = nodes.id
+                where nodes.replication_group = '{}'
+                group by node_id
+            )
             select max(count) - min(count) from parts_count;
             """.format(rg))[0][0])
             self.assertTrue(diff <= 1)
 
-            diff_replicas = int(self.lord.execute(DBNAME, """
+            diff_replicas = int(
+                self.lord.execute(DBNAME, """
             with replicas_count as (
-	      select count(*) from shardman.replicas replicas
-	      join shardman.nodes nodes on replicas.node_id = nodes.id
-	      where nodes.replication_group = '{}'
-	      group by node_id
-	    )
+                select count(*) from shardman.replicas replicas
+                join shardman.nodes nodes on replicas.node_id = nodes.id
+                where nodes.replication_group = '{}'
+                group by node_id
+            )
             select max(count) - min(count) from replicas_count;
             """.format(rg))[0][0])
             self.assertTrue(diff_replicas <= 1)
@@ -451,7 +476,9 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(
             DBNAME, 'create table pt(id int primary key, payload int);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 12, redundancy => 1);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 12, redundancy => 1);"
+        )
         self.lord.workers[0].safe_psql(
             DBNAME,
             "insert into pt select generate_series(1, 1000), (random() * 100)::int",
@@ -461,8 +488,8 @@ class ShardmanTests(unittest.TestCase):
         luke_sum = int(self.lord.workers[0].execute(
             DBNAME, sum_query("pt"), username='joe')[0][0])
         for worker in self.lord.workers[1:]:
-            worker_sum = int(worker.execute(
-                DBNAME, sum_query("pt"), username='joe')[0][0])
+            worker_sum = int(
+                worker.execute(DBNAME, sum_query("pt"), username='joe')[0][0])
             self.assertEqual(luke_sum, worker_sum)
 
         # replicas integrity
@@ -473,7 +500,7 @@ class ShardmanTests(unittest.TestCase):
                 part_sum = self.lord.workers_dict[int(node_id)].execute(
                     DBNAME, sum_query(part_name), username='joe')
                 replicas = lord_con.execute(
-                    "select node_id from shardman.replicas where part_name = '{}';" \
+                    "select node_id from shardman.replicas where part_name = '{}';"
                     .format(part_name))
                 for replica in replicas:
                     replica_id = int(replica[0])
@@ -485,7 +512,8 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt')")
         for worker in self.lord.workers:
             ptrels = worker.execute(
-                DBNAME, "select relname from pg_class where relname ~ '^pt.*';")
+                DBNAME,
+                "select relname from pg_class where relname ~ '^pt.*';")
             self.assertEqual(len(ptrels), 0)
 
         self.lord.safe_psql(DBNAME, "drop table pt;")
@@ -495,23 +523,31 @@ class ShardmanTests(unittest.TestCase):
     def test_recover_basic(self):
         self.lord.create_cluster(2, 3)
         self.lord.safe_psql(
-            DBNAME, 'create table pt(id int primary key, payload int default 1);')
+            DBNAME,
+            'create table pt(id int primary key, payload int default 1);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 2);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 2);"
+        )
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 10000), (random() * 100)::int")
+            "insert into pt select generate_series(1, 10000), (random() * 100)::int"
+        )
 
         # now accidently remove state from everywhere
         for worker in self.lord.workers:
-            worker.safe_psql(DBNAME, "set local synchronous_commit to local; select shardman.wipe_state();")
+            worker.safe_psql(
+                DBNAME,
+                "set local synchronous_commit to local; select shardman.wipe_state();"
+            )
         # repair things back
         self.lord.safe_psql(DBNAME, "select shardman.recover()")
 
         # write some more data
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(10001, 20000), (random() * 100)::int")
+            "insert into pt select generate_series(10001, 20000), (random() * 100)::int"
+        )
 
         # and make sure data is still consistent
         self.pt_everyone_sees_the_whole()
@@ -533,19 +569,20 @@ class ShardmanTests(unittest.TestCase):
             DBNAME, "select shardman.create_hash_partitions('pt', 'id', 5);")
         src.safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 1000), (random() * 100)::int")
+            "insert into pt select generate_series(1, 1000), (random() * 100)::int"
+        )
         luke_sum_before_move = int(src.execute(DBNAME, sum_query("pt"))[0][0])
 
         part_to_move = self.lord.execute(
             DBNAME,
-            "select part_name from shardman.partitions where node_id = {};" \
+            "select part_name from shardman.partitions where node_id = {};"
             .format(src_id))[0][0]
-        watcher.stop() # shut down watcher
+        watcher.stop()  # shut down watcher
         ret, out, err = self.lord.psql(
-            DBNAME, "select shardman.mv_partition('{}', {})" \
+            DBNAME, "select shardman.mv_partition('{}', {})"
             .format(part_to_move, dst_id))
-        self.assertTrue(ret == 0, msg=err.decode())
-        self.assertTrue('FDW mappings update failed on some nodes' in err.decode())
+        self.assertTrue(ret == 0, err.decode())
+        self.assertTrue(b'FDW mappings update failed on some nodes' in err)
 
         # Insert some more data. This will fail for keys belonging to watcher,
         # so insert one-by-one and ignore 'could not connect' error
@@ -553,22 +590,25 @@ class ShardmanTests(unittest.TestCase):
             for key in range(1001, 1200):
                 try:
                     con.cursor.execute(
-                        "insert into pt values ({}, (random() * 100)::int);".format(key))
+                        "insert into pt values ({}, (random() * 100)::int);".
+                        format(key))
                 except Exception as e:
-                    if not "could not connect to server" in str(e):
+                    if "could not connect to server" not in str(e):
                         raise e
                 finally:
                     con.connection.commit()
-        watcher.start() # get watcher back online
+        watcher.start()  # get watcher back online
         luke_sum = int(src.execute(DBNAME, sum_query("pt"))[0][0])
         # make sure we actually inserted something
         self.assertTrue(luke_sum > luke_sum_before_move,
-                        msg="luke_sum is {}, luke_sum_before_move is {}" \
+                        msg="luke_sum is {}, luke_sum_before_move is {}"
                         .format(luke_sum, luke_sum_before_move))
         # and another node confirms that
-        self.assertTrue(luke_sum == int(dst.execute(DBNAME, sum_query("pt"))[0][0]))
+        self.assertTrue(
+            luke_sum == int(dst.execute(DBNAME, sum_query("pt"))[0][0]))
 
-        self.lord.safe_psql(DBNAME, "select shardman.recover()") # let it know about mv
+        self.lord.safe_psql(
+            DBNAME, "select shardman.recover()")  # let it know about mv
 
         for worker in [src, dst, watcher]:
             worker_sum = int(worker.execute(DBNAME, sum_query("pt"))[0][0])
@@ -581,22 +621,27 @@ class ShardmanTests(unittest.TestCase):
     def test_worker_failover_basic(self):
         self.lord.create_cluster(2, 2)
         self.lord.safe_psql(
-            DBNAME, 'create table pt(id int primary key, payload int default 1);')
+            DBNAME,
+            'create table pt(id int primary key, payload int default 1);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+        )
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 10000), (random() * 100)::int")
+            "insert into pt select generate_series(1, 10000), (random() * 100)::int"
+        )
 
         # turn off some node
         failed_node_id = 2
         self.lord.workers_dict[failed_node_id].stop()
-        self.lord.safe_psql(DBNAME, 'select shardman.rm_node({}, force => true);' \
+        self.lord.safe_psql(DBNAME, 'select shardman.rm_node({}, force => true);'
                             .format(failed_node_id))
 
         # now there should be only 3 nodes
-        self.assertTrue(3 == int(self.lord.execute(
-            DBNAME, 'select count(*) from shardman.nodes;')[0][0]))
+        self.assertTrue(3 == int(
+            self.lord.execute(DBNAME, 'select count(*) from shardman.nodes;')[
+                0][0]))
 
         # but the data is still consistent
         luke_sum = int(self.lord.workers_dict[1].execute(
@@ -623,26 +668,29 @@ class ShardmanTests(unittest.TestCase):
         self.lord.add_node(repl_group="mangos")
         self.lord.add_node(repl_group="mangos")
         self.lord.safe_psql(
-            DBNAME, 'create table pt(id int primary key, payload int default 1);')
+            DBNAME,
+            'create table pt(id int primary key, payload int default 1);')
         # num of parts must be at least equal to num of nodes, or removed node
         # probably won't get single partition
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 6, redundancy => 2);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 6, redundancy => 2);"
+        )
         yellow_fellow.safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 10000), (random() * 100)::int")
+            "insert into pt select generate_series(1, 10000), (random() * 100)::int"
+        )
 
         yellow_fellow.stop()
         green_fellow.stop()
-        self.lord.safe_psql(DBNAME, 'select shardman.rm_node({}, force => true);' \
+        self.lord.safe_psql(DBNAME, 'select shardman.rm_node({}, force => true);'
                             .format(yf_id))
 
         green_fellow.start()
         self.lord.safe_psql(DBNAME, "select shardman.recover()")
 
         # but the data is still consistent
-        green_sum = int(green_fellow.execute(
-            DBNAME, sum_query("pt"))[0][0])
+        green_sum = int(green_fellow.execute(DBNAME, sum_query("pt"))[0][0])
         for worker_id in self.lord.workers_dict:
             if worker_id != yf_id:
                 worker_sum = int(self.lord.workers_dict[worker_id].execute(
@@ -662,12 +710,16 @@ class ShardmanTests(unittest.TestCase):
     def test_monitor_rm_node(self):
         self.lord.create_cluster(2, 2)
         self.lord.safe_psql(
-            DBNAME, 'create table pt(id int primary key, payload int default 1);')
+            DBNAME,
+            'create table pt(id int primary key, payload int default 1);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+        )
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 10000), (random() * 100)::int")
+            "insert into pt select generate_series(1, 10000), (random() * 100)::int"
+        )
 
         # turn off some node
         self.lord.workers[0].stop()
@@ -676,14 +728,18 @@ class ShardmanTests(unittest.TestCase):
         try:
             with self.lord.connect() as con:
                 con.execute("set statement_timeout = '3s'")
-                con.execute("select shardman.monitor(check_timeout_sec => 1, rm_node_timeout_sec => 1)")
+                con.execute(
+                    "select shardman.monitor(check_timeout_sec => 1, rm_node_timeout_sec => 1)"
+                )
         except Exception as e:
             # make sure it was statement_timeout
-            self.assertTrue("canceling statement due to statement timeout" in str(e))
+            self.assertTrue(
+                "canceling statement due to statement timeout" in str(e))
 
         # now there should be only 3 nodes
-        self.assertTrue(3 == int(self.lord.execute(
-            DBNAME, 'select count(*) from shardman.nodes;')[0][0]))
+        self.assertTrue(3 == int(
+            self.lord.execute(DBNAME, 'select count(*) from shardman.nodes;')[
+                0][0]))
 
         self.pt_cleanup()
 
@@ -695,22 +751,26 @@ class ShardmanTests(unittest.TestCase):
             DBNAME, "select shardman.create_hash_partitions('pt', 'id', 4)")
         self.lord.workers[0].safe_psql(
             DBNAME,
-            "insert into pt select generate_series(1, 100), (random() * 100)::int")
+            "insert into pt select generate_series(1, 100), (random() * 100)::int"
+        )
 
         node_1_part = self.lord.execute(
             DBNAME,
-            "select part_name from shardman.partitions where node_id = 1;")[0][0]
+            "select part_name from shardman.partitions where node_id = 1;")[0][
+                0]
 
         # take parts & keys from node 1 and node 2 to work with
         node_1, node_2 = self.lord.workers_dict[1], self.lord.workers_dict[2]
         node_1_part = self.lord.execute(
             DBNAME,
-            "select part_name from shardman.partitions where node_id = 1;")[0][0]
+            "select part_name from shardman.partitions where node_id = 1;")[0][
+                0]
         node_1_key = node_1.execute(
             DBNAME, "select id from {} limit 1;".format(node_1_part))[0][0]
         node_2_part = self.lord.execute(
             DBNAME,
-            "select part_name from shardman.partitions where node_id = 2;")[0][0]
+            "select part_name from shardman.partitions where node_id = 2;")[0][
+                0]
         node_2_key = node_2.execute(
             DBNAME, "select id from {} limit 1;".format(node_2_part))[0][0]
 
@@ -719,11 +779,11 @@ class ShardmanTests(unittest.TestCase):
         def xact_1():
             with node_1.connect() as con:
                 con.begin()
-                con.execute("update pt set payload = 42 where id = {}" \
+                con.execute("update pt set payload = 42 where id = {}"
                             .format(node_1_key))
                 barrier.wait()
                 try:
-                    con.execute("update pt set payload = 43 where id = {}" \
+                    con.execute("update pt set payload = 43 where id = {}"
                                 .format(node_2_key))
                 except Exception as e:
                     if "canceling statement due to user request" in str(e):
@@ -733,11 +793,11 @@ class ShardmanTests(unittest.TestCase):
         def xact_2():
             with node_1.connect() as con:
                 con.begin()
-                con.execute("update pt set payload = 42 where id = {}" \
+                con.execute("update pt set payload = 42 where id = {}"
                             .format(node_2_key))
                 barrier.wait()
                 try:
-                    con.execute("update pt set payload = 43 where id = {}" \
+                    con.execute("update pt set payload = 43 where id = {}"
                                 .format(node_1_key))
                 except Exception as e:
                     if "canceling statement due to user request" in str(e):
@@ -757,7 +817,7 @@ class ShardmanTests(unittest.TestCase):
             with self.lord.connect() as con:
                 con.execute("set statement_timeout = '3s'")
                 con.execute("select shardman.monitor(check_timeout_sec => 1)")
-        except:
+        except Exception:
             pass
         t1.join(10)
         self.assertTrue(not t1.is_alive())
@@ -770,18 +830,25 @@ class ShardmanTests(unittest.TestCase):
     def test_copy_from(self):
         self.lord.create_cluster(3, 2)
         self.lord.safe_psql(
-            DBNAME, 'create table pt(id int primary key, payload int default 1);')
+            DBNAME,
+            'create table pt(id int primary key, payload int default 1);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+        )
 
         self.lord.safe_psql(
             DBNAME, 'create table pt_text(id int primary key, payload text);')
         self.lord.safe_psql(
-            DBNAME, "select shardman.create_hash_partitions('pt_text', 'id', 30, redundancy => 1);")
+            DBNAME,
+            "select shardman.create_hash_partitions('pt_text', 'id', 30, redundancy => 1);"
+        )
 
         # copy some data on one node
-        self.lord.workers[0].safe_psql(DBNAME, 'copy pt from stdin;', input=
-b"""1	2
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            'copy pt from stdin;',
+            input=b"""1	2
 2	3
 4	5
 6	7
@@ -790,29 +857,34 @@ b"""1	2
 \.
 """)
         # and make sure another sees it
-        res_sum = int(self.lord.workers[1].execute(
-            DBNAME, sum_query("pt"))[0][0])
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query("pt"))[0][0])
         self.assertEqual(res_sum, 36)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # specify column
-        self.lord.workers[0].safe_psql(DBNAME, 'copy pt (id) from stdin;', input=
-b"""1
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            'copy pt (id) from stdin;',
+            input=b"""1
 2
 3
 \.
 """)
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 3)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # csv
         self.lord.workers[0].safe_psql(
-            DBNAME, 'copy pt from stdin (format csv);', input=
-            b"""1,2
-            3,4
-            5,6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            'copy pt from stdin (format csv);',
+            input=b"""1,2
+3,4
+5,6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 12)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
@@ -826,110 +898,131 @@ b"""1
             drop table pt_local;
             """)
         # ... and make sure we don't support it
-        with self.assertRaises(testgres.QueryException, msg="binary copy from not supported") as cm:
+        with self.assertRaises(
+                testgres.QueryException,
+                msg="binary copy from not supported") as cm:
             self.lord.workers[0].safe_psql(
                 DBNAME, 'copy pt from stdin (format binary);', input=data)
         self.assertIn("cannot copy to postgres_fdw table", str(cm.exception))
 
-
         # freeze off
         self.lord.workers[0].safe_psql(
-            DBNAME, 'copy pt from stdin (format csv, freeze false);', input=
-            b"""1,2
-            3,4
-            5,6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            'copy pt from stdin (format csv, freeze false);',
+            input=b"""1,2
+3,4
+5,6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 12)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # freeze on
-        with self.assertRaises(testgres.QueryException, msg="freeze not supported") as cm:
+        with self.assertRaises(
+                testgres.QueryException, msg="freeze not supported") as cm:
             self.lord.workers[0].safe_psql(
-                DBNAME, 'copy pt from stdin (format csv, freeze true);', input=
-                b"""1,2
-                3,4
-                5,6""")
+                DBNAME,
+                'copy pt from stdin (format csv, freeze true);',
+                input=b"""1,2
+3,4
+5,6""")
         self.assertIn("freeze is not supported", str(cm.exception))
 
         # delimiter
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt from stdin (format csv, delimiter '|');", input=
-            b"""1|2
-            3|4
-            5|6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            "copy pt from stdin (format csv, delimiter '|');",
+            input=b"""1|2
+3|4
+5|6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 12)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # null
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt FROM stdin (format csv, null '44');", input=
-            b"""1,2
-            3,44
-            5,6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            "copy pt FROM stdin (format csv, null '44');",
+            input=b"""1,2
+3,44
+5,6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 8)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # header
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt FROM stdin (format csv, header true);", input=
-            b"""hoho,hehe
-            3,4
-            5, 6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            "copy pt FROM stdin (format csv, header true);",
+            input=b"""hoho,hehe
+3,4
+5, 6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 10)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # quote
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt FROM stdin (format csv, QUOTE '^');", input=
-            b"""1,2
-            3,^4^
-            5, 6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            "copy pt FROM stdin (format csv, QUOTE '^');",
+            input=b"""1,2
+3,^4^
+5, 6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 12)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # escape
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt FROM stdin (format csv, quote '4', escape '@');", input=
-            b"""1,2
-            3,4@44
-            5, 6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            "copy pt FROM stdin (format csv, quote '4', escape '@');",
+            input=b"""1,2
+3,4@44
+5, 6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 12)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # FORCE_NOT_NULL
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt FROM stdin (format csv, null '44', force_not_null (payload));", input=
-            b"""1,2
-            3,44
-            5,6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            "copy pt FROM stdin (format csv, null '44', force_not_null (payload));",
+            input=b"""1,2
+3,44
+5,6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 52)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # FORCE_NULL
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt FROM stdin (format csv, quote '^', null '44', force_null (payload));", input=
-            b"""1,2
-            3,^44^
-            5,6""")
-        res_sum = int(self.lord.workers[1].execute(DBNAME, sum_query('pt'))[0][0])
+            DBNAME,
+            "copy pt FROM stdin (format csv, quote '^', null '44', force_null (payload));",
+            input=b"""1,2
+3,^44^
+5,6""")
+        res_sum = int(self.lord.workers[1].execute(DBNAME,
+                                                   sum_query('pt'))[0][0])
         self.assertEqual(res_sum, 8)
         self.lord.workers[0].safe_psql(DBNAME, 'delete from pt;')
 
         # Encoding. We should probably test workers with different server
         # encodings...
         self.lord.workers[0].safe_psql(
-            DBNAME, "copy pt_text from stdin (format csv, encoding 'KOI8R')", input=
-            """1,йожин
-            3,с
-            5,бажин""".encode('koi8_r'))
+            DBNAME,
+            "copy pt_text from stdin (format csv, encoding 'KOI8R')",
+            input="""1,йожин
+3,с
+5,бажин""".encode('koi8_r'))
         self.assertEqual("йожинсбажин", self.lord.workers[1].execute(
-            DBNAME, "select string_agg(payload, '' order by id) from pt_text;")[0][0])
+            DBNAME,
+            "select string_agg(payload, '' order by id) from pt_text;")[0][0])
 
         self.lord.safe_psql(DBNAME, "select shardman.rm_table('pt');")
         self.lord.safe_psql(DBNAME, "drop table pt;")
@@ -937,19 +1030,20 @@ b"""1
         self.lord.safe_psql(DBNAME, "drop table pt_text;")
         self.lord.destroy_cluster()
 
+
 # Create user joe for accessing data; configure pg_hba accordingly.
 # Unfortunately, we must use password, because postgres_fdw forbids passwordless
 # access for non-superusers
 def non_super_user_cbk(worker):
-    worker.safe_psql(DBNAME,
-                     """
+    worker.safe_psql(DBNAME, """
                      set synchronous_commit to local;
-	             drop role if exists joe;
-	             create role joe login password '12345';
+                     drop role if exists joe;
+                     create role joe login password '12345';
                      """)
     worker.stop()
     hba_conf_path = os.path.join(worker.data_dir, "pg_hba.conf")
     with open(hba_conf_path, "w") as hba_conf_file:
+        # yapf: disable
         pg_hba = [
             "local\tall\tjoe\tpassword\n",
             "local\tall\tall\ttrust\n",
@@ -984,6 +1078,7 @@ def suite():
     suite.addTest(ShardmanTests('test_copy_from'))
 
     return suite
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2, failfast=True)
