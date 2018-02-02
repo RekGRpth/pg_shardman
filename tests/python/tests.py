@@ -221,11 +221,7 @@ $$;
         super_conn_string = common_conn_string(node.port)
         add_node_cmd = "select shardman.add_node('{}', conn_string => {}, " "repl_group => {})" \
             .format(super_conn_string, conn_string, repl_group)
-        try:
-            new_node_id = int(self.execute(DBNAME, add_node_cmd)[0][0])
-        except Exception as e:
-            print(str(e))
-            sleep(434232)
+        new_node_id = int(self.execute(DBNAME, add_node_cmd)[0][0])
         self.workers_dict[new_node_id] = node
 
         # create symlink to this node's log

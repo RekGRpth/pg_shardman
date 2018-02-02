@@ -564,6 +564,7 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 	char *conninfo = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	PQconninfoOption *opts = PQconninfoParse(conninfo, &pqerrmsg);
 	PQconninfoOption *opt;
+	HeapTuple res_heap_tuple;
 
 	if (pqerrmsg != NULL)
 	{
@@ -634,7 +635,8 @@ pq_conninfo_parse(PG_FUNCTION_ARGS)
 	BlessTupleDesc(tupdesc); /* Inshallah */
 
 	PQconninfoFree(opts);
-	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+	res_heap_tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(res_heap_tuple));
 }
 
 Datum
