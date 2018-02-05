@@ -1181,6 +1181,43 @@ class ShardmanTests(unittest.TestCase):
         self.lord.safe_psql(DBNAME, "drop table pt_text;")
         self.lord.destroy_cluster()
 
+    # add column
+    def test_alter_table_add_column(self):
+        self.lord.create_cluster(2, 2)
+        self.lord.safe_psql(
+            DBNAME,
+            'create table pt(id int primary key, payload int default 1);')
+        self.lord.safe_psql(
+            DBNAME,
+            "select shardman.create_hash_partitions('pt', 'id', 4, redundancy => 1);"
+        )
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "insert into pt select generate_series(1, 100), 0")
+        # add column
+        self.lord.safe_psql(
+            DBNAME,
+            "select shardman.alter_table('pt', 'add column added_col int');"
+        )
+        # insert data into it
+        self.lord.workers[0].safe_psql(
+            DBNAME,
+            "update pt set added_col = floor(random() * (10));"
+        )
+        # remember sum
+        res_sum = int(self.lord.workers[0].execute(
+            DBNAME,
+            'select sum(added_col) from pt;')[0][0])
+        # now rm some node to ensure that replicas got this column too
+        self.lord.safe_psql(DBNAME, 'select shardman.rm_node({}, force => true);'
+                            .format(1))
+        # and make sure sum is still the same
+        sum_after_rm = int(self.lord.workers[-1].execute(
+            DBNAME,
+            'select sum(added_col) from pt;')[0][0])
+        self.assertEqual(res_sum, sum_after_rm)
+
+        self.pt_cleanup()
 
 # Create user joe for accessing data; configure pg_hba accordingly.
 # Unfortunately, we must use password, because postgres_fdw forbids passwordless
@@ -1230,6 +1267,7 @@ def suite():
     suite.addTest(ShardmanTests('test_global_snapshot'))
     suite.addTest(ShardmanTests('test_global_snapshot_external'))
     suite.addTest(ShardmanTests('test_copy_from'))
+    suite.addTest(ShardmanTests('test_alter_table_add_column'))
 
     return suite
 

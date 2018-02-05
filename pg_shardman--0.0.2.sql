@@ -1800,10 +1800,13 @@ BEGIN
 		RETURN;
 	END IF;
 
+	-- Alter root table everywhere
 	PERFORM shardman.forall(format('ALTER TABLE %I %s', rel_name, alter_clause), including_shardlord=>true);
 
 	SELECT * INTO t FROM shardman.tables WHERE relation=rel_name;
 	SELECT shardman.gen_create_table_sql(t.relation) INTO create_table;
+
+	-- Broadcast new rules
 	IF t.master_node IS NOT NULL
 	THEN
 		SELECT shardman.gen_create_rules_sql(t.relation, format('%s_fdw', t.relation)) INTO create_rules;
@@ -1816,6 +1819,7 @@ BEGIN
 	END IF;
 	UPDATE shardman.tables SET create_sql=create_table, create_rules_sql=create_rules WHERE relation=t.relation;
 
+	-- Alter all replicas
 	FOR repl IN SELECT * FROM shardman.replicas
 	LOOP
 		alters := format('%s%s:ALTER TABLE %I %s;',
