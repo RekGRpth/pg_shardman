@@ -966,8 +966,8 @@ $$ LANGUAGE plpgsql;
 
 -- Get redundancy of the particular partition
 -- This command can be executed only at shardlord.
-CREATE FUNCTION get_redundancy_of_partition(pname text) returns bigint AS $$
-	SELECT count(*) FROM shardman.replicas where part_name=pname;
+CREATE FUNCTION get_redundancy_of_partition(part_name text) returns bigint AS $$
+	SELECT count(*) FROM shardman.replicas r where r.part_name=part_name;
 $$ LANGUAGE sql;
 
 -- Get minimal redundancy of the specified relation.
@@ -1007,14 +1007,14 @@ $$ LANGUAGE plpgsql;
 
 -- Count number of replicas at particular node.
 -- This command can be executed only at shardlord.
-CREATE FUNCTION get_node_replicas_count(node int) returns bigint AS $$
-   SELECT count(*) from shardman.replicas WHERE node_id=node;
+CREATE FUNCTION get_node_replicas_count(node_id int) returns bigint AS $$
+   SELECT count(*) from shardman.replicas r WHERE r.node_id=node_id;
 $$ LANGUAGE sql;
 
 -- Count number of partitions at particular node.
 -- This command can be executed only at shardlord.
-CREATE FUNCTION get_node_partitions_count(node int) returns bigint AS $$
-   SELECT count(*) from shardman.partitions WHERE node_id=node;
+CREATE FUNCTION get_node_partitions_count(node_id int) returns bigint AS $$
+   SELECT count(*) from shardman.partitions p WHERE p.node_id=node_id;
 $$ LANGUAGE sql;
 
 -- Rebalance partitions between nodes. This function tries to evenly

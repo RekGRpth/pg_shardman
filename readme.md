@@ -587,7 +587,7 @@ parts/replicas only within replication group. Such fine-grained control is
 rarely needed -- see `rebalance_*` functions.
 
 ```plpgsql
-create_shared_table(rel regclass, master_node_id int = 1)
+create_shared_table(rel_name regclass, master_node_id int = 1)
 ```
 Share table between all nodes. This function should be executed at
 shardlord. The empty table should be present on shardlord, but not on nodes.
@@ -595,7 +595,7 @@ shardlord. The empty table should be present on shardlord, but not on nodes.
 The rest of functions in this section can be executed only on shardlord.
 
 ```plpgsql
-shardman.get_redundancy_of_partition(pname text)
+shardman.get_redundancy_of_partition(part_name text)
 ```
 Returns redundancy level for the particular partition.
 
@@ -605,12 +605,12 @@ shardman.get_min_redundancy(rel_name name)
 Returns minimal redundancy level for the whole relation.
 
 ```plpgsql
-shardman.get_node_partitions_count(node int)
+shardman.get_node_partitions_count(node_id int)
 ```
 Returns number of partitions at the particular node.
 
 ```plpgsql
-shardman.get_node_replicas_count(node int)
+shardman.get_node_replicas_count(node_id int)
 ```
 Returns number of replicas at the particular node.
 
