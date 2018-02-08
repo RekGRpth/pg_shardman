@@ -367,7 +367,7 @@ BEGIN
 	SELECT replication_group INTO repl_group FROM shardman.nodes WHERE id=rm_node_id;
 
 	-- Clean removed node, if it is reachable. Better to do that before removing
-	-- pubs on other nodes to avoid 'with_fire' pub removal. However, it is also
+	-- pubs on other nodes to avoid 'with_force' pub removal. However, it is also
 	-- would be good to do that *after* removing the node from metadata to avoid
 	-- recover() run if rm_node fails without touching metadata. We currently
 	-- can't do that, though, because broadcast would not know where to find
@@ -2691,17 +2691,17 @@ CREATE VIEW replication_state(part_name, node_id, last_seqno) AS
 
 
 -- Drop replication slot, if it exists.
--- About 'with_fire' option: we can't just drop replication slots because
+-- About 'with_force' option: we can't just drop replication slots because
 -- pg_drop_replication_slot will bail out with ERROR if connection is active.
 -- Therefore the caller must either ensure that the connection is dead (e.g.
--- drop subscription on far end) or pass 'true' to 'with_fire' option, which
+-- drop subscription on far end) or pass 'true' to 'with_force' option, which
 -- does the following dirty hack. It kills several times active walsender with
 -- short interval. After the first kill, replica will immediately try to
 -- reconnect, so the connection resurrects instantly. However, if we kill it
 -- second time, replica won't try to reconnect until wal_retrieve_retry_interval
 -- after its first reaction passes, which is 5 secs by default. Of course, this
 -- is not reliable and should be redesigned.
-CREATE FUNCTION drop_repslot(slot_name text, with_fire bool DEFAULT true)
+CREATE FUNCTION drop_repslot(slot_name text, with_force bool DEFAULT true)
 	RETURNS void AS $$
 DECLARE
 	slot_exists bool;
@@ -2711,7 +2711,7 @@ BEGIN
 	EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_replication_slots
 				   WHERE slot_name = %L)', slot_name) INTO slot_exists;
 	IF slot_exists THEN
-		IF with_fire THEN -- kill walsender several times
+		IF with_force THEN -- kill walsender several times
 			RAISE DEBUG '[SHMN] Killing repslot % with fire', slot_name;
 			FOR i IN 1..kill_ws_times LOOP
 				RAISE DEBUG '[SHMN] Killing walsender for slot %', slot_name;
@@ -2751,11 +2751,11 @@ $$ LANGUAGE plpgsql STRICT;
 
 
 -- Remove all shardman state (LR stuff, foreign servers). If
--- drop_slots_with_fire is true, we will kill walsenders before dropping LR
+-- drop_slots_with_force is true, we will kill walsenders before dropping LR
 -- slots.
 -- We reset synchronous_standby_names to empty string after commit,
 -- -- this is non-transactional action and might be not performed.
-CREATE OR REPLACE FUNCTION wipe_state(drop_slots_with_fire bool DEFAULT true)
+CREATE OR REPLACE FUNCTION wipe_state(drop_slots_with_force bool DEFAULT true)
 	RETURNS void AS $$
 DECLARE
 	srv record;
@@ -2796,7 +2796,7 @@ BEGIN
 	END LOOP;
 	FOR rs IN SELECT slot_name FROM pg_replication_slots
 		WHERE slot_name LIKE 'node_%' AND slot_type = 'logical' LOOP
-		PERFORM shardman.drop_repslot(rs.slot_name, drop_slots_with_fire);
+		PERFORM shardman.drop_repslot(rs.slot_name, drop_slots_with_force);
 	END LOOP;
 		-- TODO: remove only shardman's standbys
 	PERFORM shardman.reset_synchronous_standby_names_on_commit();

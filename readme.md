@@ -676,12 +676,12 @@ status. Though unlikely, in theory it is possible that we won't be able to
 learn it and resolve the transaction.
 
 ```plpgsql
-wipe_state(drop_slots_with_fire bool DEFAULT true)
+wipe_state(drop_slots_with_force bool DEFAULT true)
 ```
 Remove unilaterally all publications, subscriptions, replication slots, foreign
 servers and user mappings created on the worker node by
 `pg_shardman`. PostgreSQL forbids to drop replication slot with active
-connection; if `drop_slots_with_fire` is true, we will try to kill the
+connection; if `drop_slots_with_force` is true, we will try to kill the
 walsenders before dropping the slots. Also, immediately after transaction commit
 set `synchronous_standby_names` GUC to empty string -- this is a
 non-transactional action and there is a very small chance it won't be
