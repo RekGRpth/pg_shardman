@@ -401,7 +401,7 @@ BEGIN
 		conf := format('%s%s:SELECT pg_reload_conf();', conf, node.id);
 	END LOOP;
 
-	-- Broadcast drop subscription commands, ignore errors because removed node
+	-- Broadcast drop subscription commands, ignore errors because any nodes
 	-- might be not available
 	err := shardman.broadcast(subs, ignore_errors => true, super_connstr => true);
 	IF position('<error>' IN err) <> 0 THEN
@@ -966,8 +966,9 @@ $$ LANGUAGE plpgsql;
 
 -- Get redundancy of the particular partition
 -- This command can be executed only at shardlord.
-CREATE FUNCTION get_redundancy_of_partition(part_name text) returns bigint AS $$
-	SELECT count(*) FROM shardman.replicas r where r.part_name=part_name;
+CREATE FUNCTION get_redundancy_of_partition(part_name text) RETURNS bigint AS $$
+	SELECT count(*) FROM shardman.replicas r
+	  WHERE r.part_name=get_redundancy_of_partition.part_name;
 $$ LANGUAGE sql;
 
 -- Get minimal redundancy of the specified relation.

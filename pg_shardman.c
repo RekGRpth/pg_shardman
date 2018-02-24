@@ -511,7 +511,7 @@ reconstruct_table_attrs(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < local_descr->natts; i++)
 	{
-		Form_pg_attribute attr = local_descr->attrs[i];
+		Form_pg_attribute attr = TupleDescAttr(local_descr, i);
 
 		if (i != 0)
 			appendStringInfoString(&query, ", ");
