@@ -5,7 +5,9 @@ source "${script_dir}/common.sh"
 
 cd "${script_dir}/.."
 
-> $logfile
+if [ -n "$logfile" ]; then
+    > $logfile
+fi
 
 restart_nodes # make sure nodes run
 # first workers, then lord

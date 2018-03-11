@@ -1,7 +1,6 @@
 *.o
 *.so
 .dir-locals.el
-bin/setup.sh
 
 *.pyc
 __pycache__

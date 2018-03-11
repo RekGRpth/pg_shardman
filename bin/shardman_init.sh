@@ -13,7 +13,9 @@ cd "${script_dir}/.."
 make clean
 make install
 
-> $logfile
+if [ -n "$logfile" ]; then
+    > $logfile
+fi
 
 stop_nodes
 pkill -9 postgres || true
@@ -23,16 +25,7 @@ for datadir in $lord_datadir "${worker_datadirs[@]}"; do
     initdb -D "$datadir"
 done
 
-cat postgresql.conf.common >> ${lord_datadir}/postgresql.conf
-cat postgresql.conf.lord >> ${lord_datadir}/postgresql.conf
-for worker_datadir in "${worker_datadirs[@]}"; do
-    cat postgresql.conf.common >> ${worker_datadir}/postgresql.conf
-    cat postgresql.conf.worker >> ${worker_datadir}/postgresql.conf
-done
-
-for datadir in $lord_datadir "${worker_datadirs[@]}"; do
-    cat pg_hba.conf > ${datadir}/pg_hba.conf
-done
+send_configs
 
 start_nodes
 for port in $lord_port "${worker_ports[@]}"; do
