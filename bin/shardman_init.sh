@@ -3,12 +3,6 @@
 script_dir=`dirname "$(readlink -f "$0")"`
 source "${script_dir}/common.sh"
 
-if $install_pathman; then
-    cd $pathmanpath
-    USE_PGXS=1 make clean
-    USE_PGXS=1 make install
-fi
-
 cd "${script_dir}/.."
 make clean
 make install

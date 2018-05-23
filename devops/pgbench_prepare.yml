@@ -49,15 +49,15 @@
     command: >
       psql -p {{ pg_port }} -f pgbench_ddl.sql
 
-  - name: create_hash_partitions for pgbench_accounts, nparts {{ nparts }}, redundancy {{ redundancy }}
+  - name: hash_shard_table for pgbench_accounts, nparts {{ nparts }}, redundancy {{ redundancy }}
     command: >
       psql -p {{ pg_port }} -c "
-      select shardman.create_hash_partitions('pgbench_accounts', 'aid', {{ nparts }}, {{ redundancy }});
-      select shardman.create_hash_partitions('pgbench_tellers', 'tid', {{ nparts }}, {{ redundancy }});
-      select shardman.create_hash_partitions('pgbench_branches', 'bid', {{ nparts }}, {{ redundancy }});
+      select shardman.hash_shard_table('pgbench_accounts', 'aid', {{ nparts }}, {{ redundancy }});
+      select shardman.hash_shard_table('pgbench_tellers', 'tid', {{ nparts }}, {{ redundancy }});
+      select shardman.hash_shard_table('pgbench_branches', 'bid', {{ nparts }}, {{ redundancy }});
       "
     tags:
-      - create_hash_partitions
+      - hash_shard_table
 
 - hosts: init_node
   vars:

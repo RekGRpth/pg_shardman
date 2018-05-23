@@ -1,20 +1,20 @@
-# pg_shardman: PostgreSQL sharding built on pg_pathman, postgres_fdw and logical replication.
+# pg_shardman: PostgreSQL sharding built on partitioning, postgres_fdw and logical replication.
 
-`pg_shardman` is PG 10 extenstion which aims (but not yet fully reaches) for
-scalability and fault tolerance with decent transactions preserved, oriented on
-mainly OLTP workload. It allows to hash-shard tables using `pg_pathman` and move
-the shards across nodes, balancing read/write load. You can issue queries to any
-node, `postgres_fdw` is responsible for redirecting them to the proper one. To
-avoid data loss, we support replication of partitions via synchronous or
-asynchronous logical replication (LR), redundancy level is configurable. Manual
-failover is provided. While `pg_shardman` can be used with vanilla PostgreSQL
-10, some features require patched core. Most importantly, to support sane
-cross-node transactions, we use patched `postgres_fdw` with 2PC for atomicity
-and distributed snapshot manager providing `snapshot isolation` level of xact
+`pg_shardman` is a PG 11 experimental extenstion which explores applicability
+of Postgres partitioning, postgres_fdw and logical replication for sharding.  It
+allows to hash-shard tables using PostgreSQL partitioning and move the shards
+across nodes, balancing read/write load. You can issue queries to any node,
+`postgres_fdw` is responsible for redirecting them to the proper one. To avoid
+data loss, we support replication of partitions via synchronous or asynchronous
+logical replication (LR), redundancy level is configurable. Manual failover is
+provided. While `pg_shardman` can be used with vanilla PostgreSQL 11, some
+features require patched core. Most importantly, to support sane cross-node
+transactions, we use patched `postgres_fdw` with 2PC for atomicity and
+distributed snapshot manager providing `snapshot isolation` level of xact
 isolation. We support current
 version
-[here](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman), which
-we call 'patched Postgres' in this document.
+[here](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman_11),
+which we call 'patched Postgres' in this document.
 
 ## Architecture
 
@@ -28,8 +28,8 @@ can't keep sharded data itself and is manually configured by the administrator.
 We will refer to the rest of the nodes as *worker* nodes or *workers*.
 
 ### Sharding
-`pg_shardman` supports hash-sharding by leveraging `pg_pathman` and
-`postgres_fdw` extensions. Sharded table is created and partitioned on each
+`pg_shardman` supports hash-sharding by leveraging partitioning and
+`postgres_fdw` extension. Sharded table is created and partitioned on each
 node. Then `pg_shardman` replaces some partitions with foreign tables so that
 each actual partition was stored only on one node, and other nodes know where
 exactly. This allows to read/write sharded tables from any node. To balance the
@@ -145,9 +145,9 @@ coordinator (node where transaction started) has committed it on some nodes and
 then something went wrong (e.g. it failed), the transaction will be aborted on
 the rest of nodes. Because of
 that
-[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman) implements
-two-phase commit (2PC) in `postgres_fdw`, which is turned on when
-`postgres_fdw.use_twophase` GUC is set to `true`. With 2PC, the transaction is
+[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman_11) implements
+two-phase commit (2PC) in `postgres_fdw`, which is always turned on when global
+snapshots are used (see below). With 2PC, the transaction is
 firstly *prepared* on each node, and only then committed. Successfull *prepare*
 on the node means that this node has promised to commit the transaction, and it
 is also possible to abort the transaction in this state, which allows to get
@@ -168,9 +168,10 @@ nodes until the coordinator either returns or is excluded from the cluster.
 Similarly, if transactions affect only single nodes, plain PostgreSQL isolation
 rules are applicable. However, for distributed transactions we need distributed
 visibility, implemented in patched Postgres. GUCs `track_global_snapshots` and
-`postgres_fdw.use_global_snapshots` turn on distributed transaction manager for
+`postgres_fdw.use_tsdtm` turn on distributed transaction manager for
 `postgres_fdw` based on Clock-SI algorithm. It provides cluster-wide snapshot
-isolation (called `REPEATABLE READ` in Postgres) transaction isolation level.
+isolation (almost what is called `REPEATABLE READ` in Postgres) transaction
+isolation level.
 
 Yet another problem is distributed deadlocks. They can be detected and resolved
 using `monitor` function, see below.
@@ -185,10 +186,9 @@ reinstalls extension, which is useful for development. Besides, `devops/` dir
 contains a bunch of scripts we used for deploying and testing `pg_shardman` on
 ec2 which might be helpful too.
 
-Both shardlord and workers require extension built and installed. We depend on
-`pg_pathman` extension so it must be installed too. PostgreSQL location for
-building is derived from `pg_config` by default, you can also specify path to it
-in `PG_CONFIG` environment variable. PostgreSQL 10 (`REL_10_STABLE branch`) is
+Both shardlord and workers require extension built and installed. PostgreSQL
+location for building is derived from `pg_config` by default, you can also
+specify path to it in `PG_CONFIG` environment variable. PostgreSQL 11 is
 required. Extension links with `libpq`, and if you install PG from packages, you
 should install `libpq-dev` package or something like that. The whole process of
 building and copying files to PG server is just:
@@ -199,10 +199,10 @@ cd pg_shardman
 make install
 ```
 
-To actually install extension, add `pg_pathman` and `pg_shardman` to
+To actually install extension, add and `pg_shardman` to
 `shared_preload_libraries`:
 ```shell
-shared_preload_libraries='pg_shardman, pg_pathman'
+shared_preload_libraries='pg_shardman'
 ```
 restart the server and run
 
@@ -259,11 +259,11 @@ cannot be undone and does not require any confirmation.
 
 With nodes added, you can shard tables. To do that, create the table
 on shardlord with usual `CREATE TABLE` DDL and execute
-`shardman.create_hash_partitions` function, for example
+`shardman.hash_shard_table` function, for example
 
 ```plpgsql
 CRATE TABLE horns (id int primary key, branchness int);
-select create_hash_partitions('horns', 'id', 30, redundancy = 1)
+select hash_shard_table('horns', 'id', 30, redundancy = 1)
 ```
 
 On successfull execution, table `horns` will be hash-sharded into 30 partitions
@@ -278,7 +278,7 @@ mechanism: all partitions are derived from parent table. If a partition is
 located at some other node, it will be accessed using foreign data wrapper
 `postgres_fdw`. Unfortunately inheritance and FDW in Postgres have some
 limitations which doesn't allow to build efficient execution plans for some
-queries. Though Postgres 10 is capable of pushing aggregates to FDW, it can't
+queries. Though Postgres 11 is capable of pushing aggregates to FDW, it can't
 merge partial aggregate values from different nodes. Also it can't execute query
 on all nodes in parallel: foreign data wrappers do not support parallel scan
 because of using cursors. Execution of OLAP queries at `pg_shardman` might not
@@ -292,22 +292,16 @@ for client app to determine the node for particular record to perform local
 reads/writes.
 
 ### Importing data
-
-The most efficient way to import data is to use `COPY` command. Vanilla
-PostgreSQL doesn't support `COPY FROM` to foreign tables yet, and we have
-implemented this feature in
-[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman).
-Binary format is not supported there. Data can be loaded parallel from several
-nodes.
-
-Obviously nobody forbids you to populate the cluster using normal inserts.
+PostgreSQL 11 supports `COPY FROM` to foreign partitions. Besides, nobody
+forbids you to populate the cluster using normal inserts. Data can be loaded in
+parallel from multiple nodes.
 
 If redundancy level is not zero, then it is better to avoid large transactions,
 because WAL decoder will spill large transactions to the disk, which
 significantly reduces speed.
 
 ### Redundancy
-Apart from specifying redundancy in `create_hash_partitions` call, replicas for
+Apart from specifying redundancy in `hash_shard_table` call, replicas for
 existing tables can be bred with `shardman.set_redundancy(rel_name name,
 redundancy int)` function. This function can only increase redundancy level, it
 doesn't delete replicas. `set_redundancy` function doesn't wait for completion
@@ -525,13 +519,13 @@ replica.
 ### Shards and replicas
 
 ```plpgsql
-create_hash_partitions(rel_name name, expr text, part_count int, redundancy int = 0)
+hash_shard_table(rel_name name, part_count int, redundancy int = 0)
 ```
 To shard the table, you must create it on shardlord with usual `CREATE TABLE
-...` and then call this function. It hash-shards table `rel_name` by key `expr`,
-creating `part_count` shards, distributing shards evenly among the nodes. As you
-probably noticed, the signature mirrors `pg_pathman`'s function with the same
-name. `redundancy` replicas will be immediately created for each partition.
+... PARTITION BY HASH (...);` and then call this function. It hash-shards table
+`rel_name` by partitioning key, creating `part_count` shards, distributing
+shards evenly among the nodes. `redundancy` replicas will be immediately created
+for each partition.
 
 Shards are scattered among nodes using round-robin algorithm. Replicas are
 randomly chosen within replication group, but with a guarantee that there is no
@@ -539,8 +533,11 @@ more than one copy of the partition per node. Distributed table is always
 created empty, it doesn't matter had the original table on shardlord had any
 data or not.
 
-Column(s) participating in `expr` must be marked `NOT NULL`, as in
-`pg_pathman`. Generally we strongly recommend to use primary key there.
+Currently Postgres forbids index creation on partitioned tables with foreign
+partitions;
+use
+[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman_11) to
+shard tables with any indexes, e.g. having a primary key.
 
 ```plpgsql
 rm_table(rel_name name)
@@ -691,7 +688,7 @@ Data is not touched by this command.
 ## Some limitations:
   * You should not touch `synchronous_standby_names` manually while using pg_shardman.
   * The shardlord itself can't be worker node for now.
-  * All [limitations](https://github.com/postgrespro/pg_pathman/wiki/Known-limitations)  (and some features) of `pg_pathman`,
+  * All [limitations](https://www.postgresql.org/docs/devel/static/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE)  (and some features) of Postgres partitioning
 	e.g. we don't support global secondary indexes and foreign keys to sharded tables.
-  * All [limitations of logical replications](https://www.postgresql.org/docs/10/static/logical-replication-restrictions.html).
+  * All [limitations of logical replications](https://www.postgresql.org/docs/devel/static/logical-replication-restrictions.html).
     `TRUNCATE` statements on sharded tables will not be replicated.

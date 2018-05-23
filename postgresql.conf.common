@@ -1,4 +1,4 @@
-shared_preload_libraries = 'pg_shardman, pg_pathman'
+shared_preload_libraries = 'pg_shardman'
 
 shardman.shardlord_connstring = 'port=5432' # shardlord's connstring
 

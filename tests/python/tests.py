@@ -10,9 +10,10 @@
 import unittest
 import os
 import threading
+import time
 
 import testgres
-from testgres import PostgresNode, TestgresConfig, NodeStatus
+from testgres import PostgresNode, TestgresConfig, NodeStatus, IsolationLevel
 from testgres import ProgrammingError
 
 
@@ -73,7 +74,7 @@ class Shardlord(PostgresNode):
     def _common_conf_lines(self):
         # yapf: disable
         return ("""
-            shared_preload_libraries = 'pg_shardman, pg_pathman'
+            shared_preload_libraries = 'pg_shardman'
             shardman.shardlord_connstring = '{}'
 
             shared_buffers = 512MB
@@ -235,8 +236,8 @@ $$;
                        .format(node_id))
         del self.workers_dict[node_id]
 
-    # generate a bunch of keys belonging to given node
-    def gen_keys_for_node(self, table_name, node_id, start_probe=1, end_probe=50):
+    # find keys belonging to given node
+    def get_keys_for_node(self, table_name, node_id, keyname = 'id'):
         with self.connect() as con:
             numparts = int(con.execute(
                 "select partitions_count from shardman.tables where relation = '{}';"
@@ -244,18 +245,14 @@ $$;
             parts_tups = con.execute(
                 "select part_name from shardman.partitions where relation = '{}' and node_id = {};"
                 .format(table_name, node_id))
-            # parts lying on this node
-            parts = [int(part_tup[0].split('_')[-1]) for part_tup in parts_tups]
-            condition = "get_hash_part_idx(hashint4(key), {}) = {}" \
-                .format(numparts, parts[0])
-            for p in parts[1:]:
-                condition += " or get_hash_part_idx(hashint4(key), {}) = {}" \
-                    .format(numparts, p)
-
-            sql = "select key, {} from generate_series({}, {}) key;" \
-                .format(condition, start_probe, end_probe)
-            keys = con.execute(sql)
-        keys = [k[0] for k in keys if k[1]]
+        # parts lying on this node
+        parts = [part_tup[0] for part_tup in parts_tups]
+        sql = "select {} from {} ".format(keyname, parts[0])
+        for p in parts[1:]:
+            sql += "union select {} from {} ".format(keyname, p)
+        sql += ";"
+        keys = self.workers_dict[node_id].execute(sql)
+        keys = [k[0] for k in keys]
         return keys
 
     # return random worker
@@ -350,14 +347,14 @@ class ShardmanTests(unittest.TestCase):
                     yellow_fellow.execute("select shardman.get_my_id()")[0]
                     [0]) > 0)
 
-    def test_create_hash_partitions_and_rm_table(self):
+    def test_hash_shard_table_and_rm_table(self):
         with Shardlord() as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
             # try to shard table without any workers
             with self.assertRaises(testgres.QueryException) as cm:
                 lord.safe_psql("""
-                select shardman.create_hash_partitions('pt', 'id', 30,
+                select shardman.hash_shard_table('pt', 30,
                 redundancy => 1);
                 """)
                 self.assertIn("add some nodes first", str(cm.exception))
@@ -365,11 +362,12 @@ class ShardmanTests(unittest.TestCase):
         # shard some table, make sure everyone sees it and replicas are good
         with Shardlord(num_repgroups=3, nodes_in_repgroup=2) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
 
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+                "select shardman.hash_shard_table('pt', 30, redundancy => 1);"
             )
+
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 1000), (random() * 100)::int"
             )
@@ -387,7 +385,7 @@ class ShardmanTests(unittest.TestCase):
                 # now request too many replicas
                 with self.assertRaises(testgres.QueryException) as cm:
                     lord.safe_psql("""
-                    select shardman.create_hash_partitions('pt', 'id', 30,
+                    select shardman.hash_shard_table('pt', 30,
                     redundancy => 2);
                     """)
                     self.assertIn("redundancy 2 is too high", str(cm.exception))
@@ -395,10 +393,10 @@ class ShardmanTests(unittest.TestCase):
     def test_set_redundancy(self):
         with Shardlord(num_repgroups=2, nodes_in_repgroup=3) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
             # shard table without any replicas
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 30);")
+                "select shardman.hash_shard_table('pt', 30);")
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 1000), (random() * 100)::int"
             )
@@ -420,9 +418,9 @@ class ShardmanTests(unittest.TestCase):
     def test_rebalance(self):
         with Shardlord(num_repgroups=2, nodes_in_repgroup=2) as lord:
             lord.safe_psql(
-                "create table pt(id int primary key, payload int)")
+                "create table pt(id int primary key, payload int) partition by hash(id);")
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1)"
+                "select shardman.hash_shard_table('pt', 30, redundancy => 1)"
             )
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 1000), (random() * 100)::int"
@@ -476,9 +474,9 @@ class ShardmanTests(unittest.TestCase):
 
             # shard some table, make sure everyone sees it and replicas are good
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 12, redundancy => 1);"
+                "select shardman.hash_shard_table('pt', 12, redundancy => 1);"
             )
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 1000), (random() * 100)::int",
@@ -519,9 +517,9 @@ class ShardmanTests(unittest.TestCase):
     def test_recover_basic(self):
         with Shardlord(num_repgroups=2, nodes_in_repgroup=3) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int default 1);')
+                'create table pt(id int primary key, payload int default 1) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 2);"
+                "select shardman.hash_shard_table('pt', 30, redundancy => 2);"
             )
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 10000), (random() * 100)::int"
@@ -553,9 +551,9 @@ class ShardmanTests(unittest.TestCase):
             watcher, watcher_id = lord.add_node()
 
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 5);")
+                "select shardman.hash_shard_table('pt', 5);")
             src.safe_psql(
                 "insert into pt select generate_series(1, 1000), (random() * 100)::int"
             )
@@ -596,19 +594,20 @@ class ShardmanTests(unittest.TestCase):
 
             lord.safe_psql(
                 "select shardman.recover()")  # let it know about mv
-
-            for worker in [src, dst, watcher]:
+            # everything is visible now from anyone, including keys on failed node
+            luke_sum = int(src.execute(sum_query("pt"))[0][0])
+            for worker in [dst, watcher]:
                 worker_sum = int(worker.execute(sum_query("pt"))[0][0])
-            self.assertEqual(luke_sum, worker_sum)
+                self.assertEqual(luke_sum, worker_sum)
 
     # Just rm_node failed worker with all other nodes online and make sure
     # data is not lost
     def test_worker_failover_basic(self):
         with Shardlord(num_repgroups=2, nodes_in_repgroup=2) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int default 1);')
+                'create table pt(id int primary key, payload int default 1) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+                "select shardman.hash_shard_table('pt', 30, redundancy => 1);"
             )
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 10000), (random() * 100)::int"
@@ -639,11 +638,11 @@ class ShardmanTests(unittest.TestCase):
             lord.add_node(repl_group="mangos")
             lord.add_node(repl_group="mangos")
             lord.safe_psql(
-                'create table pt(id int primary key, payload int default 1);')
+                'create table pt(id int primary key, payload int default 1) partition by hash(id);')
             # num of parts must be at least equal to num of nodes, or removed node
             # probably won't get single partition
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 6, redundancy => 2);"
+                "select shardman.hash_shard_table('pt', 6, redundancy => 2);"
             )
             yellow_fellow.safe_psql(
                 "insert into pt select generate_series(1, 10000), (random() * 100)::int"
@@ -667,23 +666,26 @@ class ShardmanTests(unittest.TestCase):
     # 2PC sanity check
     def test_twophase_sanity(self):
         with Shardlord() as lord:
+            # Now 2PC is only enabled with global snaps
             additional_worker_conf = (
-                "postgres_fdw.use_twophase = on\n"
+                "track_global_snapshots = true\n"
+                "postgres_fdw.use_tsdtm = true\n"
+                "global_snapshot_defer_time = 30\n"
             )
             apple, _ = lord.add_node(additional_conf=additional_worker_conf)
             mango, _ = lord.add_node(additional_conf=additional_worker_conf)
             watermelon, _ = lord.add_node(additional_conf=additional_worker_conf)
 
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 4)")
+                "select shardman.hash_shard_table('pt', 4)")
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 100), 0")
 
-            apple_key = lord.gen_keys_for_node("pt", 1)[0]
-            mango_key = lord.gen_keys_for_node("pt", 2)[0]
-            watermelon_key = lord.gen_keys_for_node("pt", 3)[0]
+            apple_key = lord.get_keys_for_node("pt", 1)[0]
+            mango_key = lord.get_keys_for_node("pt", 2)[0]
+            watermelon_key = lord.get_keys_for_node("pt", 3)[0]
 
             with apple.connect() as con:
                 # xact 1 started
@@ -715,9 +717,9 @@ class ShardmanTests(unittest.TestCase):
     def test_monitor_rm_node(self):
         with Shardlord(num_repgroups=2, nodes_in_repgroup=2) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int default 1);')
+                'create table pt(id int primary key, payload int default 1) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+                "select shardman.hash_shard_table('pt', 30, redundancy => 1);"
             )
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 10000), (random() * 100)::int"
@@ -745,17 +747,16 @@ class ShardmanTests(unittest.TestCase):
     def test_deadlock_detector(self):
         with Shardlord(num_repgroups=2) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 2)")
+                "select shardman.hash_shard_table('pt', 2)")
+            lord.any_worker().safe_psql(
+                "insert into pt select generate_series(1, 100), 0")
 
             # take parts & keys from node 1 and node 2 to work with
             node_1, node_2 = lord.workers_dict[1], lord.workers_dict[2]
-            node_1_key = lord.gen_keys_for_node("pt", 1)[0]
-            node_2_key = lord.gen_keys_for_node("pt", 2)[0]
-            lord.any_worker().safe_psql(
-                "insert into pt values ({}, 0), ({}, 0)".format(node_1_key, node_2_key))
-
+            node_1_key = lord.get_keys_for_node("pt", 1)[0]
+            node_2_key = lord.get_keys_for_node("pt", 2)[0]
             # Induce deadlock. It would be much better to use async db connections,
             # but pg8000 doesn't support them, and we generally aim at portability
             def xact_1():
@@ -813,35 +814,35 @@ class ShardmanTests(unittest.TestCase):
     # snapshot, read skew will arise.
     def test_global_snapshot(self):
         additional_worker_conf = (
-            "track_global_snapshots = on\n"
-            "postgres_fdw.use_global_snapshots = on\n"
-            "postgres_fdw.use_twophase = on\n"
+            "track_global_snapshots = true\n"
+            "postgres_fdw.use_tsdtm = true\n"
+            "global_snapshot_defer_time = 30\n"
             "default_transaction_isolation = 'repeatable read'\n"
             "log_min_messages = DEBUG3\n"
-            "shared_preload_libraries = 'pg_shardman, pg_pathman, postgres_fdw'\n"
+            "shared_preload_libraries = 'pg_shardman, postgres_fdw'\n"
         )
         with Shardlord() as lord:
-            apple, _ = lord.add_node(additional_conf=additional_worker_conf)
-            mango, _ = lord.add_node(additional_conf=additional_worker_conf)
+            apple, apple_id = lord.add_node(additional_conf=additional_worker_conf)
+            mango, mango_id = lord.add_node(additional_conf=additional_worker_conf)
 
             lord.safe_psql(
-                "create table pt(id int primary key, payload int);")
+                "create table pt(id int primary key, payload int) partition by hash(id);")
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 4)")
+                "select shardman.hash_shard_table('pt', 4)")
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 200), 0")
 
-            apple_key = lord.gen_keys_for_node("pt", 1)[0]
-            mango_key = lord.gen_keys_for_node("pt", 2)[0]
+            apple_key = lord.get_keys_for_node("pt", apple_id)[0]
+            mango_key = lord.get_keys_for_node("pt", mango_id)[0]
             # print("apple_key is {}, mango key is {}".format(apple_key, mango_key));
 
             with apple.connect() as balance_con, mango.connect() as transfer_con:
                 # xact 1 started
-                balance_con.begin()
+                balance_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 apple_balance = int(balance_con.execute("select payload from pt where id = {}"
                                                         .format(apple_key))[0][0])
                 # and only then xact 2 started, so xact 1 must not see xact 2 effects
-                transfer_con.begin()
+                transfer_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 transfer_con.execute("update pt set payload = 42 where id = {}".format(mango_key))
                 # Though we already read apple_key, we must do that.
                 transfer_con.execute("update pt set payload = -42 where id = {}".format(apple_key))
@@ -855,12 +856,12 @@ class ShardmanTests(unittest.TestCase):
     # Same simple bank transfer, but connect from third-party observer
     def test_global_snapshot_external(self):
         additional_worker_conf = (
-            "track_global_snapshots = on\n"
-            "postgres_fdw.use_global_snapshots = on\n"
-            "postgres_fdw.use_twophase = on\n"
+            "track_global_snapshots = true\n"
+            "postgres_fdw.use_tsdtm = true\n"
+            "global_snapshot_defer_time = 30\n"
             "default_transaction_isolation = 'repeatable read'\n"
             "log_min_messages = DEBUG3\n"
-            "shared_preload_libraries = 'pg_shardman, pg_pathman, postgres_fdw'\n"
+            "shared_preload_libraries = 'pg_shardman, postgres_fdw'\n"
         )
         with Shardlord() as lord:
             apple, _ = lord.add_node(additional_conf=additional_worker_conf)
@@ -868,25 +869,25 @@ class ShardmanTests(unittest.TestCase):
             watermelon, _ = lord.add_node(additional_conf=additional_worker_conf)
 
             lord.safe_psql(
-                'create table pt(id int primary key, payload int);')
+                'create table pt(id int primary key, payload int) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 4)")
+                "select shardman.hash_shard_table('pt', 4)")
 
             lord.any_worker().safe_psql(
                 "insert into pt select generate_series(1, 200), 0")
 
-            apple_key = lord.gen_keys_for_node("pt", 1)[0]
-            mango_key = lord.gen_keys_for_node("pt", 1)[0]
+            apple_key = lord.get_keys_for_node("pt", 1)[0]
+            mango_key = lord.get_keys_for_node("pt", 1)[0]
             # print('apple_key is {}, mango key is {}'.format(apple_key, mango_key))
             # print('inserted keys are {}'.format(watermelon.execute('select id from pt order by id;')))
 
             with watermelon.connect() as balance_con, watermelon.connect() as transfer_con:
                 # xact 1 started
-                balance_con.begin()
+                balance_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 apple_balance = int(balance_con.execute("select payload from pt where id = {};"
                                                         .format(apple_key))[0][0])
                 # and only then xact 2 started, so xact 1 must not see xact 2 effects
-                transfer_con.begin()
+                transfer_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 transfer_con.execute("update pt set payload = 42 where id = {};".format(mango_key))
                 # Though we already read apple_key, we must do that.
                 transfer_con.execute("update pt set payload = -42 where id = {};".format(apple_key))
@@ -897,18 +898,19 @@ class ShardmanTests(unittest.TestCase):
             balances = 'apple balance is {}, mango balance is {}'.format(apple_balance, mango_balance)
             self.assertTrue(apple_balance + mango_balance == 0, balances)
 
+    # This is not very useful anymore since PG supports COPY FROM natively...
     def test_copy_from(self):
         with Shardlord(num_repgroups=3, nodes_in_repgroup=2) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int default 1);')
+                'create table pt(id int primary key, payload int default 1) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 30, redundancy => 1);"
+                "select shardman.hash_shard_table('pt', 30, redundancy => 1);"
             )
 
             lord.safe_psql(
-                'create table pt_text(id int primary key, payload text);')
+                'create table pt_text(id int primary key, payload text) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt_text', 'id', 30, redundancy => 1);"
+                "select shardman.hash_shard_table('pt_text', 30, redundancy => 1);"
             )
 
             # copy some data on one node
@@ -958,13 +960,11 @@ class ShardmanTests(unittest.TestCase):
                 copy pt_local to stdout (format binary);
                 drop table pt_local;
                 """)
-            # ... and make sure we don't support it
-            with self.assertRaises(
-                    testgres.QueryException,
-                    msg="binary copy from not supported") as cm:
-                lord.workers_dict[1].safe_psql(
-                    'copy pt from stdin (format binary);', input=data)
-                self.assertIn("cannot copy to postgres_fdw table", str(cm.exception))
+            lord.workers_dict[1].safe_psql(
+                'copy pt from stdin (format binary);', input=data)
+            res_sum = int(lord.workers_dict[2].execute(sum_query('pt'))[0][0])
+            self.assertEqual(res_sum, 6)
+            lord.workers_dict[1].safe_psql('delete from pt;')
 
             # freeze off
             lord.workers_dict[1].safe_psql(
@@ -1070,9 +1070,9 @@ class ShardmanTests(unittest.TestCase):
     def test_alter_table_add_column(self):
         with Shardlord(num_repgroups=2, nodes_in_repgroup=2) as lord:
             lord.safe_psql(
-                'create table pt(id int primary key, payload int default 1);')
+                'create table pt(id int primary key, payload int default 1) partition by hash(id);')
             lord.safe_psql(
-                "select shardman.create_hash_partitions('pt', 'id', 4, redundancy => 1);"
+                "select shardman.hash_shard_table('pt', 4, redundancy => 1);"
             )
             lord.workers_dict[1].safe_psql(
                 "insert into pt select generate_series(1, 100), 0")
@@ -1128,7 +1128,7 @@ def suite():
     suite = unittest.TestSuite()
     suite.addTest(ShardmanTests('test_add_node'))
     suite.addTest(ShardmanTests('test_get_my_id'))
-    suite.addTest(ShardmanTests('test_create_hash_partitions_and_rm_table'))
+    suite.addTest(ShardmanTests('test_hash_shard_table_and_rm_table'))
     suite.addTest(ShardmanTests('test_set_redundancy'))
     suite.addTest(ShardmanTests('test_rebalance'))
     suite.addTest(ShardmanTests('test_non_super_user'))
@@ -1146,7 +1146,6 @@ def suite():
     suite.addTest(ShardmanTests('test_alter_table_add_column'))
 
     return suite
-
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2, failfast=True)

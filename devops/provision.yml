@@ -1,4 +1,4 @@
-### Build & install from sources PG, pg_pathman and pg_shardman
+### Build & install from sources PG and pg_shardman
 
 ---
 - hosts: nodes
@@ -87,22 +87,6 @@
     file: path="{{ pg_src }}" state=absent
     tags:
       - rm_pg_src
-
-  - name: clone pathman
-    git: repo={{pathman_repo}}
-      dest={{pathman_src}}
-      version={{pathman_version_tag}}
-      depth=1
-      accept_hostkey=True
-    tags:
-      - build_pathman
-
-  - name: build and install pathman
-    shell: USE_PGXS=1 make clean && USE_PGXS=1 make -j {{makejobs}} install
-    args:
-      chdir: "{{pathman_src}}"
-    tags:
-      - build_pathman
 
   - name: clone shardman {{ shardman_repo }}/{{ shardman_version_tag }}
     git: repo={{shardman_repo}}

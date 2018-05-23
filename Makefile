@@ -1,6 +1,6 @@
 # the extension name
 EXTENSION = pg_shardman
-EXTVERSION = 0.0.2
+EXTVERSION = 0.0.3
 # This file will be executed by CREATE EXTENSION, so let pgxs install it.
 DATA = $(EXTENSION)--$(EXTVERSION).sql
 
@@ -43,14 +43,14 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 else # assume the extension is in contrib/ dir of pg distribution
-# install pg_pathman and postgres_fdw too
-EXTRA_INSTALL = contrib/pg_pathman contrib/postgres_fdw
+# install postgres_fdw too
+EXTRA_INSTALL = contrib/postgres_fdw
 PG_CPPFLAGS = -I$(libpq_srcdir) # include libpq-fe, defined in Makefile.global.in
 SHLIB_LINK = $(libpq) # defined in Makefile.global.in
 SHLIB_PREREQS = submake-libpq
 subdir = contrib/pg_shardman
 top_builddir = ../..
-# Add pathman to shared preload libraries when running regression tests
+# Add shardman to shared preload libraries when running regression tests
 EXTRA_REGRESS_OPTS=--temp-config=$(top_srcdir)/$(subdir)/conf.add
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

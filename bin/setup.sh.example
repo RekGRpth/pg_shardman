@@ -1,6 +1,4 @@
 pgpath=~/postgres/install/vanilla/
-pathmanpath=~/postgres/pg_pathman
-install_pathman=false
 logfile=/tmp/shmn.log
 
 lord_datadir=/tmp/data1
@@ -55,15 +53,15 @@ function run_demo()
     psql -c "select shardman.add_node('port=5435');"
     psql -c "select shardman.add_node('port=5436');"
 
-    psql -c "select shardman.create_hash_partitions('pt', 'id', 4);"
+    psql -c "select shardman.hash_shard_table('pt', 'id', 4);"
     psql -c "select shardman.set_redundancy('pt', 2);"
 
     # for port in "${worker_ports[@]}"; do
     	# psql -p $port -f /home/ars/postgres/pg_shardman/bin/pgbench_history.sql
     # done
     # psql -f devops/pgbench_ddl.sql
-    # psql -c "select shardman.create_hash_partitions('pgbench_accounts', 'aid', 30, 1);"
-    # psql -c "select shardman.create_hash_partitions('pgbench_tellers', 'tid', 30, 1);"
-    # psql -c "select shardman.create_hash_partitions('pgbench_branches', 'bid', 30, 1);"
+    # psql -c "select shardman.hash_shard_table('pgbench_accounts', 'aid', 30, 1);"
+    # psql -c "select shardman.hash_shard_table('pgbench_tellers', 'tid', 30, 1);"
+    # psql -c "select shardman.hash_shard_table('pgbench_branches', 'bid', 30, 1);"
     # pgbench -p 5433 -s 10 -i --no-ddl
 }

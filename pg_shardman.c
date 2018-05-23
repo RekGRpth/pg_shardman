@@ -84,15 +84,6 @@ _PG_init()
 		PGC_SUSET,
 		0,
 		NULL, NULL, NULL);
-
-	/*
-	 * Tell pathman that we want it to do shardman-specific COPY FROM: that
-	 * is, support copy to foreign partitions by copying to foreign parent.
-	 * For now we just ask to do it always. Better to turn on this in copy
-	 * hook turn off after, however for that we need metadata on all nodes.
-	 */
-	*find_rendezvous_variable(
-		"shardman_pathman_copy_from_rendezvous") = DatumGetPointer(1);
 }
 
 Datum
@@ -519,8 +510,9 @@ reconstruct_table_attrs(PG_FUNCTION_ARGS)
 		/* NAME TYPE[(typmod)] [NOT NULL] [COLLATE "collation"] */
 		appendStringInfo(&query, "%s %s%s%s",
 						 quote_identifier(NameStr(attr->attname)),
-						 format_type_with_typemod_qualified(attr->atttypid,
-															attr->atttypmod),
+						 format_type_extended(attr->atttypid, attr->atttypmod,
+											  FORMAT_TYPE_TYPEMOD_GIVEN |
+											  FORMAT_TYPE_FORCE_QUALIFY),
 						 (attr->attnotnull ? " NOT NULL" : ""),
 						 (attr->attcollation ?
 						  psprintf(" COLLATE \"%s\"",
