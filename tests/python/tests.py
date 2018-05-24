@@ -1094,6 +1094,40 @@ class ShardmanTests(unittest.TestCase):
                 'select sum(added_col) from pt;')[0][0])
             self.assertEqual(res_sum, sum_after_rm)
 
+    def test_unique_constraint(self):
+        with Shardlord(num_repgroups=2, nodes_in_repgroup=2) as lord:
+            lord.safe_psql(
+                'create table pt(id int primary key, payload int default 1) partition by hash(id);')
+            lord.safe_psql(
+                "select shardman.hash_shard_table('pt', 4, redundancy => 1);"
+            )
+            lord.safe_psql(
+                "select shardman.alter_table('pt', 'add unique (id, payload)');"
+            )
+            lord.rm_node(1)
+
+    def test_indexes(self):
+        with Shardlord(num_repgroups=2, nodes_in_repgroup=2) as lord:
+            lord.safe_psql(
+                'create table pt(id int primary key, payload int default 1, payload2 int) partition by hash(id);')
+            lord.safe_psql(
+                "select shardman.hash_shard_table('pt', 4, redundancy => 1);"
+            )
+            lord.workers_dict[1].safe_psql(
+                "insert into pt select generate_series(1, 100), generate_series(1, 100)")
+
+            lord.safe_psql(
+                "select shardman.create_index('create index if not exists', 'payload_idx',"
+                " 'pt', 'using btree (payload)');"
+            )
+            # now rm some node, replicas should be reattached successfully
+            lord.rm_node(1)
+
+            # make sure that indexes on replicas have names allowing drop_index
+            # to drop them
+            lord.safe_psql(
+                "select shardman.drop_index('payload_idx');"
+            )
 
 # Create user joe for accessing data; configure pg_hba accordingly.
 # Unfortunately, we must use password, because postgres_fdw forbids passwordless
@@ -1144,6 +1178,8 @@ def suite():
     suite.addTest(ShardmanTests('test_global_snapshot_external'))
     suite.addTest(ShardmanTests('test_copy_from'))
     suite.addTest(ShardmanTests('test_alter_table_add_column'))
+    suite.addTest(ShardmanTests('test_unique_constraint'))
+    suite.addTest(ShardmanTests('test_indexes'))
 
     return suite
 

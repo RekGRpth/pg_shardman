@@ -58,6 +58,7 @@ CREATE TABLE partitions (
 -- Partition replicas
 CREATE TABLE replicas (
 	part_name text NOT NULL REFERENCES partitions(part_name) ON DELETE CASCADE,
+        part_num int,
 	-- node on which partition lies
 	node_id int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
 	relation text NOT NULL REFERENCES tables(relation) ON DELETE CASCADE,
@@ -724,14 +725,14 @@ BEGIN
 				ORDER by random() LIMIT redundancy-n_replicas
 			LOOP
 				-- Insert information about new replica in replicas table
-				INSERT INTO shardman.replicas (part_name, node_id, relation)
-					VALUES (part.part_name, repl_node, rel_name);
+				INSERT INTO shardman.replicas (part_name, part_num, node_id, relation)
+					VALUES (part.part_name, part.part_num, repl_node, rel_name);
 				-- Establish publications and subscriptions for this partition
 				pubs := format('%s%s:ALTER PUBLICATION node_%s ADD TABLE %I;',
 					 pubs, part.node_id, repl_node, part.part_name);
                                 -- Currently CREATE TABLE LIKE does exactly what
                                 -- we want: copy everything but partitioning
-                                create_reps := format('%s%s:CREATE TABLE %I (LIKE %I INCLUDING ALL);',
+                                create_reps := format('%s%s:SELECT shardman.create_replica(%L, %L);',
                                                       create_reps, repl_node,
                                                       part.part_name, part.relation);
 				sub := format('%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION%s;',
@@ -762,6 +763,43 @@ BEGIN
 
 	-- This function doesn't wait completion of replication sync.
 	-- Use wait ensure_redundancy function to wait until sync is completed
+END
+$$ LANGUAGE plpgsql;
+
+-- CREATE TABLE LIKE parent is fine for replicas creation except that we can't
+-- control index names, so we can't drop them. So copy them manually.
+CREATE FUNCTION create_replica(part_name name, rel_name name) RETURNS void AS $$
+DECLARE
+    index_relid regclass;
+    index_def text;
+    primkey_constr_oid oid := oid FROM pg_constraint
+                           WHERE conrelid = rel_name::regclass AND contype = 'p';
+    uniq_constr_oid oid;
+BEGIN
+    EXECUTE format('CREATE TABLE %I (LIKE %I INCLUDING COMMENTS INCLUDING CONSTRAINTS
+                   INCLUDING DEFAULTS INCLUDING IDENTITY INCLUDING STATISTICS
+                   INCLUDING STORAGE)', part_name, rel_name);
+    -- Copy primary key and unique constraints: those are not imported by LIKE
+    -- without INCLUDING INDEXES
+    IF primkey_constr_oid IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE %I ADD %s',
+                       part_name, pg_get_constraintdef(primkey_constr_oid));
+    END IF;
+    FOR uniq_constr_oid IN SELECT oid FROM pg_constraint
+        WHERE conrelid=rel_name::regclass AND contype = 'u' LOOP
+        EXECUTE format('ALTER TABLE %I ADD %s',
+                       part_name, pg_get_constraintdef(uniq_constr_oid));
+    END LOOP;
+
+    -- Now copy indexes; we are interested only in non-constraint ones.
+    FOR index_relid IN SELECT indexrelid FROM pg_index WHERE
+        indrelid = rel_name::regclass AND NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conindid = index_relid)
+    LOOP
+    	index_def = shardman.get_indexdef_custom_idx_rel_names(index_relid,
+                                                               part_name || '_' || index_relid::name,
+                                                               part_name);
+    END LOOP;
 END
 $$ LANGUAGE plpgsql;
 
@@ -1021,13 +1059,13 @@ $$ LANGUAGE sql;
 
 -- Execute command at all shardman nodes.
 -- It can be used to perform DDL at all nodes.
-CREATE FUNCTION forall(sql text, use_2pc bool = false, including_shardlord bool = false)
+CREATE FUNCTION forall(sql text, two_phase bool = false, including_shardlord bool = false)
 returns void AS $$
 DECLARE
 	node_id integer;
 	cmds text = '';
 BEGIN
-	IF shardman.redirect_to_shardlord(format('forall(%L, %L, %L)', sql, use_2pc, including_shardlord))
+	IF shardman.redirect_to_shardlord(format('forall(%L, %L, %L)', sql, two_phase, including_shardlord))
 	THEN
 		RETURN;
 	END IF;
@@ -1044,7 +1082,7 @@ BEGIN
 		cmds := format('%s0:%s;', cmds, sql);
 	END IF;
 
-	PERFORM shardman.broadcast(cmds, two_phase => use_2pc);
+	PERFORM shardman.broadcast(cmds, two_phase => two_phase);
 END
 $$ LANGUAGE plpgsql;
 
@@ -1258,21 +1296,26 @@ BEGIN
 	PERFORM shardman.broadcast(format('%s:ALTER PUBLICATION node_%s ADD TABLE %I;%s:ALTER PUBLICATION node_%s DROP TABLE %I;',
 		master_node_id, dst_node_id, mv_part_name, master_node_id, src_node_id, mv_part_name));
 
-	-- Refresh subscriptions
+    	-- Create replica at dst node
+    	PERFORM shardman.broadcast(format('%s:SELECT shardman.create_replica(%L, %L);',
+                                                      dst_node_id,
+                                                      mv_part_name, rel_name));
+	-- Refresh subscription
 	PERFORM shardman.broadcast(format('%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION WITH (copy_data=false);'
-									  '%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;',
-									  src_node_id, src_node_id, master_node_id,
-									  dst_node_id, dst_node_id, master_node_id),
-							   super_connstr => true);
+					  '%s:ALTER SUBSCRIPTION sub_%s_%s REFRESH PUBLICATION;',
+					  src_node_id, src_node_id, master_node_id,
+					  dst_node_id, dst_node_id, master_node_id),
+					  super_connstr => true);
 
 	-- Wait completion of initial table sync
 	PERFORM shardman.wait_sync_completion(master_node_id, dst_node_id);
 
-	-- Update metadata
+	-- Update metadata.
 	UPDATE shardman.replicas SET node_id=dst_node_id WHERE node_id=src_node_id AND part_name=mv_part_name;
 
-	-- Truncate original table
-	PERFORM shardman.broadcast(format('%s:TRUNCATE TABLE %I;', src_node_id, mv_part_name));
+    	-- DROP original table. XXX yeah, if we fail here, we will be left
+        -- without replicas at all (metadata update not committed yet).
+	PERFORM shardman.broadcast(format('%s:DROP TABLE %I;', src_node_id, mv_part_name));
 
 	-- If there are more than one replica, we need to maintain change_log table for it
 	IF shardman.get_redundancy_of_partition(mv_part_name) > 1
@@ -1831,11 +1874,22 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Make sure table is created on shardlord (probably it doesn't after failover)
+CREATE FUNCTION shardlord_ensure_table(rel_name name) RETURNS void AS $$
+DECLARE
+    create_table text;
+BEGIN
+    PERFORM shardman.broadcast(format('0:DROP TABLE IF EXISTS %I CASCADE;', rel_name));
+    SELECT create_sql FROM shardman.tables WHERE relation = rel_name INTO create_table;
+    PERFORM shardman.broadcast(format('{0:%s}', create_table));
+END
+$$ LANGUAGE plpgsql;
 
 -- Alter table at shardlord and all nodes
-CREATE FUNCTION alter_table(rel regclass, alter_clause text) RETURNS void AS $$
+-- Better to use 2pc here, but then we should update replicas in one broadcast.
+-- Also, metadata might still be not updated anyway.
+CREATE FUNCTION alter_table(rel_name name, alter_clause text) RETURNS void AS $$
 DECLARE
-	rel_name text = rel::text;
 	t shardman.tables;
 	repl shardman.replicas;
 	create_table text;
@@ -1849,13 +1903,15 @@ BEGIN
 		RETURN;
 	END IF;
 
+    	PERFORM shardman.shardlord_ensure_table(rel_name);
+
 	-- Alter root table everywhere
 	PERFORM shardman.forall(format('ALTER TABLE %I %s', rel_name, alter_clause), including_shardlord=>true);
 
 	SELECT * INTO t FROM shardman.tables WHERE relation=rel_name;
 	SELECT shardman.gen_create_table_sql(t.relation) INTO create_table;
 
-	-- Broadcast new rules
+	-- Broadcast new rules, if shared table is altered
 	IF t.master_node IS NOT NULL
 	THEN
 		SELECT shardman.gen_create_rules_sql(t.relation, format('%s_fdw', t.relation)) INTO create_rules;
@@ -1875,6 +1931,74 @@ BEGIN
 			   alters, repl.node_id, repl.part_name, alter_clause);
 	END LOOP;
 	PERFORM shardman.broadcast(alters);
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION create_index(create_clause text, idx_name name, rel_name name,
+                             index_clause text) RETURNS void AS $$
+DECLARE
+    repl shardman.replicas;
+    alters text = '';
+    create_table text;
+BEGIN
+    IF shardman.redirect_to_shardlord(format('create_index(%L,%L,%L)', create_clause, rel_name, index_clause))
+    THEN
+	RETURN;
+    END IF;
+
+    PERFORM shardman.shardlord_ensure_table(rel_name);
+    -- Alter root table everywhere
+    PERFORM shardman.forall(format('%s %I ON %I %s', create_clause, idx_name, rel_name,
+                                   index_clause),
+                                   including_shardlord=>true);
+    SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
+    UPDATE shardman.tables SET create_sql=create_table WHERE relation=rel_name;
+
+    -- Create index on all replicas with appropriate name
+    FOR repl IN SELECT * FROM shardman.replicas
+	LOOP
+	alters := format('%s%s:%s %I ON %I %s;',
+			 alters, repl.node_id,
+                         create_clause, repl.part_name || '_' || idx_name, repl.part_name,
+                         index_clause);
+    END LOOP;
+    PERFORM shardman.broadcast(alters);
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION drop_index(idx_name name) RETURNS void AS $$
+DECLARE
+    repl shardman.replicas;
+    alters text = '';
+    create_table text;
+    rel_name name;
+BEGIN
+    IF shardman.redirect_to_shardlord(format('drop_index(%L)', idx_name))
+    THEN
+	RETURN;
+    END IF;
+
+    -- Find out relation
+    FOR rel_name IN SELECT relation FROM shardman.tables LOOP
+        PERFORM shardman.shardlord_ensure_table(rel_name);
+    END LOOP;
+    rel_name := shardman.broadcast(format('0:SELECT indrelid::regclass::name
+                                          FROM pg_index WHERE indexrelid::regclass::name = %L;',
+                                   idx_name));
+    -- Alter root table everywhere
+    PERFORM shardman.forall(format('DROP INDEX %I', idx_name),
+                                   including_shardlord=>true);
+    SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
+    UPDATE shardman.tables SET create_sql=create_table WHERE relation=rel_name;
+
+    -- Drop index on all replicas
+    FOR repl IN SELECT * FROM shardman.replicas
+	LOOP
+	alters := format('%s%s:DROP INDEX %I;',
+			 alters, repl.node_id,
+                         repl.part_name || '_' || idx_name, repl.part_name);
+    END LOOP;
+    PERFORM shardman.broadcast(alters);
 END
 $$ LANGUAGE plpgsql;
 
@@ -2076,12 +2200,15 @@ BEGIN
     WHERE  i.indrelid = rel_name::regclass
     AND    i.indisprimary;
 
-	RETURN format('CREATE OR REPLACE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
-		           CREATE OR REPLACE RULE on_insert AS ON INSERT TO %I DO INSTEAD INSERT INTO %I (%s) VALUES (%s);
-		           CREATE OR REPLACE RULE on_delete AS ON DELETE TO %I DO INSTEAD DELETE FROM %I WHERE %s;',
-        rel_name, fdw_name, dst, src, pk,
-		rel_name, fdw_name, dst, src,
-		rel_name, fdw_name, pk);
+	RETURN format('CREATE OR REPLACE RULE on_update AS ON UPDATE TO %I DO INSTEAD
+                      UPDATE %I SET (%s) = (%s) WHERE %s;
+		      CREATE OR REPLACE RULE on_insert AS ON INSERT TO %I DO INSTEAD
+                      INSERT INTO %I (%s) VALUES (%s);
+		      CREATE OR REPLACE RULE on_delete AS ON DELETE TO %I DO INSTEAD
+                      DELETE FROM %I WHERE %s;',
+                      rel_name, fdw_name, dst, src, pk,
+		      rel_name, fdw_name, dst, src,
+		      rel_name, fdw_name, pk);
 END
 $$ LANGUAGE plpgsql;
 
@@ -2116,6 +2243,12 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Reconstruct table attributes for foreign table
 CREATE FUNCTION reconstruct_table_attrs(relation regclass)
+RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
+
+-- Reconstruct table attributes for foreign table
+CREATE FUNCTION get_indexdef_custom_idx_rel_names(indexrelid regclass,
+                                                  target_idxname name,
+                                                  target_relname name)
 RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Broadcast SQL commands to nodes and wait their completion.

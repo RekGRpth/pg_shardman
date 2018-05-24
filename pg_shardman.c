@@ -8,21 +8,33 @@
  */
 #include "postgres.h"
 
+#include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_opclass.h"
+#include "catalog/pg_operator.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
+#include "commands/tablespace.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/parse_oper.h"
+#include "parser/parser.h"
 #include "pgstat.h"
 #include "storage/latch.h"
-#include "utils/guc.h"
-#include "utils/rel.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/ruleutils.h"
+#include "utils/syscache.h"
+#include "utils/rel.h"
 
 /* ensure that extension won't load against incompatible version of Postgres */
 PG_MODULE_MAGIC;
@@ -35,6 +47,7 @@ PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
 PG_FUNCTION_INFO_V1(pq_conninfo_parse);
 PG_FUNCTION_INFO_V1(get_system_identifier);
 PG_FUNCTION_INFO_V1(reset_synchronous_standby_names_on_commit);
+PG_FUNCTION_INFO_V1(get_indexdef_custom_idx_rel_names);
 
 /* GUC variables */
 static bool is_lord;
@@ -47,6 +60,16 @@ static bool reset_ssn_callback_set = false;
 static bool reset_ssn_requested = false;
 
 static void reset_ssn_xact_callback(XactEvent event, void *arg);
+
+/* Copied from ruleutils.c */
+static char *get_relation_name(Oid relid);
+static bool looks_like_function(Node *node);
+static void get_opclass_name(Oid opclass, Oid actual_datatype,
+				 StringInfo buf);
+static char *generate_operator_name(Oid operid, Oid arg1, Oid arg2);
+static char *flatten_reloptions(Oid relid);
+static text *string_to_text(char *str);
+static void simple_quote_literal(StringInfo buf, const char *val);
 
 /*
  * Entrypoint of the module. Define GUCs.
@@ -677,4 +700,594 @@ reset_ssn_xact_callback(XactEvent event, void *arg)
 		list_free_deep(setstmt.args);
 		reset_ssn_requested = false;
 	}
+}
+
+/*
+ * Decompile index definition with given indexrelid, substituting index and
+ * relation names with given ones. Copied from ruleutils.c.
+ *
+ * This is obviously ugly, but that's probably the easiest way to create
+ * indexes with controllable names on replicas.
+ */
+Datum
+get_indexdef_custom_idx_rel_names(PG_FUNCTION_ARGS)
+{
+	Oid			indexrelid = PG_GETARG_OID(0);
+	Name		target_idxname = PG_GETARG_NAME(1);
+	Name		target_relname = PG_GETARG_NAME(2);
+	/* Dummy args */
+	int colno = 0;
+	const Oid *excludeOps = NULL;
+	bool attrsOnly = false;
+	bool showTblSpc = false;
+
+	/* might want a separate isConstraint parameter later */
+	bool		isConstraint = (excludeOps != NULL);
+	HeapTuple	ht_idx;
+	HeapTuple	ht_idxrel;
+	HeapTuple	ht_am;
+	Form_pg_index idxrec;
+	Form_pg_class idxrelrec;
+	Form_pg_am	amrec;
+	IndexAmRoutine *amroutine;
+	List	   *indexprs;
+	ListCell   *indexpr_item;
+	List	   *context;
+	Oid			indrelid;
+	int			keyno;
+	Datum		indcollDatum;
+	Datum		indclassDatum;
+	Datum		indoptionDatum;
+	bool		isnull;
+	oidvector  *indcollation;
+	oidvector  *indclass;
+	int2vector *indoption;
+	StringInfoData buf;
+	char	   *str;
+	char	   *sep;
+
+	/*
+	 * Fetch the pg_index tuple by the Oid of the index
+	 */
+	ht_idx = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexrelid));
+	if (!HeapTupleIsValid(ht_idx))
+	{
+		elog(ERROR, "cache lookup failed for index %u", indexrelid);
+	}
+	idxrec = (Form_pg_index) GETSTRUCT(ht_idx);
+
+	indrelid = idxrec->indrelid;
+	Assert(indexrelid == idxrec->indexrelid);
+
+	/* Must get indcollation, indclass, and indoption the hard way */
+	indcollDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
+								   Anum_pg_index_indcollation, &isnull);
+	Assert(!isnull);
+	indcollation = (oidvector *) DatumGetPointer(indcollDatum);
+
+	indclassDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
+									Anum_pg_index_indclass, &isnull);
+	Assert(!isnull);
+	indclass = (oidvector *) DatumGetPointer(indclassDatum);
+
+	indoptionDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
+									 Anum_pg_index_indoption, &isnull);
+	Assert(!isnull);
+	indoption = (int2vector *) DatumGetPointer(indoptionDatum);
+
+	/*
+	 * Fetch the pg_class tuple of the index relation
+	 */
+	ht_idxrel = SearchSysCache1(RELOID, ObjectIdGetDatum(indexrelid));
+	if (!HeapTupleIsValid(ht_idxrel))
+		elog(ERROR, "cache lookup failed for relation %u", indexrelid);
+	idxrelrec = (Form_pg_class) GETSTRUCT(ht_idxrel);
+
+	/*
+	 * Fetch the pg_am tuple of the index' access method
+	 */
+	ht_am = SearchSysCache1(AMOID, ObjectIdGetDatum(idxrelrec->relam));
+	if (!HeapTupleIsValid(ht_am))
+		elog(ERROR, "cache lookup failed for access method %u",
+			 idxrelrec->relam);
+	amrec = (Form_pg_am) GETSTRUCT(ht_am);
+
+	/* Fetch the index AM's API struct */
+	amroutine = GetIndexAmRoutine(amrec->amhandler);
+
+	/*
+	 * Get the index expressions, if any.  (NOTE: we do not use the relcache
+	 * versions of the expressions and predicate, because we want to display
+	 * non-const-folded expressions.)
+	 */
+	if (!heap_attisnull(ht_idx, Anum_pg_index_indexprs, NULL))
+	{
+		Datum		exprsDatum;
+		bool		isnull;
+		char	   *exprsString;
+
+		exprsDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
+									 Anum_pg_index_indexprs, &isnull);
+		Assert(!isnull);
+		exprsString = TextDatumGetCString(exprsDatum);
+		indexprs = (List *) stringToNode(exprsString);
+		pfree(exprsString);
+	}
+	else
+		indexprs = NIL;
+
+	indexpr_item = list_head(indexprs);
+
+	context = deparse_context_for(get_relation_name(indrelid), indrelid);
+
+	/*
+	 * Start the index definition.  Note that the index's name should never be
+	 * schema-qualified, but the indexed rel's name may be.
+	 */
+	initStringInfo(&buf);
+
+	if (!attrsOnly)
+	{
+		if (!isConstraint)
+			appendStringInfo(&buf, "CREATE %sINDEX %s ON %s USING %s (",
+							 idxrec->indisunique ? "UNIQUE " : "",
+							 quote_identifier(NameStr(*target_idxname)),
+							 quote_identifier(NameStr(*target_relname)),
+							 quote_identifier(NameStr(amrec->amname)));
+		else					/* currently, must be EXCLUDE constraint */
+			appendStringInfo(&buf, "EXCLUDE USING %s (",
+							 quote_identifier(NameStr(amrec->amname)));
+	}
+
+	/*
+	 * Report the indexed attributes
+	 */
+	sep = "";
+	for (keyno = 0; keyno < idxrec->indnatts; keyno++)
+	{
+		AttrNumber	attnum = idxrec->indkey.values[keyno];
+		int16		opt = indoption->values[keyno];
+		Oid			keycoltype;
+		Oid			keycolcollation;
+
+		/*
+		 * attrsOnly flag is used for building unique-constraint and
+		 * exclusion-constraint error messages. Included attrs are meaningless
+		 * there, so do not include them in the message.
+		 */
+		if (attrsOnly && keyno >= idxrec->indnkeyatts)
+			break;
+
+		/* Report the INCLUDED attributes, if any. */
+		if ((!attrsOnly) && keyno == idxrec->indnkeyatts)
+		{
+			appendStringInfoString(&buf, ") INCLUDE (");
+			sep = "";
+		}
+
+		if (!colno)
+			appendStringInfoString(&buf, sep);
+		sep = ", ";
+
+		if (attnum != 0)
+		{
+			/* Simple index column */
+			char	   *attname;
+			int32		keycoltypmod;
+
+			attname = get_attname(indrelid, attnum, false);
+			if (!colno || colno == keyno + 1)
+				appendStringInfoString(&buf, quote_identifier(attname));
+			get_atttypetypmodcoll(indrelid, attnum,
+								  &keycoltype, &keycoltypmod,
+								  &keycolcollation);
+		}
+		else
+		{
+			/* expressional index */
+			Node	   *indexkey;
+
+			if (indexpr_item == NULL)
+				elog(ERROR, "too few entries in indexprs list");
+			indexkey = (Node *) lfirst(indexpr_item);
+			indexpr_item = lnext(indexpr_item);
+			/* Deparse */
+			str = deparse_expression(indexkey, context, false, false);
+			if (!colno || colno == keyno + 1)
+			{
+				/* Need parens if it's not a bare function call */
+				if (looks_like_function(indexkey))
+					appendStringInfoString(&buf, str);
+				else
+					appendStringInfo(&buf, "(%s)", str);
+			}
+			keycoltype = exprType(indexkey);
+			keycolcollation = exprCollation(indexkey);
+		}
+
+		if (!attrsOnly && (!colno || colno == keyno + 1))
+		{
+			Oid			indcoll;
+
+			if (keyno >= idxrec->indnkeyatts)
+				continue;
+
+			/* Add collation, if not default for column */
+			indcoll = indcollation->values[keyno];
+			if (OidIsValid(indcoll) && indcoll != keycolcollation)
+				appendStringInfo(&buf, " COLLATE %s",
+								 generate_collation_name((indcoll)));
+
+			/* Add the operator class name, if not default */
+			get_opclass_name(indclass->values[keyno], keycoltype, &buf);
+
+			/* Add options if relevant */
+			if (amroutine->amcanorder)
+			{
+				/* if it supports sort ordering, report DESC and NULLS opts */
+				if (opt & INDOPTION_DESC)
+				{
+					appendStringInfoString(&buf, " DESC");
+					/* NULLS FIRST is the default in this case */
+					if (!(opt & INDOPTION_NULLS_FIRST))
+						appendStringInfoString(&buf, " NULLS LAST");
+				}
+				else
+				{
+					if (opt & INDOPTION_NULLS_FIRST)
+						appendStringInfoString(&buf, " NULLS FIRST");
+				}
+			}
+
+			/* Add the exclusion operator if relevant */
+			if (excludeOps != NULL)
+				appendStringInfo(&buf, " WITH %s",
+								 generate_operator_name(excludeOps[keyno],
+														keycoltype,
+														keycoltype));
+		}
+	}
+
+	if (!attrsOnly)
+	{
+		appendStringInfoChar(&buf, ')');
+
+		/*
+		 * If it has options, append "WITH (options)"
+		 */
+		str = flatten_reloptions(indexrelid);
+		if (str)
+		{
+			appendStringInfo(&buf, " WITH (%s)", str);
+			pfree(str);
+		}
+
+		/*
+		 * Print tablespace, but only if requested
+		 */
+		if (showTblSpc)
+		{
+			Oid			tblspc;
+
+			tblspc = get_rel_tablespace(indexrelid);
+			if (!OidIsValid(tblspc))
+				tblspc = MyDatabaseTableSpace;
+			if (isConstraint)
+				appendStringInfoString(&buf, " USING INDEX");
+			appendStringInfo(&buf, " TABLESPACE %s",
+							 quote_identifier(get_tablespace_name(tblspc)));
+		}
+
+		/*
+		 * If it's a partial index, decompile and append the predicate
+		 */
+		if (!heap_attisnull(ht_idx, Anum_pg_index_indpred, NULL))
+		{
+			Node	   *node;
+			Datum		predDatum;
+			bool		isnull;
+			char	   *predString;
+
+			/* Convert text string to node tree */
+			predDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
+										Anum_pg_index_indpred, &isnull);
+			Assert(!isnull);
+			predString = TextDatumGetCString(predDatum);
+			node = (Node *) stringToNode(predString);
+			pfree(predString);
+
+			/* Deparse */
+			str = deparse_expression(node, context, false, false);
+			if (isConstraint)
+				appendStringInfo(&buf, " WHERE (%s)", str);
+			else
+				appendStringInfo(&buf, " WHERE %s", str);
+		}
+	}
+
+	/* Clean up */
+	ReleaseSysCache(ht_idx);
+	ReleaseSysCache(ht_idxrel);
+	ReleaseSysCache(ht_am);
+
+	PG_RETURN_TEXT_P(string_to_text(buf.data));
+}
+
+/*
+ * get_relation_name
+ *		Get the unqualified name of a relation specified by OID
+ *
+ * This differs from the underlying get_rel_name() function in that it will
+ * throw error instead of silently returning NULL if the OID is bad.
+ */
+static char *
+get_relation_name(Oid relid)
+{
+	char	   *relname = get_rel_name(relid);
+
+	if (!relname)
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	return relname;
+}
+
+/*
+ * Helper function to identify node types that satisfy func_expr_windowless.
+ * If in doubt, "false" is always a safe answer.
+ */
+static bool
+looks_like_function(Node *node)
+{
+	if (node == NULL)
+		return false;			/* probably shouldn't happen */
+	switch (nodeTag(node))
+	{
+		case T_FuncExpr:
+			/* OK, unless it's going to deparse as a cast */
+			return (((FuncExpr *) node)->funcformat == COERCE_EXPLICIT_CALL);
+		case T_NullIfExpr:
+		case T_CoalesceExpr:
+		case T_MinMaxExpr:
+		case T_SQLValueFunction:
+		case T_XmlExpr:
+			/* these are all accepted by func_expr_common_subexpr */
+			return true;
+		default:
+			break;
+	}
+	return false;
+}
+
+/*
+ * get_opclass_name			- fetch name of an index operator class
+ *
+ * The opclass name is appended (after a space) to buf.
+ *
+ * Output is suppressed if the opclass is the default for the given
+ * actual_datatype.  (If you don't want this behavior, just pass
+ * InvalidOid for actual_datatype.)
+ */
+static void
+get_opclass_name(Oid opclass, Oid actual_datatype,
+				 StringInfo buf)
+{
+	HeapTuple	ht_opc;
+	Form_pg_opclass opcrec;
+	char	   *opcname;
+	char	   *nspname;
+
+	ht_opc = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
+	if (!HeapTupleIsValid(ht_opc))
+		elog(ERROR, "cache lookup failed for opclass %u", opclass);
+	opcrec = (Form_pg_opclass) GETSTRUCT(ht_opc);
+
+	if (!OidIsValid(actual_datatype) ||
+		GetDefaultOpClass(actual_datatype, opcrec->opcmethod) != opclass)
+	{
+		/* Okay, we need the opclass name.  Do we need to qualify it? */
+		opcname = NameStr(opcrec->opcname);
+		if (OpclassIsVisible(opclass))
+			appendStringInfo(buf, " %s", quote_identifier(opcname));
+		else
+		{
+			nspname = get_namespace_name(opcrec->opcnamespace);
+			appendStringInfo(buf, " %s.%s",
+							 quote_identifier(nspname),
+							 quote_identifier(opcname));
+		}
+	}
+	ReleaseSysCache(ht_opc);
+}
+
+/*
+ * generate_operator_name
+ *		Compute the name to display for an operator specified by OID,
+ *		given that it is being called with the specified actual arg types.
+ *		(Arg types matter because of ambiguous-operator resolution rules.
+ *		Pass InvalidOid for unused arg of a unary operator.)
+ *
+ * The result includes all necessary quoting and schema-prefixing,
+ * plus the OPERATOR() decoration needed to use a qualified operator name
+ * in an expression.
+ */
+static char *
+generate_operator_name(Oid operid, Oid arg1, Oid arg2)
+{
+	StringInfoData buf;
+	HeapTuple	opertup;
+	Form_pg_operator operform;
+	char	   *oprname;
+	char	   *nspname;
+	Operator	p_result;
+
+	initStringInfo(&buf);
+
+	opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operid));
+	if (!HeapTupleIsValid(opertup))
+		elog(ERROR, "cache lookup failed for operator %u", operid);
+	operform = (Form_pg_operator) GETSTRUCT(opertup);
+	oprname = NameStr(operform->oprname);
+
+	/*
+	 * The idea here is to schema-qualify only if the parser would fail to
+	 * resolve the correct operator given the unqualified op name with the
+	 * specified argtypes.
+	 */
+	switch (operform->oprkind)
+	{
+		case 'b':
+			p_result = oper(NULL, list_make1(makeString(oprname)), arg1, arg2,
+							true, -1);
+			break;
+		case 'l':
+			p_result = left_oper(NULL, list_make1(makeString(oprname)), arg2,
+								 true, -1);
+			break;
+		case 'r':
+			p_result = right_oper(NULL, list_make1(makeString(oprname)), arg1,
+								  true, -1);
+			break;
+		default:
+			elog(ERROR, "unrecognized oprkind: %d", operform->oprkind);
+			p_result = NULL;	/* keep compiler quiet */
+			break;
+	}
+
+	if (p_result != NULL && oprid(p_result) == operid)
+		nspname = NULL;
+	else
+	{
+		nspname = get_namespace_name(operform->oprnamespace);
+		appendStringInfo(&buf, "OPERATOR(%s.", quote_identifier(nspname));
+	}
+
+	appendStringInfoString(&buf, oprname);
+
+	if (nspname)
+		appendStringInfoChar(&buf, ')');
+
+	if (p_result != NULL)
+		ReleaseSysCache(p_result);
+
+	ReleaseSysCache(opertup);
+
+	return buf.data;
+}
+
+/*
+ * Generate a C string representing a relation's reloptions, or NULL if none.
+ */
+static char *
+flatten_reloptions(Oid relid)
+{
+	char	   *result = NULL;
+	HeapTuple	tuple;
+	Datum		reloptions;
+	bool		isnull;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	reloptions = SysCacheGetAttr(RELOID, tuple,
+								 Anum_pg_class_reloptions, &isnull);
+	if (!isnull)
+	{
+		StringInfoData buf;
+		Datum	   *options;
+		int			noptions;
+		int			i;
+
+		initStringInfo(&buf);
+
+		deconstruct_array(DatumGetArrayTypeP(reloptions),
+						  TEXTOID, -1, false, 'i',
+						  &options, NULL, &noptions);
+
+		for (i = 0; i < noptions; i++)
+		{
+			char	   *option = TextDatumGetCString(options[i]);
+			char	   *name;
+			char	   *separator;
+			char	   *value;
+
+			/*
+			 * Each array element should have the form name=value.  If the "="
+			 * is missing for some reason, treat it like an empty value.
+			 */
+			name = option;
+			separator = strchr(option, '=');
+			if (separator)
+			{
+				*separator = '\0';
+				value = separator + 1;
+			}
+			else
+				value = "";
+
+			if (i > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfo(&buf, "%s=", quote_identifier(name));
+
+			/*
+			 * In general we need to quote the value; but to avoid unnecessary
+			 * clutter, do not quote if it is an identifier that would not
+			 * need quoting.  (We could also allow numbers, but that is a bit
+			 * trickier than it looks --- for example, are leading zeroes
+			 * significant?  We don't want to assume very much here about what
+			 * custom reloptions might mean.)
+			 */
+			if (quote_identifier(value) == value)
+				appendStringInfoString(&buf, value);
+			else
+				simple_quote_literal(&buf, value);
+
+			pfree(option);
+		}
+
+		result = buf.data;
+	}
+
+	ReleaseSysCache(tuple);
+
+	return result;
+}
+
+/*
+ * Given a C string, produce a TEXT datum.
+ *
+ * We assume that the input was palloc'd and may be freed.
+ */
+static text *
+string_to_text(char *str)
+{
+	text	   *result;
+
+	result = cstring_to_text(str);
+	pfree(str);
+	return result;
+}
+
+/*
+ * simple_quote_literal - Format a string as a SQL literal, append to buf
+ */
+static void
+simple_quote_literal(StringInfo buf, const char *val)
+{
+	const char *valptr;
+
+	/*
+	 * We form the string literal according to the prevailing setting of
+	 * standard_conforming_strings; we never use E''. User is responsible for
+	 * making sure result is used correctly.
+	 */
+	appendStringInfoChar(buf, '\'');
+	for (valptr = val; *valptr; valptr++)
+	{
+		char		ch = *valptr;
+
+		if (SQL_STR_DOUBLE(ch, !standard_conforming_strings))
+			appendStringInfoChar(buf, ch);
+		appendStringInfoChar(buf, ch);
+	}
+	appendStringInfoChar(buf, '\'');
 }
