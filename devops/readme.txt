@@ -25,6 +25,11 @@ regions = eu-central-1 # set region
 set aws_access_key_id = xxx
 set aws_secret_access_key = xxx
 export EC2_INI_PATH=/etc/ansible/ec2.ini
+I also advise to add something like
+Host *amazonaws.com
+    User ubuntu
+    IdentityFile /home/ars/.ssh/aws.pem
+to ~/.ssh/config for direct ssh'ing.
 
 Now launch some instances and check that ec2.py works:
 inventory_ec2/ec2_elect_shardlord.py --list
@@ -65,6 +70,9 @@ ansible-playbook -i inventory_ec2/ pgbench_single.yml -e 'scale=10 tmstmp=false 
 
 Gather logs to ./logs:
 ansible-playbook -i inventory_ec2/ logs.yml
+
+tester.py attempts to automate this stuff, e.g.
+nohup ./tester.py tester_conf.json > tester.log 2>&1 &
 
 Start micro instances:
 ansible-playbook -i inventory_ec2/ ec2.yml --tags "micro" -e "count=2"

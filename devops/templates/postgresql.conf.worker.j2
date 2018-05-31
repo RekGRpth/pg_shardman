@@ -5,6 +5,8 @@
 
 {% include "postgresql.conf.worker" %}
 
+shardman.shardlord_connstring = '{{ shardman_shardlord_connstring }}'
+
 {% include "postgresql.conf.devops.common" ignore missing %}
 
 {% include "postgresql.conf.devops.worker" ignore missing %}

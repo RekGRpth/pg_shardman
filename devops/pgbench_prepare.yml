@@ -52,9 +52,9 @@
   - name: hash_shard_table for pgbench_accounts, nparts {{ nparts }}, redundancy {{ redundancy }}
     command: >
       psql -p {{ pg_port }} -c "
-      select shardman.hash_shard_table('pgbench_accounts', 'aid', {{ nparts }}, {{ redundancy }});
-      select shardman.hash_shard_table('pgbench_tellers', 'tid', {{ nparts }}, {{ redundancy }});
-      select shardman.hash_shard_table('pgbench_branches', 'bid', {{ nparts }}, {{ redundancy }});
+      select shardman.hash_shard_table('pgbench_accounts', {{ nparts }}, {{ redundancy }});
+      select shardman.hash_shard_table('pgbench_tellers', {{ nparts }}, {{ redundancy }});
+      select shardman.hash_shard_table('pgbench_branches', {{ nparts }}, {{ redundancy }});
       "
     tags:
       - hash_shard_table
@@ -69,9 +69,8 @@
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
   tasks:
-    # requires patched pgbench
   - name: initialize pgbench, scale {{ scale }}
     command: >
-      pgbench -p {{ pg_port }} -s {{ scale }} -i --no-ddl
+      pgbench -p {{ pg_port }} -s {{ scale }} -i --init-steps=gv
     tags:
       - pgbench_init

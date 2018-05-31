@@ -1,4 +1,4 @@
 ---
 
-- name: pg_ctl {{pg_ctl_action}} -l {{ pg_logfile }}
+- name: pg_ctl {{pg_ctl_action}} -l {{ pg_logfile }} -D {{pg_datadir}}
   command: "{{pg_dst}}/bin/pg_ctl {{pg_ctl_action}} -D {{pg_datadir}} -l {{pg_logfile}}"

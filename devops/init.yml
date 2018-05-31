@@ -49,24 +49,46 @@
 
   tasks:
   - name: create extension pg_shardman
-    command: psql -p {{ pg_port }} -c "create extension pg_shardman cascade;"
+    command: >
+      psql -p {{ pg_port }} -c "
+      do $$
+      declare
+      begin
+      if exists (select 1 from pg_extension where extname = 'pg_shardman') then
+      perform shardman.wipe_state();
+      drop extension pg_shardman cascade;
+      end if;
+      create extension pg_shardman cascade;
+      end $$ language 'plpgsql';
+      "
+    tags:
+      - create_ext
+  - name: reload conf
+    command: psql -p {{ pg_port }} -c "select pg_reload_conf();"
     tags:
       - create_ext
 
 - hosts: shardlord
   vars:
-    nodes_in_repgroup: 999999
+    nodes_in_repgroup: 1
 
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
   tasks:
+  # repgroup requires accuracy: we need to be sure that no replication group has
+  # less members than nodes_in_repgroup, so set it to min (quotient, max repl group)
+  - debug: msg="Putting node {{item.0}} to rg {{ [item.0 // (nodes_in_repgroup | int), ((groups.ec2_workers | length) // (nodes_in_repgroup | int)) - 1] | min }}"
+    with_indexed_items: "{{ groups.ec2_workers }}"
+    tags:
+      - dbg
+
   - name: add ec2 workers, nodes_in_repgroup is {{ nodes_in_repgroup }}
     command: >
       psql -p {{ pg_port }} -c "select shardman.add_node(
       'hostaddr={{ hostvars[item.1]['ec2_private_ip_address'] }} port={{ pg_port }}',
       'hostaddr={{ hostvars[item.1]['ec2_private_ip_address'] }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}',
-      'group_{{ item.0 // (nodes_in_repgroup | int) }}')
+      'group_{{ [item.0 // (nodes_in_repgroup | int), ((groups.ec2_workers | length) // (nodes_in_repgroup | int)) - 1] | min }}')
       "
     with_indexed_items: "{{ groups.ec2_workers }}"
     tags:
@@ -77,7 +99,7 @@
       psql -p {{ pg_port }} -c "select shardman.add_node(
       'hostaddr={{ item.1 }} port={{ pg_port }}',
       'hostaddr={{ item.1 }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}',
-      'group_{{ item.0 // (nodes_in_repgroup | int) }}')"
+      'group_{{ [item.0 // (nodes_in_repgroup | int), ((groups.manual_workers | length) // (nodes_in_repgroup | int)) - 1] | min }}')"
     with_indexed_items: "{{ groups.manual_workers }}"
     tags:
       - add_nodes
