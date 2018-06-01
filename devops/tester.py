@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import json
 import copy
+from boto import ec2
 from sys import argv
 from itertools import product
 from subprocess import check_call, check_output
@@ -90,11 +91,26 @@ def test_conf(conf):
             if create_instances:
                 check_call('ansible-playbook -i inventory_ec2/ ec2.yml --tags "terminate"',
                            shell=True)
-                check_call('''
-                ansible-playbook -i inventory_ec2/ ec2.yml --tags "launch" \
-                -e "instance_type={} count={}"
-                '''.format(test_row.instance_type, test_row.nodes + 1),
-                           shell=True)
+                # Amazon doesn't like requesting many instances to be spawn at
+                # once. So try to create them gradually. Ah, that was just
+                # because I used old generation instances, damn amazon.
+                zone = 'eu-central-1b'
+                conn = ec2.connect_to_region(
+                    'eu-central-1',
+                    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+                    aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'])
+                instances = []
+                instances_needed = test_row.nodes + 1
+                while len(instances) != instances_needed:
+                    to_spawn = min(49, instances_needed - len(instances))
+                    check_call('''
+                    ansible-playbook -i inventory_ec2/ ec2.yml --tags "launch" \
+                    -e "instance_type={} count={} zone={}"
+                    '''.format(test_row.instance_type, to_spawn, zone),
+                               shell=True)
+                    reservations = conn.get_all_instances()
+                    instances = [i for r in reservations for i in r.instances if i.state != 'terminated']
+
                 time.sleep(20) ## wait for system to start up
             test_nodes(conf, test_row_dup)
     finally:
@@ -121,7 +137,7 @@ def test_pgbench(conf, test_row):
 
     if not test_row.fdw_2pc:
         with open("postgresql.conf.common", "a") as pgconf:
-            pgconf.write('postgres_fdw.use_2pc = off\n')
+            pgconf.write('postgres_fdw.use_twophase = off\n')
 
     test_row.nparts = test_row.nodes * test_row.nparts_per_node
     if test_row.redundancy == 0:
@@ -166,7 +182,7 @@ def run(conf, test_row):
         raise ValueError('Wrong "test" {}'.format(test_row.test))
 
     # monitor wal lag if we test async logical replication
-    if not test_row.sync_replication:
+    if test_row.sync_replication == False:
         inventory = ec2_elect_shardlord()
         mon_node = "ubuntu@{}".format(inventory['ec2_workers'][0])
         print("mon_node is {}".format(mon_node))
@@ -193,7 +209,7 @@ def run(conf, test_row):
     print(run_output)
 
     # stop wal lag monitoring and pull the results
-    if not test_row.sync_replication:
+    if test_row.sync_replication == False:
         check_call('ssh {} pkill -f -SIGTERM monitor_wal_lag.sh'
                    .format(mon_node), shell=True)
         check_call('scp {}:wal_lag.txt .'.format(mon_node), shell=True)

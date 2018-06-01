@@ -83,10 +83,10 @@
     tags:
       - build_pg_fdw
 
-  - name: rm pg sources
-    file: path="{{ pg_src }}" state=absent
-    tags:
-      - rm_pg_src
+  # - name: rm pg sources
+    # file: path="{{ pg_src }}" state=absent
+    # tags:
+      # - rm_pg_src
 
   - name: clone pathman
     git: repo={{pathman_repo}}
@@ -234,6 +234,15 @@
     tags:
       - allow_ptrace
 
+  - name: set ulimit -c unlimited
+    pam_limits: domain={{ ansible_user }}
+      limit_type=soft
+      limit_item=core
+      value=unlimited
+    become: yes
+    tags:
+      - dump_core
+
   - name: dump cores in sane places
     shell: echo '/tmp/core.%e.%p.%t' | sudo tee /proc/sys/kernel/core_pattern
     become: yes
@@ -265,6 +274,15 @@
     lineinfile: dest=~/.bashrc insertbefore=BOF line="export PATH={{ fg_path }}:$PATH"
     tags:
       - perf
+
+  - name: raise max open files limit
+    pam_limits: domain={{ ansible_user }}
+      limit_type=soft
+      limit_item=nofile
+      value=64000
+    become: yes
+    tags:
+      - nofile
 
 - import_playbook: init.yml
   tags:

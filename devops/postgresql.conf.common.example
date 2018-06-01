@@ -34,6 +34,9 @@ synchronous_commit = on
 # synchronous_commit = local
 shardman.sync_replication = on
 
-max_prepared_transactions = 100000
-postgres_fdw.use_2pc = on
+max_prepared_transactions = 0
+postgres_fdw.use_2pc = off
+
 postgres_fdw.use_repeatable_read = off
+track_global_snapshots = off
+postgres_fdw.use_global_snapshots = off

@@ -9,5 +9,6 @@
       count: "{{ count }}"
       vpc_subnet_id: "{{ vpc_subnet_id }}"
       region: "{{ region }}"
+      zone: "{{ zone }}"
       wait: yes
       assign_public_ip: yes

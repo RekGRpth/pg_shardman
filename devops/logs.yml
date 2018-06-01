@@ -32,3 +32,4 @@
       dest={{ logs }}/shardlord.log
       force=yes
       state=link
+    run_once: true

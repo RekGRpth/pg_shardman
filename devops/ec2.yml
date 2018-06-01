@@ -11,6 +11,7 @@
     vpc_subnet_id: subnet-e0e2d99a
     image: ami-1e339e71 # ubuntu xenial backed by ebs
     region: eu-central-1
+    zone: eu-central-1b
     instance_type: c3.2xlarge
 
   tasks:
