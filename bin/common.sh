@@ -9,7 +9,9 @@ if [ -n "$logfile" ]; then
     logopts = "-l $logfile"
 fi
 
-export PATH="${pgpath}/bin/:$PATH"
+if [ -n "$pgpath" ]; then
+    export PATH="${pgpath}/bin/:$PATH"
+fi
 function start_nodes()
 {
     echo "Starting nodes"

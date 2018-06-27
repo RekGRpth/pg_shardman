@@ -1,6 +1,6 @@
 # the extension name
 EXTENSION = pg_shardman
-EXTVERSION = 0.0.2
+EXTVERSION = 0.0.3
 # This file will be executed by CREATE EXTENSION, so let pgxs install it.
 DATA = $(EXTENSION)--$(EXTVERSION).sql
 

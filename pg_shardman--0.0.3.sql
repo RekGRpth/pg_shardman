@@ -30,7 +30,7 @@ $$;
 CREATE TABLE nodes (
 	id serial PRIMARY KEY,
 	system_id bigint NOT NULL UNIQUE,
-    super_connection_string text UNIQUE NOT NULL,
+        super_connection_string text UNIQUE NOT NULL,
 	connection_string text UNIQUE NOT NULL,
 	-- group of nodes within which shard replicas are allocated
 	replication_group text NOT NULL
@@ -1888,14 +1888,15 @@ BEGIN
 	LOOP
 		xact_node_id := split_part(xact, '=>', 1);
 		gid := split_part(xact, '=>', 2);
+            	-- See gid format at comment to lock_graph
 		sysid := split_part(gid, ':', 3)::bigint;
-		xid := split_part(gid, ':', 4)::bigint; -- coordinator's xid
+		xid := split_part(gid, ':', 5)::bigint; -- coordinator's xid
 		SELECT id INTO coordinator FROM shardman.nodes WHERE system_id=sysid;
 		IF coordinator IS NULL
 		THEN
 			-- Coordinator node is not available
 			RAISE NOTICE 'Coordinator of transaction % is not available', gid;
-			n_participants := split_part(gid, ':', 5)::int;
+			n_participants := split_part(gid, ':', 6)::int;
 			IF n_participants > 1
 			THEN
 				-- Poll all participants.
@@ -2337,7 +2338,7 @@ $$ LANGUAGE plpgsql;
 
 -- Get relation primary key. There can be table with no primary key or with
 -- compound primary key. But logical replication and hash partitioning in any
--- case requires single primary key.
+-- case requires single primary key (well, actually neigher).
 CREATE FUNCTION get_primary_key(rel regclass, out pk_name text, out pk_type text) AS $$
 	SELECT a.attname::text, a.atttypid::regtype::text FROM pg_index i
 	JOIN   pg_attribute a ON a.attrelid = i.indrelid
@@ -2476,7 +2477,7 @@ create type process as (node int, pid int);
 
 -- View to build lock graph which can be used to detect global deadlock.
 -- Application_name is assumed pgfdw:$system_id:$coord_pid
--- gid is assumed $pid:$count:$sys_id:$xid:$participants_count
+-- gid is assumed pgfdw:$timestamp:$sys_id:$pid:$xid:$participants_count:$coord_count
 -- Currently we are oblivious about lock modes and report any wait -> hold edge
 -- on the same object and therefore might produce false loops. Furthermore,
 -- we have not idea about locking queues here. Probably it is better to use
@@ -2491,7 +2492,7 @@ CREATE VIEW lock_graph(wait, hold) AS
 		    ROW(shardman.get_my_id(), hold.pid)::shardman.process
 		ELSE -- prepared
 			ROW(shardman.get_node_by_sysid(split_part(gid, ':', 3)::bigint),
-				split_part(gid, ':', 1)::int)::shardman.process
+				split_part(gid, ':', 4)::int)::shardman.process
 		END
      FROM pg_locks wait, pg_locks hold LEFT OUTER JOIN pg_prepared_xacts twopc
 			  ON twopc.transaction=hold.transactionid
@@ -2617,6 +2618,7 @@ BEGIN
 
 	LOOP
 		resp := shardman.global_lock_graph();
+            	RAISE DEBUG 'Lock graph is %', resp;
 		error_begin := position('<error>' IN resp);
 		IF error_begin <> 0
 		THEN

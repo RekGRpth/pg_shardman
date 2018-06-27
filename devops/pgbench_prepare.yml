@@ -69,9 +69,9 @@
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
 
   tasks:
-    # requires patched pgbench
+    # requires patched pgbench to avoid truncate
   - name: initialize pgbench, scale {{ scale }}
     command: >
-      pgbench -p {{ pg_port }} -s {{ scale }} -i --no-ddl
+      pgbench -p {{ pg_port }} -s {{ scale }} -i --init-steps=gv
     tags:
       - pgbench_init

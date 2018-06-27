@@ -519,8 +519,9 @@ reconstruct_table_attrs(PG_FUNCTION_ARGS)
 		/* NAME TYPE[(typmod)] [NOT NULL] [COLLATE "collation"] */
 		appendStringInfo(&query, "%s %s%s%s",
 						 quote_identifier(NameStr(attr->attname)),
-						 format_type_with_typemod_qualified(attr->atttypid,
-															attr->atttypmod),
+						 format_type_extended(attr->atttypid, attr->atttypmod,
+											  FORMAT_TYPE_TYPEMOD_GIVEN |
+											  FORMAT_TYPE_FORCE_QUALIFY),
 						 (attr->attnotnull ? " NOT NULL" : ""),
 						 (attr->attcollation ?
 						  psprintf(" COLLATE \"%s\"",

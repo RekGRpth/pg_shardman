@@ -19,9 +19,8 @@ makejobs=4
 # pg_repo=git://git.postgresql.org/git/postgresql.git
 # pg_version_tag=REL_10_STABLE
 pg_repo=https://github.com/postgrespro/postgres_cluster.git
-pg_version_tag=pg_shardman
 # postgres_fdw 2pc and triggers on fdw tables
-# pg_version_tag=pg_shardman_tbr_2pc
+pg_version_tag=pg_shardman_11
 # pg_prefix="{{ansible_env.HOME}}/pg"
 pg_prefix="/tmp/pg"
 pg_src="{{pg_prefix}}/src"
@@ -42,9 +41,9 @@ pgbouncer_pool_mode = session
 pgbouncer_pool_size = 10
 use_pgbouncer = False
 
-pathman_repo=https://github.com/arssher/pg_pathman
+pathman_repo=https://github.com/postgrespro/pg_pathman
 pathman_src="{{pg_prefix}}/pg_pathman"
-pathman_version_tag=foreign_copy_from
+pathman_version_tag=master
 
 shardman_repo=https://github.com/postgrespro/pg_shardman.git
 shardman_src="{{pg_prefix}}/pg_shardman"

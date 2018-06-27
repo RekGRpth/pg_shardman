@@ -1,20 +1,20 @@
 # pg_shardman: PostgreSQL sharding built on pg_pathman, postgres_fdw and logical replication.
 
-`pg_shardman` is PG 10 extenstion which aims (but not yet fully reaches) for
-scalability and fault tolerance with decent transactions preserved, oriented on
-mainly OLTP workload. It allows to hash-shard tables using `pg_pathman` and move
-the shards across nodes, balancing read/write load. You can issue queries to any
-node, `postgres_fdw` is responsible for redirecting them to the proper one. To
-avoid data loss, we support replication of partitions via synchronous or
-asynchronous logical replication (LR), redundancy level is configurable. Manual
-failover is provided. While `pg_shardman` can be used with vanilla PostgreSQL
-10, some features require patched core. Most importantly, to support sane
-cross-node transactions, we use patched `postgres_fdw` with 2PC for atomicity
-and distributed snapshot manager providing `snapshot isolation` level of xact
+`pg_shardman` is a PG 11 experimental extenstion which explores applicability
+of Postgres partitioning, postgres_fdw and logical replication for sharding.  It
+allows to hash-shard tables using pg_pathman and move the shards
+across nodes, balancing read/write load. You can issue queries to any node,
+`postgres_fdw` is responsible for redirecting them to the proper one. To avoid
+data loss, we support replication of partitions via synchronous or asynchronous
+logical replication (LR), redundancy level is configurable. Manual failover is
+provided. While `pg_shardman` can be used with vanilla PostgreSQL 11, some
+features require patched core. Most importantly, to support sane cross-node
+transactions, we use patched `postgres_fdw` with 2PC for atomicity and
+distributed snapshot manager providing `snapshot isolation` level of xact
 isolation. We support current
 version
-[here](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman), which
-we call 'patched Postgres' in this document.
+[here](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman_11),
+which we call 'patched Postgres' in this document.
 
 ## Architecture
 
@@ -145,9 +145,9 @@ coordinator (node where transaction started) has committed it on some nodes and
 then something went wrong (e.g. it failed), the transaction will be aborted on
 the rest of nodes. Because of
 that
-[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman) implements
-two-phase commit (2PC) in `postgres_fdw`, which is turned on when
-`postgres_fdw.use_twophase` GUC is set to `true`. With 2PC, the transaction is
+[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman_11) implements
+two-phase commit (2PC) in `postgres_fdw`, which is always turned on when global
+snapshots are used (see below). With 2PC, the transaction is
 firstly *prepared* on each node, and only then committed. Successfull *prepare*
 on the node means that this node has promised to commit the transaction, and it
 is also possible to abort the transaction in this state, which allows to get
@@ -170,7 +170,8 @@ rules are applicable. However, for distributed transactions we need distributed
 visibility, implemented in patched Postgres. GUCs `track_global_snapshots` and
 `postgres_fdw.use_global_snapshots` turn on distributed transaction manager for
 `postgres_fdw` based on Clock-SI algorithm. It provides cluster-wide snapshot
-isolation (called `REPEATABLE READ` in Postgres) transaction isolation level.
+isolation (almost what is called `REPEATABLE READ` in Postgres) transaction
+isolation level.
 
 Yet another problem is distributed deadlocks. They can be detected and resolved
 using `monitor` function, see below.
@@ -188,10 +189,10 @@ ec2 which might be helpful too.
 Both shardlord and workers require extension built and installed. We depend on
 `pg_pathman` extension so it must be installed too. PostgreSQL location for
 building is derived from `pg_config` by default, you can also specify path to it
-in `PG_CONFIG` environment variable. PostgreSQL 10 (`REL_10_STABLE branch`) is
-required. Extension links with `libpq`, and if you install PG from packages, you
-should install `libpq-dev` package or something like that. The whole process of
-building and copying files to PG server is just:
+in `PG_CONFIG` environment variable. PostgreSQL 11 is required. Extension links
+with `libpq`, and if you install PG from packages, you should install
+`libpq-dev` package or something like that. The whole process of building and
+copying files to PG server is just:
 
 ```shell
 git clone https://github.com/postgrespro/pg_shardman
@@ -278,7 +279,7 @@ mechanism: all partitions are derived from parent table. If a partition is
 located at some other node, it will be accessed using foreign data wrapper
 `postgres_fdw`. Unfortunately inheritance and FDW in Postgres have some
 limitations which doesn't allow to build efficient execution plans for some
-queries. Though Postgres 10 is capable of pushing aggregates to FDW, it can't
+queries. Though Postgres 11 is capable of pushing aggregates to FDW, it can't
 merge partial aggregate values from different nodes. Also it can't execute query
 on all nodes in parallel: foreign data wrappers do not support parallel scan
 because of using cursors. Execution of OLAP queries at `pg_shardman` might not
@@ -294,9 +295,9 @@ reads/writes.
 ### Importing data
 
 The most efficient way to import data is to use `COPY` command. Vanilla
-PostgreSQL doesn't support `COPY FROM` to foreign tables yet, and we have
+PostgreSQL 11 `COPY FROM` to foreign tables is kinda slow, so we have
 implemented this feature in
-[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman).
+[patched Postgres](https://github.com/postgrespro/postgres_cluster/tree/pg_shardman_11).
 Binary format is not supported there. Data can be loaded parallel from several
 nodes.
 
@@ -691,7 +692,7 @@ Data is not touched by this command.
 ## Some limitations:
   * You should not touch `synchronous_standby_names` manually while using pg_shardman.
   * The shardlord itself can't be worker node for now.
-  * All [limitations](https://github.com/postgrespro/pg_pathman/wiki/Known-limitations)  (and some features) of `pg_pathman`,
+  * All [limitations](https://www.postgresql.org/docs/devel/static/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE)  (and some features) of Postgres partitioning
 	e.g. we don't support global secondary indexes and foreign keys to sharded tables.
-  * All [limitations of logical replications](https://www.postgresql.org/docs/10/static/logical-replication-restrictions.html).
+  * All [limitations of logical replications](https://www.postgresql.org/docs/devel/static/logical-replication-restrictions.html).
     `TRUNCATE` statements on sharded tables will not be replicated.

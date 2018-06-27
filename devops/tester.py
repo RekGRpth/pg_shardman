@@ -40,7 +40,7 @@ class TestRow:
         self.nodes = None
 
         self.sync_replication = None
-        self.fdw_2pc = None
+        self.global_snapshots_and_2pc = None
         self.nparts_per_node = None
         self.redundancy = None
         self.scale = None
@@ -61,7 +61,7 @@ class TestRow:
 
 def res_header():
     return ["instance_type", "nodes", "sync_replication",
-            "sync_commit", "fdw_2pc", "nparts", "nodes_in_repgroup",
+            "sync_commit", "global_snapshots_and_2pc", "nparts", "nodes_in_repgroup",
             "redundancy", "scale", "use_pgbouncer", "pgbouncer_pool_mode",
             "pgbouncer_pool_size",
             "duration", "test", "active_nodes", "clients", "tps_sum",
@@ -73,7 +73,7 @@ def form_csv_row(test_row):
         sync_commit = 'local'
 
     return [test_row.instance_type, test_row.nodes, test_row.sync_replication,
-            sync_commit, test_row.fdw_2pc, test_row.nparts,
+            sync_commit, test_row.global_snapshots_and_2pc, test_row.nparts,
             test_row.nodes_in_repgroup, test_row.redundancy, test_row.scale,
             test_row.use_pgbouncer, test_row.pgbouncer_pool_mode,
             test_row.pgbouncer_pool_size,
@@ -125,7 +125,7 @@ def test_nodes(conf, test_row):
             ansible-playbook -i inventory_ec2/ provision.yml --tags "ars" && \
             ansible-playbook -i inventory_ec2/ provision.yml
             ''', shell=True)
-    for test_row.sync_replication, test_row.fdw_2pc, test_row.nparts_per_node, test_row.redundancy, test_row.scale, test_row.use_pgbouncer in product(conf['sync_replication'], conf['fdw_2pc'], conf['nparts_per_node'], conf['redundancy'], conf['scale'], conf['use_pgbouncer']):
+    for test_row.sync_replication, test_row.global_snapshots_and_2pc, test_row.nparts_per_node, test_row.redundancy, test_row.scale, test_row.use_pgbouncer in product(conf['sync_replication'], conf['global_snapshots_and_2pc'], conf['nparts_per_node'], conf['redundancy'], conf['scale'], conf['use_pgbouncer']):
         test_row_dup = copy.copy(test_row)
         test_pgbench(conf, test_row_dup)
 
@@ -135,9 +135,12 @@ def test_pgbench(conf, test_row):
         with open("postgresql.conf.common", "a") as pgconf:
             pgconf.write(async_config)
 
-    if not test_row.fdw_2pc:
+    if not test_row.global_snapshots_and_2pc:
         with open("postgresql.conf.common", "a") as pgconf:
-            pgconf.write('postgres_fdw.use_twophase = off\n')
+            pgconf.write('track_global_snapshots = false\n'
+                         'global_snapshot_defer_time = 0\n'
+                         'postgres_fdw.use_global_snapshots = false\n'
+                         'postgres_fdw.use_repeatable_read = off\n')
 
     test_row.nparts = test_row.nodes * test_row.nparts_per_node
     if test_row.redundancy == 0:
