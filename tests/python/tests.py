@@ -10,9 +10,10 @@
 import unittest
 import os
 import threading
+import time
 
 import testgres
-from testgres import PostgresNode, TestgresConfig, NodeStatus
+from testgres import PostgresNode, TestgresConfig, NodeStatus, IsolationLevel
 from testgres import ProgrammingError
 
 
@@ -596,10 +597,11 @@ class ShardmanTests(unittest.TestCase):
 
             lord.safe_psql(
                 "select shardman.recover()")  # let it know about mv
-
-            for worker in [src, dst, watcher]:
+            # everything is visible now from anyone, including keys on failed node
+            luke_sum = int(src.execute(sum_query("pt"))[0][0])
+            for worker in [dst, watcher]:
                 worker_sum = int(worker.execute(sum_query("pt"))[0][0])
-            self.assertEqual(luke_sum, worker_sum)
+                self.assertEqual(luke_sum, worker_sum)
 
     # Just rm_node failed worker with all other nodes online and make sure
     # data is not lost
@@ -667,8 +669,11 @@ class ShardmanTests(unittest.TestCase):
     # 2PC sanity check
     def test_twophase_sanity(self):
         with Shardlord() as lord:
+            # Now 2PC is only enabled with global snaps
             additional_worker_conf = (
-                "postgres_fdw.use_twophase = on\n"
+                "track_global_snapshots = true\n"
+                "postgres_fdw.use_global_snapshots = true\n"
+                "global_snapshot_defer_time = 30\n"
             )
             apple, _ = lord.add_node(additional_conf=additional_worker_conf)
             mango, _ = lord.add_node(additional_conf=additional_worker_conf)
@@ -813,9 +818,9 @@ class ShardmanTests(unittest.TestCase):
     # snapshot, read skew will arise.
     def test_global_snapshot(self):
         additional_worker_conf = (
-            "track_global_snapshots = on\n"
-            "postgres_fdw.use_global_snapshots = on\n"
-            "postgres_fdw.use_twophase = on\n"
+            "track_global_snapshots = true\n"
+            "postgres_fdw.use_global_snapshots = true\n"
+            "global_snapshot_defer_time = 30\n"
             "default_transaction_isolation = 'repeatable read'\n"
             "log_min_messages = DEBUG3\n"
             "shared_preload_libraries = 'pg_shardman, pg_pathman, postgres_fdw'\n"
@@ -837,11 +842,11 @@ class ShardmanTests(unittest.TestCase):
 
             with apple.connect() as balance_con, mango.connect() as transfer_con:
                 # xact 1 started
-                balance_con.begin()
+                balance_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 apple_balance = int(balance_con.execute("select payload from pt where id = {}"
                                                         .format(apple_key))[0][0])
                 # and only then xact 2 started, so xact 1 must not see xact 2 effects
-                transfer_con.begin()
+                transfer_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 transfer_con.execute("update pt set payload = 42 where id = {}".format(mango_key))
                 # Though we already read apple_key, we must do that.
                 transfer_con.execute("update pt set payload = -42 where id = {}".format(apple_key))
@@ -855,9 +860,9 @@ class ShardmanTests(unittest.TestCase):
     # Same simple bank transfer, but connect from third-party observer
     def test_global_snapshot_external(self):
         additional_worker_conf = (
-            "track_global_snapshots = on\n"
-            "postgres_fdw.use_global_snapshots = on\n"
-            "postgres_fdw.use_twophase = on\n"
+            "track_global_snapshots = true\n"
+            "postgres_fdw.use_global_snapshots = true\n"
+            "global_snapshot_defer_time = 30\n"
             "default_transaction_isolation = 'repeatable read'\n"
             "log_min_messages = DEBUG3\n"
             "shared_preload_libraries = 'pg_shardman, pg_pathman, postgres_fdw'\n"
@@ -882,11 +887,11 @@ class ShardmanTests(unittest.TestCase):
 
             with watermelon.connect() as balance_con, watermelon.connect() as transfer_con:
                 # xact 1 started
-                balance_con.begin()
+                balance_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 apple_balance = int(balance_con.execute("select payload from pt where id = {};"
                                                         .format(apple_key))[0][0])
                 # and only then xact 2 started, so xact 1 must not see xact 2 effects
-                transfer_con.begin()
+                transfer_con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 transfer_con.execute("update pt set payload = 42 where id = {};".format(mango_key))
                 # Though we already read apple_key, we must do that.
                 transfer_con.execute("update pt set payload = -42 where id = {};".format(apple_key))
