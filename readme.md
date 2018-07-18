@@ -168,7 +168,7 @@ nodes until the coordinator either returns or is excluded from the cluster.
 Similarly, if transactions affect only single nodes, plain PostgreSQL isolation
 rules are applicable. However, for distributed transactions we need distributed
 visibility, implemented in patched Postgres. GUCs `track_global_snapshots` and
-`postgres_fdw.use_tsdtm` turn on distributed transaction manager for
+`postgres_fdw.use_global_snapshots` turn on distributed transaction manager for
 `postgres_fdw` based on Clock-SI algorithm. It provides cluster-wide snapshot
 isolation (almost what is called `REPEATABLE READ` in Postgres) transaction
 isolation level.

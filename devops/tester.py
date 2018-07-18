@@ -123,7 +123,7 @@ def test_pgbench(conf, test_row):
         with open("postgresql.conf.common", "a") as pgconf:
             pgconf.write('track_global_snapshots = false\n'
                          'global_snapshot_defer_time = 0\n'
-                         'postgres_fdw.use_tsdtm = false\n'
+                         'postgres_fdw.use_global_snapshots = false\n'
                          'postgres_fdw.use_repeatable_read = off\n')
 
     test_row.nparts = test_row.nodes * test_row.nparts_per_node

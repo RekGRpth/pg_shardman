@@ -25,7 +25,7 @@ max_prepared_transactions = 1000
 # global snapshots
 track_global_snapshots = on
 global_snapshot_defer_time = 30
-postgres_fdw.use_tsdtm = on
+postgres_fdw.use_global_snapshots = on
 
 # only for testing performance; setting this to 'off' violates visibility
 postgres_fdw.use_repeatable_read = off

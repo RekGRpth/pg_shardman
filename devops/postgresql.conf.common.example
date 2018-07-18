@@ -39,5 +39,5 @@ max_prepared_transactions = 100000
 # global snapshots
 track_global_snapshots = on
 global_snapshot_defer_time = 30
-postgres_fdw.use_tsdtm = on
+postgres_fdw.use_global_snapshots = on
 postgres_fdw.use_repeatable_read = on

@@ -669,7 +669,7 @@ class ShardmanTests(unittest.TestCase):
             # Now 2PC is only enabled with global snaps
             additional_worker_conf = (
                 "track_global_snapshots = true\n"
-                "postgres_fdw.use_tsdtm = true\n"
+                "postgres_fdw.use_global_snapshots = true\n"
                 "global_snapshot_defer_time = 30\n"
             )
             apple, _ = lord.add_node(additional_conf=additional_worker_conf)
@@ -815,7 +815,7 @@ class ShardmanTests(unittest.TestCase):
     def test_global_snapshot(self):
         additional_worker_conf = (
             "track_global_snapshots = true\n"
-            "postgres_fdw.use_tsdtm = true\n"
+            "postgres_fdw.use_global_snapshots = true\n"
             "global_snapshot_defer_time = 30\n"
             "default_transaction_isolation = 'repeatable read'\n"
             "log_min_messages = DEBUG3\n"
@@ -857,7 +857,7 @@ class ShardmanTests(unittest.TestCase):
     def test_global_snapshot_external(self):
         additional_worker_conf = (
             "track_global_snapshots = true\n"
-            "postgres_fdw.use_tsdtm = true\n"
+            "postgres_fdw.use_global_snapshots = true\n"
             "global_snapshot_defer_time = 30\n"
             "default_transaction_isolation = 'repeatable read'\n"
             "log_min_messages = DEBUG3\n"
