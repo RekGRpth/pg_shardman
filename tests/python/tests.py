@@ -671,6 +671,7 @@ class ShardmanTests(unittest.TestCase):
         with Shardlord() as lord:
             # Now 2PC is only enabled with global snaps
             additional_worker_conf = (
+                "default_transaction_isolation = 'repeatable read'\n"
                 "track_global_snapshots = true\n"
                 "postgres_fdw.use_global_snapshots = true\n"
                 "global_snapshot_defer_time = 30\n"
@@ -692,7 +693,7 @@ class ShardmanTests(unittest.TestCase):
 
             with apple.connect() as con:
                 # xact 1 started
-                con.begin()
+                con.begin(isolation_level=IsolationLevel.RepeatableRead)
                 con.execute("update pt set payload = 42 where id = {};"
                             .format(apple_key))
                 con.execute("update pt set payload = -20 where id = {};"
