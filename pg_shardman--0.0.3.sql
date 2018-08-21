@@ -1865,6 +1865,7 @@ DECLARE
 	do_commit bool;
 	do_rollback bool;
 	finish text = '';
+        xact_sender text = '';
 BEGIN
 	IF shardman.redirect_to_shardlord('recover_xacts()')
 	THEN
@@ -1890,8 +1891,18 @@ BEGIN
 		gid := split_part(xact, '=>', 2);
             	-- See gid format at comment to lock_graph
 		sysid := split_part(gid, ':', 3)::bigint;
-		xid := split_part(gid, ':', 5)::bigint; -- coordinator's xid
-		SELECT id INTO coordinator FROM shardman.nodes WHERE system_id=sysid;
+	        xid := split_part(gid, ':', 5)::bigint; -- coordinator's xid
+
+                -- node from which xact came, if it is replica
+                xact_sender = split_part(gid, ':', 8);
+                -- if this xact is replica and node is still in the cluster,
+                -- publisher must decide what to do with xact and finish it.
+                IF split_part(gid, ':', 8) != '' AND
+                    EXISTS (SELECT 1 FROM shardman.nodes WHERE system_id = xact_sender::bigint)
+                THEN
+                    CONTINUE;
+                END IF;
+	        SELECT id INTO coordinator FROM shardman.nodes WHERE system_id=sysid;
 		IF coordinator IS NULL
 		THEN
 			-- Coordinator node is not available
@@ -2478,6 +2489,7 @@ create type process as (node int, pid int);
 -- View to build lock graph which can be used to detect global deadlock.
 -- Application_name is assumed pgfdw:$system_id:$coord_pid
 -- gid is assumed pgfdw:$timestamp:$sys_id:$pid:$xid:$participants_count:$coord_count
+-- on replicas, :$sender_sysid is added to prevent collisions.
 -- Currently we are oblivious about lock modes and report any wait -> hold edge
 -- on the same object and therefore might produce false loops. Furthermore,
 -- we have not idea about locking queues here. Probably it is better to use
