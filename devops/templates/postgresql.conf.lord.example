@@ -1,0 +1,4 @@
+# This node is shardlord?
+shardman.shardlord = on
+# While adding nodes, add them to synchronous_standby_names?
+shardman.sync_replication = on

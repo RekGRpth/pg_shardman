@@ -1,0 +1,3 @@
+/postgresql.conf.common
+/postgresql.conf.lord
+/postgresql.conf.worker

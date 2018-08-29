@@ -4,7 +4,10 @@
 ---
 - hosts: nodes
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
 
   tasks:
   - name: pkill pg
@@ -45,7 +48,10 @@
 
 - hosts: nodes
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
 
   tasks:
   - name: create extension pg_shardman
@@ -73,7 +79,10 @@
     nodes_in_repgroup: 1
 
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
 
   tasks:
   # repgroup requires accuracy: we need to be sure that no replication group has
@@ -94,11 +103,16 @@
     tags:
       - add_nodes
 
+  - debug: msg="Putting node number {{item.0}} ( {{ item.1 }} ) to rg {{ [item.0 // (nodes_in_repgroup | int), ((groups.manual_workers | length) // (nodes_in_repgroup | int)) - 1] | min }}"
+    with_indexed_items: "{{ groups.manual_workers }}"
+    tags:
+      - dbg
+
   - name: add manual workers, nodes_in_repgroup is {{ nodes_in_repgroup }}
     command: >
       psql -p {{ pg_port }} -c "select shardman.add_node(
-      'hostaddr={{ item.1 }} port={{ pg_port }}',
-      'hostaddr={{ item.1 }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}',
+      'host={{ item.1 }} port={{ pg_port }}',
+      'host={{ item.1 }} port={{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }}',
       'group_{{ [item.0 // (nodes_in_repgroup | int), ((groups.manual_workers | length) // (nodes_in_repgroup | int)) - 1] | min }}')"
     with_indexed_items: "{{ groups.manual_workers }}"
     tags:

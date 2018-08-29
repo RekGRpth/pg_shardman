@@ -6,15 +6,23 @@
     ars_conf: "{{ ansible_env.HOME }}/ars_conf"
 
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
     CFLAGS: "{{ cflags }}"
     CONFPATH: "{{ ars_conf }}"
 
   tasks:
+  # to run something iff tags were specified
+  - shell: /bin/true
+    register: tags_not_specified
+
   - name: set Moscow timezone
     timezone:
       name: Europe/Moscow
     become: yes
+    when: ec2
     tags:
       - tz
 
@@ -23,16 +31,19 @@
       name=/tmp src='tmpfs' fstype=tmpfs
       opts='size={{ (ansible_memtotal_mb * 0.5) | int }}m' state=mounted
     become: yes
+    when: ec2
     tags:
       - tmpfs
 
   - name: chown {{ ansible_user }} /mnt
     shell: sudo chown -R {{ ansible_user }} /mnt/
+    when: ec2
     become: yes
 
   - name: update apt cache (Debian)
     apt: update_cache=yes
     become: yes
+    when: ec2
     tags:
       - apt_cache
 
@@ -54,8 +65,25 @@
     - zlib1g-dev
     - gdb
     - libevent-dev # for pgbouncer
-    when: ansible_os_family == "Debian"
+    when: ansible_os_family == "Debian" and ec2
     become: yes
+    tags:
+      - ensure_deps
+      - build_pg
+
+  - name: copy script to ensure dependencies (build them from source)
+    copy:
+      src: install_deps.sh
+      dest: "{{ ansible_env.HOME }}/install_deps.sh"
+      mode: 0755
+    when: manual_deps
+    tags:
+      - ensure_deps
+      - build_pg
+
+  - name: ensure dependencies (build them from source)
+    command: "{{ ansible_env.HOME }}/install_deps.sh"
+    when: manual_deps
     tags:
       - ensure_deps
       - build_pg
@@ -141,6 +169,7 @@
       src: https://pgbouncer.github.io/downloads/files/1.7.2/pgbouncer-1.7.2.tar.gz
       dest: "{{ pg_prefix }}"
       remote_src: yes
+    when: tags_not_specified is not defined
     tags:
       - pgbouncer
 
@@ -148,12 +177,9 @@
     shell: ./configure --prefix={{pgbouncer_dst}} --without-openssl && make clean && make -j {{makejobs}} && make install
     args:
       chdir: "{{ pgbouncer_src }}"
+    when: tags_not_specified is not defined
     tags:
       - pgbouncer
-
-  # to run something iff tags were specified
-  - shell: /bin/true
-    register: tags_not_specified
 
   - name: send built pg to nodes for debugging
     synchronize:
@@ -197,16 +223,18 @@
       state=present
       update_cache=yes
     become: yes
-    when: tags_not_specified is not defined and ansible_os_family == "Debian"
+    when: tags_not_specified is not defined and ansible_os_family == "Debian" and ec2
     tags: ars
 
+# note: for compiling minimal emacs from sources, you need something like
+# ./configure --without-x --with-gnutls=no --without-pop
   - name: install emacs & other stuff for Arseny
     apt: name={{item}} state=installed
     with_items:
      - x11-xkb-utils
      - emacs25
     become: yes
-    when: tags_not_specified is not defined and ansible_os_family == "Debian"
+    when: tags_not_specified is not defined and ansible_os_family == "Debian" and ec2
     tags: ars
 
   - name: setup Arseny's conf
@@ -217,7 +245,7 @@
 
   - name: Install packages for Arseny's emacs
     command: emacs emacs -batch --eval '(message "Hi!")' -u {{ ansible_user}}
-    when: tags_not_specified is not defined
+    when: tags_not_specified is not defined and ec2
     tags: ars
 
   - name: set PATH to pg binaries in .bashrc.
@@ -234,18 +262,28 @@
       - set_path
       - ars
 
+  - name: copy .bashrc to .profile
+    copy:
+      src: "{{ ansible_env.HOME }}/.bashrc"
+      dest: "{{ ansible_env.HOME }}/.profile"
+      remote_src: true
+    when: tags_not_specified is not defined and cmc
+    tags: ars
+
   - name: allow ptrace for non-root users
     lineinfile: dest=/etc/sysctl.d/10-ptrace.conf
       regexp='^kernel.yama.ptrace_scope'
       line='kernel.yama.ptrace_scope = 0'
       state=present
     become: yes
+    when: ec2
     tags:
       - allow_ptrace
 
   - name: allow ptrace for non-root users
     shell: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
     become: yes
+    when: ec2
     tags:
       - allow_ptrace
 
@@ -255,18 +293,20 @@
       limit_item=core
       value=unlimited
     become: yes
+    when: ec2
     tags:
       - dump_core
 
   - name: dump cores in sane places
     shell: echo '/tmp/core.%e.%p.%t' | sudo tee /proc/sys/kernel/core_pattern
     become: yes
+    when: ec2
     tags:
       - dump_core
 
   - name: install perf for xenial
     apt: name=linux-tools-4.4.0-1022-aws state=installed
-    when: ansible_os_family == "Debian"
+    when: ansible_os_family == "Debian" and ec2
     become: yes
     tags:
       - perf
@@ -274,6 +314,7 @@
   - name: allow perfing
     shell: echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
     become: yes
+    when: ec2
     tags: perf
 
   - name: download flamegraph
@@ -296,6 +337,7 @@
       limit_item=nofile
       value=64000
     become: yes
+    when: ec2
     tags:
       - nofile
 

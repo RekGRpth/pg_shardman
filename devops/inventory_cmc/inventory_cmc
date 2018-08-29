@@ -1,0 +1,21 @@
+# cmc setup, kind of 'manual'
+
+[nodes:vars]
+cmc=True
+ansible_user=pgpro
+manual_deps=True
+pg_prefix="{{ ansible_env.HOME }}/pg"
+
+[manual]
+[manual:children]
+manual_shardlord
+manual_workers
+
+[manual_shardlord]
+vm-704-1.prac.cs.msu.ru
+
+[manual_workers]
+vm-704-[2:8].prac.cs.msu.ru
+
+[manual_init_node]
+vm-704-2.prac.cs.msu.ru

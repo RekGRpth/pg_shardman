@@ -9,20 +9,6 @@
 ---
 - hosts: shardlord
   tasks:
-  # jinja2 won't work with outside files, so first copy them to templates/ dir,
-  # oh my... see https://github.com/ansible/ansible/issues/7106
-  # I used to create a bunch of (possibly dangled) symlinks, but pgfarm doesn't
-  # like that.
-  - name: cp configs into template dir
-    local_action: >
-      shell cp ../postgresql.conf.common templates/postgresql.conf.common 2>/dev/null || : ;
-      cp ../postgresql.conf.lord templates/postgresql.conf.lord 2>/dev/null || : ;
-      cp ../postgresql.conf.worker templates/postgresql.conf.worker 2>/dev/null || : ;
-
-      cp postgresql.conf.common templates/postgresql.conf.devops.common 2>/dev/null || : ;
-      cp postgresql.conf.lord templates/postgresql.conf.devops.lord 2>/dev/null || : ;
-      cp postgresql.conf.worker templates/postgresql.conf.devops.worker 2>/dev/null || : ;
-    run_once: true
 
   - name: copy postgresql.conf to shardlord
     template:

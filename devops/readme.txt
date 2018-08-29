@@ -92,6 +92,8 @@ If you don't want to measure the disk performance, keep data dir on tmpfs or
 turn of fsync, the effect it similar.
 
 Things that made me wonder during writing this:
+* Setting env vars at every play is outrageous. It must be done at inventory
+  level.
 * Reusability of tasks. Playbooks, files with tasks, roles, includes, imports,
   old include API...probably working directly from Python would be easier? There
   seems to be no way to run only one play from playbook, and the only way to run
@@ -99,6 +101,8 @@ Things that made me wonder during writing this:
   why projects like
   https://github.com/larsks/ansible-toolbox
   emerge. Printing cmd output via saved var is pretty horrible too.
+* I don't find much use of roles given that you can't order them with tasks in
+  play...
 * They also try to reinvent all the concepts of normal languages in YML. How
   about infinite repeat..until?
 * No way to specify multiple inventory files, only whole directory or one file.

@@ -4,7 +4,10 @@
 
 - hosts: workers[0]
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
   vars:
     scale: 10
     clients: 1

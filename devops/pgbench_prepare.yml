@@ -9,7 +9,10 @@
 
 - hosts: workers
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
 
   tasks:
   - name: recreate pgbench_history on workers, drop other pgbench tables
@@ -37,7 +40,10 @@
     nparts: 10
     redundancy: 0
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
 
   tasks:
   - name: copy pgbench_ddl.sql
@@ -49,7 +55,7 @@
     command: >
       psql -p {{ pg_port }} -f pgbench_ddl.sql
 
-  - name: create_hash_partitions for pgbench_accounts, nparts {{ nparts }}, redundancy {{ redundancy }}
+  - name: create_hash_partitions for pgbench_accounts, tellers, branches, nparts {{ nparts }}, redundancy {{ redundancy }}
     command: >
       psql -p {{ pg_port }} -c "
       select shardman.create_hash_partitions('pgbench_accounts', 'aid', {{ nparts }}, {{ redundancy }});
@@ -66,7 +72,10 @@
     redundancy: 0
     rebalance: true
   environment:
-    PATH: "{{ pg_dst }}/bin:{{ ansible_env.PATH }}"
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
 
   tasks:
     # requires patched pgbench to avoid truncate

@@ -1,12 +1,9 @@
 {# jinja2 won't work with outside file, so I've created a bunch of symlinks #}
 {# pointing to them, oh my... #}
 {# see https://github.com/ansible/ansible/issues/7106 #}
+{# It turns out our buildfarm doesn't like symlinks at all, so just specify configs in this dir manually  #}
 {% include "postgresql.conf.common" ignore missing %}
 
 {% include "postgresql.conf.lord" ignore missing %}
 
 shardman.shardlord_connstring = '{{ shardman_shardlord_connstring }}'
-
-{% include "postgresql.conf.devops.common" ignore missing %}
-
-{% include "postgresql.conf.devops.lord" ignore missing %}

@@ -13,6 +13,12 @@ localhost ansible_connection=local ansible_python_interpreter=python
 ansible_user=ubuntu
 # on fresh ubuntus, there is no 'python' executable
 ansible_python_interpreter=python3
+# We are not necessarily on ec2
+ec2=False
+# install deps manually
+manual_deps=False
+# cmc stuff
+cmc=False
 
 # make -j
 makejobs=4
@@ -41,9 +47,11 @@ pgbouncer_pool_mode = session
 pgbouncer_pool_size = 10
 use_pgbouncer = False
 
-pathman_repo=https://github.com/postgrespro/pg_pathman
+# pathman_repo=https://github.com/postgrespro/pg_pathman
+pathman_repo=https://github.com/arssher/pg_pathman.git
 pathman_src="{{pg_prefix}}/pg_pathman"
-pathman_version_tag=master
+# pathman_version_tag=master
+pathman_version_tag=postgres_11
 
 shardman_repo=https://github.com/postgrespro/pg_shardman.git
 shardman_src="{{pg_prefix}}/pg_shardman"
@@ -85,6 +93,8 @@ manual_init_node
 [ec2:vars]
 # for ec2, take private ip
 shardlord_ip="{{ hostvars[groups['shardlord'][0]]['ec2_private_ip_address'] }}"
+ansible_ssh_private_key_file=~/.ssh/aws_rsa
+ec2=True
 [ec2_shardlord]
 [ec2_workers]
 [ec2_init_node]
@@ -95,7 +105,3 @@ shardlord_ip="{{ groups['shardlord'][0] }}"
 [manual_shardlord]
 [manual_workers]
 [manual_init_node]
-
-[ec2:vars]
-# Your aws key
-ansible_ssh_private_key_file=~/.ssh/aws_rsa

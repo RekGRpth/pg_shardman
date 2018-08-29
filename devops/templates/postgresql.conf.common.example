@@ -1,3 +1,5 @@
+shared_preload_libraries = 'pg_shardman, pg_pathman'
+
 TimeZone = 'Europe/Moscow'
 log_timezone = 'Europe/Moscow'
 
@@ -34,10 +36,8 @@ synchronous_commit = on
 # synchronous_commit = local
 shardman.sync_replication = on
 
-max_prepared_transactions = 100000
+max_prepared_transactions = 0
 
-# global snapshots
-track_global_snapshots = on
-global_snapshot_defer_time = 30
-postgres_fdw.use_global_snapshots = on
-postgres_fdw.use_repeatable_read = on
+postgres_fdw.use_repeatable_read = off
+track_global_snapshots = off
+postgres_fdw.use_global_snapshots = off

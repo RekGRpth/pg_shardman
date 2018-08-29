@@ -18,9 +18,10 @@ function start_nodes()
     for ((i=0; i<${#worker_datadirs[@]}; ++i)); do
 	datadir="${worker_datadirs[i]}"
 	port="${worker_ports[i]}"
-	pg_ctl -o "-p $port" -D $datadir $logopts start
+	echo "starting $datadir on $port"
+	pg_ctl -o "-p $port" -l "/tmp/postgresql_$port.log" -D $datadir start
     done
-    pg_ctl -o "-p $lord_port" -D $lord_datadir $logopts start
+    pg_ctl -o "-p $lord_port" -l "/tmp/postgresql_${lord_port}.log" -D $lord_datadir start
 }
 
 function stop_nodes()
