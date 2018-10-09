@@ -226,8 +226,8 @@ BEGIN
 		create_tables := format('%s{%s:%s}',
 			create_tables, new_node_id, t.create_sql);
 		create_partitions := format('%s%s:SELECT create_hash_partitions(%L,%L,%L);',
-			create_partitions, new_node_id, t.relation, t.sharding_key, t.partitions_count);
-		SELECT shardman.reconstruct_table_attrs(t.relation) INTO table_attrs;
+			create_partitions, new_node_id, quote_ident(t.relation), t.sharding_key, t.partitions_count);
+		SELECT shardman.reconstruct_table_attrs(quote_ident(t.relation)) INTO table_attrs;
 		FOR part IN SELECT * FROM shardman.partitions WHERE relation=t.relation
 	    LOOP
 			create_fdws := format(
@@ -242,7 +242,7 @@ BEGIN
 		SELECT connection_string INTO conn_string from shardman.nodes WHERE id=t.master_node;
 		create_tables := format('%s{%s:%s}',
 			create_tables, new_node_id, t.create_sql);
-		SELECT shardman.reconstruct_table_attrs(t.relation) INTO table_attrs;
+		SELECT shardman.reconstruct_table_attrs(quote_ident(t.relation)) INTO table_attrs;
 		srv_name := format('node_%s', t.master_node);
 		fdw_part_name := format('%s_fdw', t.relation);
 		create_fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
@@ -284,12 +284,12 @@ DECLARE
 	srv_name name :=  format('node_%s', target_srv);
 	fdw_part_name name := format('%s_fdw', part_name);
 BEGIN
-	RAISE DEBUG '[SHMN] replace table % with foreign %', part_name, fdw_part_name;
+    	RAISE DEBUG '[SHMN] replace table % with foreign %', part_name, fdw_part_name;
 	EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
 				   fdw_part_name, table_attrs, srv_name, part_name);
-	PERFORM replace_hash_partition(part_name::regclass, fdw_part_name::regclass);
+	PERFORM replace_hash_partition(quote_ident(part_name)::regclass, quote_ident(fdw_part_name)::regclass);
 	EXECUTE format('TRUNCATE TABLE %I', part_name);
-	PERFORM shardman.write_protection_on(part_name::regclass);
+	PERFORM shardman.write_protection_on(quote_ident(part_name)::regclass);
 END
 $$ LANGUAGE plpgsql;
 
@@ -299,7 +299,7 @@ DECLARE
 	fdw_part_name name := format('%s_fdw', part_name);
 BEGIN
 	RAISE DEBUG '[SHMN] replace foreign table % with %', fdw_part_name, part_name;
-	PERFORM replace_hash_partition(fdw_part_name::regclass, part_name::regclass);
+	PERFORM replace_hash_partition(quote_ident(fdw_part_name)::regclass, quote_ident(part_name)::regclass);
 	PERFORM shardman.write_protection_off(part_name::regclass);
 	EXECUTE format('DROP FOREIGN TABLE %I', fdw_part_name);
 END
@@ -496,7 +496,7 @@ BEGIN
 			IF node.id=new_master_id THEN
 			    -- At new master node replace foreign link with local partition
 				prts := format('%s%s:SELECT shardman.replace_foreign_with_real(%L);',
-			 				   prts, node.id, part.part_name);
+			 				   prts, node.id, quote_ident(part.part_name));
 			ELSE
 				-- At all other nodes adjust foreign server for foreign table to
 				-- refer to new master node.
@@ -602,7 +602,7 @@ BEGIN
 		create_tables := format('%s{%s:%s}',
 			create_tables, node.id, create_table);
 		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
-			create_partitions, node.id, rel_name, expr, part_count);
+			create_partitions, node.id, quote_ident(rel_name), expr, part_count);
 	END LOOP;
 
 	-- Broadcast create table commands
@@ -615,7 +615,7 @@ BEGIN
 	n_nodes := array_length(node_ids, 1);
 
 	-- Reconstruct table attributes from parent table
-	SELECT shardman.reconstruct_table_attrs(rel_name::regclass) INTO table_attrs;
+	SELECT shardman.reconstruct_table_attrs(quote_ident(rel_name)::regclass) INTO table_attrs;
 
 	FOR i IN 0..part_count-1
 	LOOP
@@ -935,7 +935,7 @@ BEGIN
 		dst_node_id, mv_part_name));
 
 	-- Update FDWs at all nodes
-	SELECT shardman.reconstruct_table_attrs(part.relation) INTO table_attrs;
+	SELECT shardman.reconstruct_table_attrs(quote_ident(part.relation)) INTO table_attrs;
 	FOR node IN SELECT * FROM shardman.nodes
 	LOOP
 		IF node.id = src_node_id
@@ -946,7 +946,7 @@ BEGIN
 		ELSIF node.id = dst_node_id THEN
 			replace_parts := format(
 				'%s%s:SELECT shardman.replace_foreign_with_real(%L);',
-				replace_parts, node.id, mv_part_name);
+				replace_parts, node.id, quote_ident(mv_part_name));
 		ELSE
 			replace_parts := format(
 				'%s%s:SELECT shardman.alter_ftable_set_server(%L, ''node_%s'');',
@@ -1104,7 +1104,7 @@ BEGIN
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
 	-- Construct table attributes for create foreign table
-	SELECT shardman.reconstruct_table_attrs(rel) INTO table_attrs;
+	SELECT shardman.reconstruct_table_attrs(quote_ident(rel)) INTO table_attrs;
 
 	-- Generate SQL statements creating  instead rules for updates
 	SELECT shardman.gen_create_rules_sql(rel_name) INTO create_rules;
@@ -1565,7 +1565,7 @@ BEGIN
 					fdw_part_name))
 				THEN
 					RAISE NOTICE 'Creating foreign table % at node %', fdw_part_name, src_node.id;
-					SELECT shardman.reconstruct_table_attrs(part.relation) INTO table_attrs;
+					SELECT shardman.reconstruct_table_attrs(quote_ident(part.relation)) INTO table_attrs;
 					PERFORM shardman.broadcast(format(
 						'%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
 						src_node.id, fdw_part_name, table_attrs, srv_name, part.part_name));
@@ -1601,7 +1601,7 @@ BEGIN
 						SELECT * INTO t FROM shardman.tables WHERE relation=part.relation;
 						PERFORM shardman.broadcast(format(
 							'%s:SELECT create_hash_partitions(%L,%L,%L);',
-							src_node.id, t.relation, t.sharding_key, t.partitions_count),
+							src_node.id, quote_ident(t.relation), t.sharding_key, t.partitions_count),
 							iso_level => 'read committed');
 					END IF;
 					RAISE NOTICE 'Replace % with % at node %',
@@ -1629,7 +1629,7 @@ BEGIN
 						SELECT * INTO t FROM shardman.tables WHERE relation=part.relation;
 						PERFORM shardman.broadcast(format(
 							'%s:SELECT create_hash_partitions(%L, %L, %L);',
-							src_node.id, t.relation, t.sharding_key, t.partitions_count),
+							src_node.id, quote_ident(t.relation), t.sharding_key, t.partitions_count),
 							iso_level => 'read committed');
 					ELSE
 						RAISE NOTICE 'Replace % with % at node %',
@@ -1693,7 +1693,7 @@ BEGIN
 			IF shardman.not_exists(node_id, format('pg_class c,pg_foreign_table f WHERE c.oid=f.ftrelid AND c.relname=%L', fdw_part_name))
 			THEN
 				RAISE NOTICE 'Create foreign table %I at node %', fdw_part_name, node_id;
-				SELECT shardman.reconstruct_table_attrs(t.relation) INTO table_attrs;
+				SELECT shardman.reconstruct_table_attrs(quote_ident(t.relation)) INTO table_attrs;
 				PERFORM shardman.broadcast(format('%s:CREATE FOREIGN TABLE % %s SERVER %s OPTIONS (table_name %L);',
 					node_id, fdw_part_name, table_attrs, srv_name, t.relation));
 			END IF;
@@ -2285,7 +2285,7 @@ BEGIN
 	IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'write_protection' AND
 												  tgrelid = part) THEN
 		EXECUTE format('CREATE TRIGGER write_protection BEFORE INSERT OR UPDATE OR DELETE ON
-					   %I FOR EACH STATEMENT EXECUTE PROCEDURE shardman.deny_access();',
+					   %s FOR EACH STATEMENT EXECUTE PROCEDURE shardman.deny_access();',
 					   part::name);
 	END IF;
 END
@@ -2296,7 +2296,7 @@ CREATE FUNCTION write_protection_off(part regclass) RETURNS void AS $$
 BEGIN
 	IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'write_protection' AND
 											  tgrelid = part) THEN
-		EXECUTE format('DROP TRIGGER write_protection ON %I', part::name);
+		EXECUTE format('DROP TRIGGER write_protection ON %s', part::name);
 	END IF;
 END
 $$ LANGUAGE plpgsql;

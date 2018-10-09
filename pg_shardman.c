@@ -465,7 +465,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	join_path_components(pg_dump_path, pg_dump_path, "pg_dump");
 	canonicalize_path(pg_dump_path);
 
-	cmd = psprintf("%s -t '%s' --no-owner --schema-only --dbname='%s' 2>&1",
+	cmd = psprintf("%s -t '\"%s\"' --no-owner --schema-only --dbname='%s' 2>&1",
 				   pg_dump_path, relation, shardlord_connstring);
 
 	if ((fp = popen(cmd, "r")) == NULL)
