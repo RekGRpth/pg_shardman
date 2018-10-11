@@ -113,19 +113,7 @@ The trade-off is well-known: asynchronous replication is faster, but allows
 replica to lag arbitrary behind the primary, which might lead to loss of a bunch
 of recently committed transactions (if primary holder fails), or WAL puffing up
 in case of replica failure. Synchronous replication is slower, but committed
-transaction are *typically* not dropped. Typically, because it is actually still
-possible to lose them without kind of 2PC commit. Imagine the following
-scenario:
- * Primary's connection with replica is teared down.
- * Primary executes a transaction, e.g. adds some row with id `42`, commits it
-   locally and blocks because there is no connection with replica.
- * Client suddenly loses connection with primary for a moment and reconnects
-   to learn the status of the transaction, sees the row with id `42` and
-   thinks that it has been committed.
- * Now primary fails permanently and we switch to the replica. Replica has
-   no idea of that transaction, but client is sure it is committed.
-
-Though this situation is rather unlikely in practice, it is possible.
+transaction are typically not dropped.
 
 We don't track replication mode for each table separately, and changing
 `shardman.sync_replication` GUC during cluster operation might lead to a mess.
@@ -153,13 +141,8 @@ on the node means that this node has promised to commit the transaction, and it
 is also possible to abort the transaction in this state, which allows to get
 consistent behaviour of all nodes.
 
-The problem is that presently `PREPARE` is not transferred via logical
-replication to replicas, which means that in case of permanent node failure we
-still might lost part of distributed transaction and get non-atomic result if
-primary has prepared the transaction, but died without committing it and now
-replica has no idea about the xact. Properly implemented `PREPARE` going over
-logical replication will also mitigate the possibilty of losing transactions
-described in 'Replication' section, and we plan to do that.
+To avoid losing part of transaction during failover, replicas must participate
+in 2PC. For that, set `logical_replication_2pc=shardman`.
 
 The notorious shortcoming of 2PC is that it is a blocking protocol: if the
 coordinator of transaction T has failed, T might hang in PREPAREd state on some

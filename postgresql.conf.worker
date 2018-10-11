@@ -21,6 +21,7 @@ synchronous_commit = on
 
 # for 2pc
 max_prepared_transactions = 1000
+logical_replication_2pc = shardman
 
 # global snapshots
 track_global_snapshots = on
