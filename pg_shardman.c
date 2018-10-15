@@ -441,13 +441,13 @@ Datum
 gen_create_table_sql(PG_FUNCTION_ARGS)
 {
 	char pg_dump_path[MAXPGPATH];
-	/* let the mmgr free that */
-	char *relation = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	const size_t chunksize = 5; /* read max that bytes at time */
+	/* let the mmgr free that; must be already quoted if needed */
+	const char *relation = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const size_t chunksize = 1024; /* read max that bytes at time */
 	/* how much already allocated *including header* */
 	size_t pallocated = VARHDRSZ + chunksize;
 	text *sql = (text *) palloc(pallocated);
-	char *ptr = VARDATA(sql); /* ptr to first free byte */
+	char *ptr;
 	char *cmd;
 	FILE *fp;
 	size_t bytes_read;
@@ -465,7 +465,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 	join_path_components(pg_dump_path, pg_dump_path, "pg_dump");
 	canonicalize_path(pg_dump_path);
 
-	cmd = psprintf("%s -t '\"%s\"' --no-owner --schema-only --dbname='%s' 2>&1",
+	cmd = psprintf("%s -t '%s' --no-owner --schema-only --dbname='%s' 2>&1",
 				   pg_dump_path, relation, shardlord_connstring);
 
 	if ((fp = popen(cmd, "r")) == NULL)
@@ -473,6 +473,7 @@ gen_create_table_sql(PG_FUNCTION_ARGS)
 		elog(ERROR, "SHARDMAN: Failed to run pg_dump, cmd %s", cmd);
 	}
 
+	ptr = VARDATA(sql); /* ptr to first free byte */
 	while ((bytes_read = fread(ptr, sizeof(char), chunksize, fp)) != 0)
 	{
 		SET_VARSIZE(sql, VARSIZE_ANY(sql) + bytes_read);

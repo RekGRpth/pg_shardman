@@ -559,10 +559,12 @@ $$ LANGUAGE plpgsql;
 -- This function expects that empty table is created at shardlord.
 -- It can be executed only at shardlord and there is no need to redirect this
 -- function to shardlord.
+-- rel_name must be quoted as usual.
 CREATE FUNCTION create_hash_partitions(rel_name name, expr text, part_count int,
 									   redundancy int = 0)
 RETURNS void AS $$
 DECLARE
+        rel_name_unquoted text = relname FROM pg_class WHERE oid = rel_name::regclass;
 	create_table text;
 	node shardman.nodes;
 	node_ids int[];
@@ -578,7 +580,7 @@ DECLARE
 	i int;
 	n_nodes int;
 BEGIN
-	IF EXISTS(SELECT relation FROM shardman.tables WHERE relation = rel_name)
+	IF EXISTS(SELECT relation FROM shardman.tables WHERE relation = rel_name_unquoted)
 	THEN
 		RAISE EXCEPTION 'Table % is already sharded', rel_name;
 	END IF;
@@ -593,7 +595,7 @@ BEGIN
 	-- Generate SQL statement creating this table
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
-	INSERT INTO shardman.tables (relation,sharding_key,partitions_count,create_sql) values (rel_name,expr,part_count,create_table);
+	INSERT INTO shardman.tables (relation,sharding_key,partitions_count,create_sql) values (rel_name_unquoted,expr,part_count,create_table);
 
 	-- Create parent table and partitions at all nodes
 	FOR node IN SELECT * FROM shardman.nodes
@@ -602,7 +604,7 @@ BEGIN
 		create_tables := format('%s{%s:%s}',
 			create_tables, node.id, create_table);
 		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
-			create_partitions, node.id, quote_ident(rel_name), expr, part_count);
+			create_partitions, node.id, rel_name, expr, part_count);
 	END LOOP;
 
 	-- Broadcast create table commands
@@ -615,16 +617,16 @@ BEGIN
 	n_nodes := array_length(node_ids, 1);
 
 	-- Reconstruct table attributes from parent table
-	SELECT shardman.reconstruct_table_attrs(quote_ident(rel_name)::regclass) INTO table_attrs;
+	SELECT shardman.reconstruct_table_attrs(rel_name::regclass) INTO table_attrs;
 
 	FOR i IN 0..part_count-1
 	LOOP
 		-- Choose location of new partition
 		node_id := node_ids[1 + (i % n_nodes)]; -- round robin
-		part_name := format('%s_%s', rel_name, i);
+		part_name := format('%s_%s', rel_name_unquoted, i);
 		fdw_part_name := format('%s_fdw', part_name);
 		-- Insert information about new partition in partitions table
-		INSERT INTO shardman.partitions (part_name, node_id, relation) VALUES (part_name, node_id, rel_name);
+		INSERT INTO shardman.partitions (part_name, node_id, relation) VALUES (part_name, node_id, rel_name_unquoted);
 		-- Construct name of the server where partition will be located
 		srv_name := format('node_%s', node_id);
 
