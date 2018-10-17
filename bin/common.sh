@@ -15,12 +15,13 @@ fi
 function start_nodes()
 {
     echo "Starting nodes"
-    for ((i=0; i<${#worker_datadirs[@]}; ++i)); do
-	datadir="${worker_datadirs[i]}"
-	port="${worker_ports[i]}"
+    for ((i=1; i<=${#worker_datadirs[@]}; ++i)); do
+	datadir=${worker_datadirs[i]}
+	port=${worker_ports[i]}
 	echo "starting $datadir on $port"
 	pg_ctl -o "-p $port" -l "/tmp/postgresql_$port.log" -D $datadir start
     done
+    echo "starting lord $lord_datadir on $lord_port"
     pg_ctl -o "-p $lord_port" -l "/tmp/postgresql_${lord_port}.log" -D $lord_datadir start
 }
 
@@ -35,12 +36,12 @@ function stop_nodes()
 function restart_nodes()
 {
     echo "Restarting nodes"
-    for ((i=0; i<${#worker_datadirs[@]}; ++i)); do
+    for ((i=1; i<=${#worker_datadirs[@]}; ++i)); do
 	datadir="${worker_datadirs[i]}"
 	port="${worker_ports[i]}"
-	pg_ctl -o "-p $port" -D $datadir $logopts restart
+	pg_ctl -o "-p $port" -D $datadir -l "/tmp/postgresql_$port.log" restart
     done
-    pg_ctl -o "-p $lord_port" -D $lord_datadir $logopts restart
+    pg_ctl -o "-p $lord_port" -D $lord_datadir -l "/tmp/postgresql_${lord_port}.log" restart
 }
 
 function send_configs()
