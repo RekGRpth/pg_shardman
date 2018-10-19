@@ -233,7 +233,9 @@ workers; each worker round-robingly connects to some shardman node and performs
 COPY FROM. Max rows per transaction is configurably limited. By default, 2PC
 is used; script will first prepare xacts everywhere, then inform you that
 everything is ok (or not) and then commit (abort) prepared xacts everywhere.
-All gids contain shmnloader_${table_name}.
+All gids contain shmnloader_${table_name}. Can also be used for importing data
+into shared tables; in this case all workers knock directly to master node;
+parallelism probably doesn't make much sense here.
 Requires psycopg2 (though you probably already know it in since you are reading this, ha).
 """,
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -272,6 +274,22 @@ Requires psycopg2 (though you probably already know it in since you are reading 
         with lconn.cursor() as curs:
             curs.execute("select id, connection_string from shardman.nodes")
             nodes = curs.fetchall()
+
+            curs.execute("select master_node from shardman.tables where relation = '{}'".format(args.table_name))
+            master_nodes = curs.fetchall()
+            if len(master_nodes) != 1:
+                raise ValueError('Table {} is not sharded/shared'.format(args.table_name))
+            master_node = master_nodes[0][0]
+            if master_node is None:
+              sharded_table = True
+            else:
+              sharded_table = False  # shared table
+              for node in nodes:
+                  if node[0] == master_node:
+                      master_connstr = node[1]
+    if not sharded_table:
+        if not args.notwophase:
+            raise ValueError("2PC doesn't make sense for shared tables")
     nnodes = len(nodes)
     if nnodes < 1:
         raise ValueError("No workers");
@@ -284,7 +302,10 @@ Requires psycopg2 (though you probably already know it in since you are reading 
         workers.append(ws)
         ws.worker_id = i
         node_idx = i % (nnodes)
-        ws.node_id, ws.connstr = (nodes[node_idx][0], nodes[node_idx][1])
+        if sharded_table:
+            ws.node_id, ws.connstr = (nodes[node_idx][0], nodes[node_idx][1])
+        else:
+            ws.node_id, ws.connstr = (master_node, master_connstr)
         ws.numnodes = nnodes
         ws.parent_conn, ws.child_conn = Pipe()
         ws.feedback_queue = feedback_queue
