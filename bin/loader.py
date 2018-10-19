@@ -208,12 +208,16 @@ def scatter_data(file_path, workers, nworkers, feedback_queue, args):
 
 
     with open(file_path) as f:
-        for line in f:
-            workers[next_worker].parent_conn.send(line)
-            # send_row(line, workers[next_worker].parent_conn, feedback_queue, progress)
-            next_worker = (next_worker + 1) % nworkers
-    if progress:
-        progress.report()
+        try:
+            for line in f:
+                workers[next_worker].parent_conn.send(line)
+                next_worker = (next_worker + 1) % nworkers
+        except Exception as e:
+            # something wrong; probably worker died and closed the pipe?
+            m = feedback_queue.get(block=True)
+            assert isinstance(m, ErrorMsg)
+            print("sending row failed with {} {}".format(str(e), traceback.format_exc()))
+            raise WorkerError(m)
     return
 
     # All this stuff is here because csv allows to have CR and LF characters
@@ -315,11 +319,6 @@ Requires psycopg2 (though you probably already know it in since you are reading 
                         help="""
                         Don't employ 2PC which is used by default.
                         """)
-    parser.add_argument('--print-progress', dest='print_progress', action='store_true',
-                        help='print progress')
-    parser.set_defaults(print_progress=False)
-    parser.add_argument('-R', dest='report_each_rows', default=10000, type=int,
-                        help='print progress each R rows')
     parser.add_argument('--direct-connstr', dest='direct_connstr', default=None, type=str,
                         help=argparse.SUPPRESS)
     parser.add_argument('--reader-bufsize', dest='reader_bufsize', default=8192, type=int,
