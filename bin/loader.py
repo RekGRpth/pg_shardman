@@ -3,7 +3,9 @@
 import argparse
 import psycopg2
 import time
+import traceback
 from multiprocessing import Process, Pipe, Queue
+import queue
 
 class WorkerState:
     def __init__(self):
@@ -40,7 +42,6 @@ class Reader:
         res = self.buf[self.pos:self.pos + to_return]
         self.pos += to_return
 
-        # print("res is {}".format(res))
         return res
 
     def readline(self, size=None):
@@ -61,6 +62,7 @@ class Reader:
 
         self.buf = s
         self.buflen = len(s)
+        self.pos = 0
 
     def reset_rowcount(self):
         assert self.pos == self.buflen
@@ -74,10 +76,11 @@ class CompletedXact:
         self.rowcount = rowcount
 
 class ErrorMsg:
-    def __init__(self, worker_id, node_id, msg):
+    def __init__(self, worker_id, node_id, msg, backtrace):
         self.worker_id = worker_id
         self.node_id = node_id
         self.msg = msg
+        self.backtrace = backtrace
 
 def worker_main_internal(ws, args, completed_xacts):
     xact_count = 0
@@ -130,7 +133,7 @@ def worker_main(ws, args):
     try:
         worker_main_internal(ws, args, completed_xacts)
     except Exception as e:
-        err_msg = ErrorMsg(ws.worker_id, ws.node_id, str(e))
+        err_msg = ErrorMsg(ws.worker_id, ws.node_id, str(e), traceback.format_exc())
     finally:
         ws.child_conn.close()
         # print("Process {} is done".format(ws.worker_id))
@@ -141,7 +144,32 @@ def worker_main(ws, args):
         else:
             ws.feedback_queue.put(err_msg)
 
-def scatter_data(file_path, workers, nworkers, quotec, escapec):
+class WorkerError(Exception):
+    def __init__(self, errormsg):
+        super().__init__("worker died")
+        self.errormsg = errormsg
+
+def send_row(row, conn, feedback_queue):
+    m = None
+    try: # notice errors asap
+        m = feedback_queue.get(block=False)
+    except queue.Empty:
+        pass
+    if m is not None:
+        assert isinstance(m, ErrorMsg)
+        raise WorkerError(m)
+
+    try:
+        conn.send(row)
+    except Exception as e:
+        # something wrong; probably worker died and closed the pipe?
+        m = feedback_queue.get(block=True)
+        assert isinstance(m, ErrorMsg)
+        print("sending row failed with {} {}".format(str(e), traceback.format_exc()))
+        raise WorkerError(m)
+
+
+def scatter_data(file_path, workers, nworkers, quotec, escapec, feedback_queue):
     row = ""
     buf = ""
     pos_copied = 0 # first char of buf not yet copied into row
@@ -157,8 +185,8 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec):
     # All this stuff is here because csv allows to have CR and LF characters
     # literally in import file if they are quotted and I wanted to have some fun
     # parsing it. Otherwise we could just read and send rows line-by-line...
-    # Python csv parser is not ok because a) It doesn't give raw lines b)
-    # not sure how it handles newlines in data.
+    # Python csv parser is not entirely ok because a) It doesn't give raw lines
+    # b) not sure how it handles newlines in data.
     # Partly inspired by CopyReadLineText.
     with open(file_path) as f:
         while True:
@@ -179,8 +207,9 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec):
             if eof and pos_approved == len(buf):
                 # eof and buffer processed
                 if row != "":
+                    # print(row)
                     assert row[-1] == '\r'
-                    workers[next_worker].parent_conn.send(row)
+                    send_row(row, workers[next_worker].parent_conn, feedback_queue)
                 break
 
             c = buf[pos_approved]
@@ -191,7 +220,8 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec):
                     pos_approved += 1
                 row += buf[pos_copied:pos_approved]
                 # send row
-                workers[next_worker].parent_conn.send(row)
+                # print(row)
+                send_row(row, workers[next_worker].parent_conn, feedback_queue)
                 next_worker = (next_worker + 1) % nworkers
                 row = ""
                 pos_copied = pos_approved
@@ -220,7 +250,8 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec):
             if not in_quote and c == '\n':  # eol
                 row += buf[pos_copied:pos_approved]
                 # send row
-                workers[next_worker].parent_conn.send(row)
+                # print(row)
+                send_row(row, workers[next_worker].parent_conn, feedback_queue)
                 next_worker = (next_worker + 1) % nworkers
                 row = ""
                 pos_copied = pos_approved
@@ -313,19 +344,25 @@ Requires psycopg2 (though you probably already know it in since you are reading 
         ws.child_handle.start()
         ws.child_conn.close()  # close child fd
 
-    scatter_data(file_path, workers, nworkers, args.quote, args.escape)
+    error = False
+    finished_workers = 0
+    try:
+        scatter_data(file_path, workers, nworkers, args.quote, args.escape, feedback_queue)
+    except WorkerError as e:
+        error = True
+        finished_workers = 1
+        m = e.errormsg
+        print("Worker {} attached to node {} failed with error '{}' \nThe backtrace is {}".format(m.worker_id, m.node_id, m.msg, m.backtrace))
 
     for i in range(nworkers):
         workers[i].parent_conn.close()
 
-    finished_workers = 0
     workstat = [{'worker_id': i, 'numxacts': 0, 'rowcount': 0} for i in range(nworkers)]
-    error = False
     while finished_workers < nworkers:
         m = feedback_queue.get()
         if type(m) is str or isinstance(m, ErrorMsg):
             if isinstance(m, ErrorMsg):
-                print("Worker {} attached to node {} failed with error {}".format(m.worker_id, m.node_id, m.msg))
+                print("Worker {} attached to node {} failed with error '{}' \nThe backtrace is {}".format(m.worker_id, m.node_id, m.msg, m.backtrace))
                 error=True
             else:
                 assert type(m) is str and m == 'STOP'
