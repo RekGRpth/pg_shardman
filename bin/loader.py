@@ -311,6 +311,8 @@ Requires psycopg2 (though you probably already know it in since you are reading 
     parser.set_defaults(print_progress=False)
     parser.add_argument('-R', dest='report_each_rows', default=10000, type=int,
                         help='print progress each R rows')
+    parser.add_argument('--direct-connstr', dest='direct_connstr', default=None, type=str,
+                        help=argparse.SUPPRESS)
     parser.add_argument('-d', dest='delimiter', default=',', type=str,
                         help='delimiter')
     parser.add_argument('-q', dest='quote', default='"', type=str,
@@ -333,26 +335,31 @@ Requires psycopg2 (though you probably already know it in since you are reading 
     file_path = args.file_path
 
     nodes = []
-    with psycopg2.connect(lord_connstring) as lconn:
-        with lconn.cursor() as curs:
-            curs.execute("select id, connection_string from shardman.nodes")
-            nodes = curs.fetchall()
+    sharded_table = True
+    if args.direct_connstr is None:
+        with psycopg2.connect(lord_connstring) as lconn:
+            with lconn.cursor() as curs:
+                curs.execute("select id, connection_string from shardman.nodes")
+                nodes = curs.fetchall()
 
-            curs.execute("select master_node from shardman.tables where relation = '{}'".format(args.table_name))
-            master_nodes = curs.fetchall()
-            if len(master_nodes) != 1:
-                raise ValueError('Table {} is not sharded/shared'.format(args.table_name))
-            master_node = master_nodes[0][0]
-            if master_node is None:
-              sharded_table = True
-            else:
-              sharded_table = False  # shared table
-              for node in nodes:
-                  if node[0] == master_node:
-                      master_connstr = node[1]
+                curs.execute("select master_node from shardman.tables where relation = '{}'".format(args.table_name))
+                master_nodes = curs.fetchall()
+                if len(master_nodes) != 1:
+                    raise ValueError('Table {} is not sharded/shared'.format(args.table_name))
+                master_node = master_nodes[0][0]
+                if master_node is None:
+                    sharded_table = True
+                else:
+                    sharded_table = False  # shared table
+                    for node in nodes:
+                        if node[0] == master_node:
+                            master_connstr = node[1]
+    else:
+        nodes = [(1, args.direct_connstr)]
+
     nnodes = len(nodes)
     if nnodes < 1:
-        raise ValueError("No workers");
+        raise ValueError("No nodes");
 
     # Use queue for collecting results. We could reuse pipes (selecting them),
     # but who cares
@@ -362,8 +369,8 @@ Requires psycopg2 (though you probably already know it in since you are reading 
         workers.append(ws)
         ws.worker_id = i
         node_idx = i % (nnodes)
-        if sharded_table:
-            ws.node_id, ws.connstr = (nodes[node_idx][0], nodes[node_idx][1])
+        if sharded_table or args.direct_connstr is not None:
+            ws.node_id, ws.connstr = nodes[node_idx]
         else:
             ws.node_id, ws.connstr = (master_node, master_connstr)
         ws.numnodes = nnodes
