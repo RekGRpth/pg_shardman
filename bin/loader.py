@@ -209,7 +209,7 @@ def scatter_data(file_path, workers, nworkers, feedback_queue, args):
 
     with open(file_path) as f:
         for line in f:
-            send_row(row, workers[next_worker].parent_conn, feedback_queue, progress)
+            send_row(line, workers[next_worker].parent_conn, feedback_queue, progress)
             next_worker = (next_worker + 1) % nworkers
     if progress:
         progress.report()
