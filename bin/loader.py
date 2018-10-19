@@ -318,9 +318,6 @@ Requires psycopg2 (though you probably already know it in since you are reading 
               for node in nodes:
                   if node[0] == master_node:
                       master_connstr = node[1]
-    if not sharded_table:
-        if not args.notwophase:
-            raise ValueError("2PC doesn't make sense for shared tables")
     nnodes = len(nodes)
     if nnodes < 1:
         raise ValueError("No workers");
@@ -397,7 +394,7 @@ Requires psycopg2 (though you probably already know it in since you are reading 
         with psycopg2.connect(connstr) as conn:
             conn.set_session(autocommit=True) # for commit/abort prepared
             with conn.cursor() as curs:
-                curs.execute("select gid from pg_prepared_xacts where gid ~ '.*shmnloader_t.*'")
+                curs.execute("select gid from pg_prepared_xacts where gid ~ '.*shmnloader_{}.*'".format(args.table_name))
                 gids = [gidt[0] for gidt in curs.fetchall()]
                 for gid in gids:
                     curs.execute("{} prepared '{}'".format(action, gid))
