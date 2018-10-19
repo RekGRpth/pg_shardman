@@ -1081,6 +1081,8 @@ $$ LANGUAGE plpgsql;
 -- shardlord. The empty table should be present at shardlord, but not at nodes.
 CREATE FUNCTION create_shared_table(rel regclass, master_node_id int = 1) RETURNS void AS $$
 DECLARE
+	rel_name text = rel::text;
+	rel_name_unquoted text = relname FROM pg_class WHERE oid = rel;
 	node shardman.nodes;
 	pubs text = '';
 	subs text = '';
@@ -1091,8 +1093,7 @@ DECLARE
 	create_tables text;
 	create_rules text;
 	table_attrs text;
-	rel_name text = rel::text;
-	fdw_name text = format('%s_fdw', rel_name);
+	fdw_name text = format('%s_fdw', rel_name_unquoted);
 	srv_name text = format('node_%s', master_node_id);
 	new_master bool;
 BEGIN
@@ -1108,8 +1109,8 @@ BEGIN
 	-- Construct table attributes for create foreign table
 	SELECT shardman.reconstruct_table_attrs(rel_name) INTO table_attrs;
 
-	-- Generate SQL statements creating  instead rules for updates
-	SELECT shardman.gen_create_rules_sql(rel_name, format('%s_fdw', rel_name)) INTO create_rules;
+	-- Generate SQL statements creating instead rules for updates
+	SELECT shardman.gen_create_rules_sql(rel_name_unquoted, fdw_name) INTO create_rules;
 
 	-- Create table at all nodes
 	FOR node IN SELECT * FROM shardman.nodes
@@ -1122,11 +1123,11 @@ BEGIN
 	IF EXISTS(SELECT * from shardman.tables WHERE master_node=master_node_id)
 	THEN
 		new_master := false;
-		pubs := format('%s:ALTER PUBLICATION shared_tables ADD TABLE %I;',
+		pubs := format('%s:ALTER PUBLICATION shared_tables ADD TABLE %s;',
 			 master_node_id, rel_name);
 	ELSE
 		new_master := true;
-		pubs := format('%s:CREATE PUBLICATION shared_tables FOR TABLE %I;',
+		pubs := format('%s:CREATE PUBLICATION shared_tables FOR TABLE %s;',
 	         master_node_id, rel_name);
 	END IF;
 
@@ -1144,7 +1145,7 @@ BEGIN
 				 subs, node.id, node.id, master_node_id);
 		END IF;
 		fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
-			 fdws, node.id, fdw_name, table_attrs, srv_name, rel_name);
+			 fdws, node.id, fdw_name, table_attrs, srv_name, rel_name_unquoted);
 		rules := format('%s{%s:%s}',
 			 rules, node.id, create_rules);
 	END LOOP;
@@ -2017,6 +2018,7 @@ END
 $$ LANGUAGE plpgsql;
 
 -- Generate rules for redirecting updates for shared table
+-- rel_name and fdw_name are unquoted
 CREATE FUNCTION gen_create_rules_sql(rel_name text, fdw_name text) RETURNS text AS $$
 DECLARE
 	pk text;
@@ -2028,7 +2030,7 @@ BEGIN
           string_agg(quote_ident(attname), ', '),
 		  string_agg('NEW.' || quote_ident(attname), ', ')
     FROM   pg_attribute
-    WHERE  attrelid = rel_name::regclass
+    WHERE  attrelid = quote_ident(rel_name)::regclass
     AND    NOT attisdropped   -- no dropped (dead) columns
     AND    attnum > 0;
 
@@ -2038,7 +2040,7 @@ BEGIN
 	FROM   pg_index i
 	JOIN   pg_attribute a ON a.attrelid = i.indrelid
                      AND a.attnum = ANY(i.indkey)
-    WHERE  i.indrelid = rel_name::regclass
+    WHERE  i.indrelid = quote_ident(rel_name)::regclass
     AND    i.indisprimary;
 
 	RETURN format('CREATE OR REPLACE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
