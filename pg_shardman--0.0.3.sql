@@ -1106,10 +1106,10 @@ BEGIN
 	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
 
 	-- Construct table attributes for create foreign table
-	SELECT shardman.reconstruct_table_attrs(quote_ident(rel)) INTO table_attrs;
+	SELECT shardman.reconstruct_table_attrs(rel_name) INTO table_attrs;
 
 	-- Generate SQL statements creating  instead rules for updates
-	SELECT shardman.gen_create_rules_sql(rel_name) INTO create_rules;
+	SELECT shardman.gen_create_rules_sql(rel_name, format('%s_fdw', rel_name)) INTO create_rules;
 
 	-- Create table at all nodes
 	FOR node IN SELECT * FROM shardman.nodes
