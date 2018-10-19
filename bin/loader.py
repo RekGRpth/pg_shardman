@@ -205,7 +205,6 @@ def scatter_data(file_path, workers, nworkers, feedback_queue, args):
     quotec = args.quote
     escapec = args.escape
     print_progress = args.print_progress
-    print("print_progress is {}".format(args.print_progress))
     progress = Progress(args.report_each_rows) if args.print_progress else None
 
     # All this stuff is here because csv allows to have CR and LF characters
