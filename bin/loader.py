@@ -3,6 +3,7 @@
 import argparse
 import psycopg2
 import time
+import datetime
 import traceback
 from multiprocessing import Process, Pipe, Queue
 import queue
@@ -149,7 +150,23 @@ class WorkerError(Exception):
         super().__init__("worker died")
         self.errormsg = errormsg
 
-def send_row(row, conn, feedback_queue):
+class Progress:
+    def __init__(self, report_each_rows):
+        self.start = time.time()
+        self.report_each_rows = report_each_rows
+        self.sent_count = 0
+    def row_sent(self):
+        self.sent_count += 1
+        if self.sent_count % self.report_each_rows == 0:
+            self.report()
+    def report(self):
+        elapsed_sec = time.time() - self.start
+        print("{} rows sent, {} elapsed, {} rows per sec".format(self.sent_count,
+                                                                 datetime.timedelta(seconds=int(elapsed_sec)),
+                                                                 int(self.sent_count / elapsed_sec)))
+
+
+def send_row(row, conn, feedback_queue, progress):
     m = None
     try: # notice errors asap
         m = feedback_queue.get(block=False)
@@ -168,8 +185,11 @@ def send_row(row, conn, feedback_queue):
         print("sending row failed with {} {}".format(str(e), traceback.format_exc()))
         raise WorkerError(m)
 
+    if progress is not None:
+        progress.row_sent()
 
-def scatter_data(file_path, workers, nworkers, quotec, escapec, feedback_queue):
+
+def scatter_data(file_path, workers, nworkers, feedback_queue, args):
     row = ""
     buf = ""
     pos_copied = 0 # first char of buf not yet copied into row
@@ -181,6 +201,12 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec, feedback_queue):
     last_was_cr = False
     next_worker = 0
     eof = False
+    file_path = args.file_path
+    quotec = args.quote
+    escapec = args.escape
+    print_progress = args.print_progress
+    print("print_progress is {}".format(args.print_progress))
+    progress = Progress(args.report_each_rows) if args.print_progress else None
 
     # All this stuff is here because csv allows to have CR and LF characters
     # literally in import file if they are quotted and I wanted to have some fun
@@ -209,7 +235,9 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec, feedback_queue):
                 if row != "":
                     # print(row)
                     assert row[-1] == '\r'
-                    send_row(row, workers[next_worker].parent_conn, feedback_queue)
+                    send_row(row, workers[next_worker].parent_conn, feedback_queue, progress)
+                if progress:
+                    progress.report()
                 break
 
             c = buf[pos_approved]
@@ -221,7 +249,7 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec, feedback_queue):
                 row += buf[pos_copied:pos_approved]
                 # send row
                 # print(row)
-                send_row(row, workers[next_worker].parent_conn, feedback_queue)
+                send_row(row, workers[next_worker].parent_conn, feedback_queue, progress)
                 next_worker = (next_worker + 1) % nworkers
                 row = ""
                 pos_copied = pos_approved
@@ -251,7 +279,7 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec, feedback_queue):
                 row += buf[pos_copied:pos_approved]
                 # send row
                 # print(row)
-                send_row(row, workers[next_worker].parent_conn, feedback_queue)
+                send_row(row, workers[next_worker].parent_conn, feedback_queue, progress)
                 next_worker = (next_worker + 1) % nworkers
                 row = ""
                 pos_copied = pos_approved
@@ -279,6 +307,11 @@ Requires psycopg2 (though you probably already know it in since you are reading 
                         help="""
                         Don't employ 2PC which is used by default.
                         """)
+    parser.add_argument('--print-progress', dest='print_progress', action='store_true',
+                        help='print progress')
+    parser.set_defaults(print_progress=False)
+    parser.add_argument('-R', dest='report_each_rows', default=10000, type=int,
+                        help='print progress each R rows')
     parser.add_argument('-d', dest='delimiter', default=',', type=str,
                         help='delimiter')
     parser.add_argument('-q', dest='quote', default='"', type=str,
@@ -344,7 +377,7 @@ Requires psycopg2 (though you probably already know it in since you are reading 
     error = False
     finished_workers = 0
     try:
-        scatter_data(file_path, workers, nworkers, args.quote, args.escape, feedback_queue)
+        scatter_data(file_path, workers, nworkers, feedback_queue, args)
     except WorkerError as e:
         error = True
         finished_workers = 1
