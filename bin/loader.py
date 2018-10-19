@@ -19,11 +19,9 @@ class WorkerState:
         self.parent_conn = None  # only for parent
         self.child_handle = None  # only at parent
 
-bufsize = 8 * (1 << 10)
-
 # Imitates file for copy_from
 class Reader:
-    def __init__(self, pipe, maxrows):
+    def __init__(self, pipe, maxrows, bufsize):
         self.buf = ""
         self.pos = 0
         self.buflen = 0
@@ -31,6 +29,7 @@ class Reader:
         self.rowcount = 0
         self.pipe = pipe
         self.eof = False # no more data in the pipe
+        self.fill_bufsize = bufsize
 
     def read(self, size=None):
         if (self.pos == self.buflen) and not self.eof:
@@ -52,7 +51,7 @@ class Reader:
         assert self.pos == self.buflen
 
         s = ""
-        while (len(s) <= bufsize) and not self.eof and self.rowcount < self.maxrows:
+        while (len(s) <= self.fill_bufsize) and not self.eof and self.rowcount < self.maxrows:
             try:
                 line = self.pipe.recv()
                 # print("got {}".format(line))
@@ -85,7 +84,7 @@ class ErrorMsg:
 
 def worker_main_internal(ws, args, completed_xacts):
     xact_count = 0
-    reader = Reader(ws.child_conn, args.max_rows_per_xact)
+    reader = Reader(ws.child_conn, args.max_rows_per_xact, args.reader_bufsize)
     with psycopg2.connect(ws.connstr) as conn:
         with conn.cursor() as curs:
             curs.execute("select system_identifier from pg_control_system()")
@@ -113,7 +112,7 @@ def worker_main_internal(ws, args, completed_xacts):
                 conn.tpc_begin(gid)
             with conn.cursor() as curs:
                 copy_sql = "copy {} from stdin (format csv, delimiter '{}', quote '{}', escape '{}')".format(args.table_name, args.delimiter, args.quote, args.escape)
-                curs.copy_expert(copy_sql, reader, size=bufsize)
+                curs.copy_expert(copy_sql, reader, size=args.reader_bufsize)
             if not args.notwophase:
                 # print("preparing {}".format(gid))
                 conn.tpc_prepare()
@@ -194,7 +193,7 @@ def scatter_data(file_path, workers, nworkers, feedback_queue, args):
     buf = ""
     pos_copied = 0 # first char of buf not yet copied into row
     pos_approved = 0 # first char of buf not yet approved as part of current line
-    bufsize = 1 << 20
+    bufsize = args.scatter_bufsize
     need_data = False
     last_was_esc = False
     in_quote = False
@@ -312,6 +311,10 @@ Requires psycopg2 (though you probably already know it in since you are reading 
     parser.add_argument('-R', dest='report_each_rows', default=10000, type=int,
                         help='print progress each R rows')
     parser.add_argument('--direct-connstr', dest='direct_connstr', default=None, type=str,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--reader-bufsize', dest='reader_bufsize', default=8192, type=int,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--scatter-bufsize', dest='scatter_bufsize', default=8192, type=int,
                         help=argparse.SUPPRESS)
     parser.add_argument('-d', dest='delimiter', default=',', type=str,
                         help='delimiter')
