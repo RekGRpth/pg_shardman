@@ -206,6 +206,15 @@ def scatter_data(file_path, workers, nworkers, feedback_queue, args):
     print_progress = args.print_progress
     progress = Progress(args.report_each_rows) if args.print_progress else None
 
+
+    with open(file_path) as f:
+        for line in f:
+            send_row(row, workers[next_worker].parent_conn, feedback_queue, progress)
+            next_worker = (next_worker + 1) % nworkers
+    if progress:
+        progress.report()
+    return
+
     # All this stuff is here because csv allows to have CR and LF characters
     # literally in import file if they are quotted and I wanted to have some fun
     # parsing it. Otherwise we could just read and send rows line-by-line...
