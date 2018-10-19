@@ -2,7 +2,7 @@
 
 import argparse
 import psycopg2
-import csv
+import time
 from multiprocessing import Process, Pipe, Queue
 
 class WorkerState:
@@ -10,6 +10,7 @@ class WorkerState:
         self.worker_id = None
         self.node_id = None
         self.connstr = None
+        self.numnodes = None
         self.child_conn = None  # only for child
 
         self.parent_conn = None  # only for parent
@@ -72,26 +73,47 @@ class CompletedXact:
         self.gid = gid
         self.rowcount = rowcount
 
-def worker_main(ws, args):
-    ws.parent_conn.close()  # close parent fd
-    xact_count = 0
-    completed_xacts = []
+class ErrorMsg:
+    def __init__(self, worker_id, node_id, msg):
+        self.worker_id = worker_id
+        self.node_id = node_id
+        self.msg = msg
 
+def worker_main_internal(ws, args, completed_xacts):
+    xact_count = 0
     reader = Reader(ws.child_conn, args.max_rows_per_xact)
     with psycopg2.connect(ws.connstr) as conn:
+        with conn.cursor() as curs:
+            curs.execute("select system_identifier from pg_control_system()")
+            sysid = curs.fetchall()[0][0]
+        conn.commit()
         while not reader.eof:
             gid = ''
-            if args.twophase:
-                gid = "shmnloader_{}_{}_{}_{}".format(args.table_name,
-                                                               ws.worker_id,
-                                                               ws.node_id,
-                                                               xact_count)
+            if not args.notwophase:
+                # Try to respect shardman's gid format so recover_xacts can
+                # handle it.
+                # This actually won't work in most cases because we don't know
+                # xid (apparently thanks to XA spec) and number of participants,
+                # but it is easy to rollback/commit these xacts manually.
+                gid = "pgfdw:{}:{}:{}:{}:{}:{}_shmnloader_{}_{}_{}_{}".format(
+                    int(time.time()),
+                    sysid,
+                    0,  # procpid
+                    0,  # xid
+                    0,  # xact count
+                    nnodes,  # participants count, take all
+                    args.table_name,
+                    ws.worker_id,
+                    ws.node_id,
+                    xact_count)
                 conn.tpc_begin(gid)
             with conn.cursor() as curs:
                 copy_sql = "copy {} from stdin (format csv, delimiter '{}', quote '{}', escape '{}')".format(args.table_name, args.delimiter, args.quote, args.escape)
                 curs.copy_expert(copy_sql, reader, size=bufsize)
-            if args.twophase:
+            if not args.notwophase:
+                # print("preparing {}".format(gid))
                 conn.tpc_prepare()
+                conn.reset()  # allow to run further xacts without finishing prepared
             else:
                 conn.commit()
             completed_xact = CompletedXact(ws.worker_id, ws.node_id, gid, reader.rowcount)
@@ -99,11 +121,25 @@ def worker_main(ws, args):
             reader.reset_rowcount()
             # print("xact {} finished".format(xact_count))
             xact_count += 1
-    ws.child_conn.close()
-    # print("Process {} is done".format(ws.worker_id))
-    for completed_xact in completed_xacts:
-        ws.feedback_queue.put(completed_xact)
-    ws.feedback_queue.put('STOP')
+
+def worker_main(ws, args):
+    ws.parent_conn.close()  # close parent fd
+    completed_xacts = []
+    err_msg = None
+
+    try:
+        worker_main_internal(ws, args, completed_xacts)
+    except Exception as e:
+        err_msg = ErrorMsg(ws.worker_id, ws.node_id, str(e))
+    finally:
+        ws.child_conn.close()
+        # print("Process {} is done".format(ws.worker_id))
+        if err_msg is None:
+            for completed_xact in completed_xacts:
+                ws.feedback_queue.put(completed_xact)
+            ws.feedback_queue.put('STOP')
+        else:
+            ws.feedback_queue.put(err_msg)
 
 def scatter_data(file_path, workers, nworkers, quotec, escapec):
     row = ""
@@ -139,7 +175,7 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec):
                     if read_data == '':
                         eof = True
                 need_data = False
-                
+
             if eof and pos_approved == len(buf):
                 # eof and buffer processed
                 if row != "":
@@ -192,19 +228,24 @@ def scatter_data(file_path, workers, nworkers, quotec, escapec):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="""
-Dummy csv loader for shardman. Round-robins csv file row by row to a bunch of 
+Dummy csv loader for shardman. Round-robins csv file row by row to a bunch of
 workers; each worker round-robingly connects to some shardman node and performs
-COPY FROM. Max rows per transaction is configurably limited.
-Requires psycopg2.
+COPY FROM. Max rows per transaction is configurably limited. By default, 2PC
+is used; script will first prepare xacts everywhere, then inform you that
+everything is ok (or not) and then commit (abort) prepared xacts everywhere.
+All gids contain shmnloader_${table_name}.
+Requires psycopg2 (though you probably already know it in since you are reading this, ha).
 """,
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-p', dest='nworkers', default=1, type=int,
                         help='number of working processes')
     parser.add_argument('-x', dest='max_rows_per_xact', default=4096, type=int,
                         help='max rows per xact')
-    parser.add_argument('--no-twophase', dest='twophase', action='store_const',
-                        const=False, default=True,
-                        help='Don\'t use 2PC')
+    parser.add_argument('--no-twophase', dest='notwophase', action='store_const',
+                        const=True, default=False,
+                        help="""
+                        Don't employ 2PC which is used by default.
+                        """)
     parser.add_argument('-d', dest='delimiter', default=',', type=str,
                         help='delimiter')
     parser.add_argument('-q', dest='quote', default='"', type=str,
@@ -244,6 +285,7 @@ Requires psycopg2.
         ws.worker_id = i
         node_idx = i % (nnodes)
         ws.node_id, ws.connstr = (nodes[node_idx][0], nodes[node_idx][1])
+        ws.numnodes = nnodes
         ws.parent_conn, ws.child_conn = Pipe()
         ws.feedback_queue = feedback_queue
         ws.child_handle = Process(target=worker_main, args=(ws, args))
@@ -256,23 +298,49 @@ Requires psycopg2.
         workers[i].parent_conn.close()
 
     finished_workers = 0
-    workstat = [{'worker_id': i} for i in range(nworkers)]
+    workstat = [{'worker_id': i, 'numxacts': 0, 'rowcount': 0} for i in range(nworkers)]
+    error = False
     while finished_workers < nworkers:
         m = feedback_queue.get()
-        if type(m) is str and m == 'STOP':
+        if type(m) is str or isinstance(m, ErrorMsg):
+            if isinstance(m, ErrorMsg):
+                print("Worker {} attached to node {} failed with error {}".format(m.worker_id, m.node_id, m.msg))
+                error=True
+            else:
+                assert type(m) is str and m == 'STOP'
             finished_workers += 1
         else:
-            if 'numxacts' in workstat[m.worker_id]:
-                workstat[m.worker_id]['numxacts'] += 1
-            else:
-                workstat[m.worker_id]['numxacts'] = 1
-            if 'rowcount' in workstat[m.worker_id]:
-                workstat[m.worker_id]['rowcount'] += m.rowcount
-            else:
-                workstat[m.worker_id]['rowcount'] = m.rowcount
+            assert isinstance(m, CompletedXact)
+            workstat[m.worker_id]['numxacts'] += 1
+            workstat[m.worker_id]['rowcount'] += m.rowcount
 
     for i in range(nworkers):
         workers[i].child_handle.join()
 
     for i in range(nworkers):
         print("Worker {} completed {} xacts with total rowcount {}".format(i, workstat[i]['numxacts'], workstat[i]['rowcount']))
+
+    if args.notwophase:
+        if error:
+            print("Looks like some transactions have failed. Examine the logs.")
+        else:
+            print("All transactions completed successfully")
+        exit(0)
+
+    gid_contains = "shmnloader_{}".format(args.table_name)
+    if error:
+        print('Some transactions have failed. Attempting to rollback all prepared xacts containing "{}" in gid...'.format(gid_contains))
+    else:
+        print('All transactions successfully prepared. Proceeding to commit all prepared xacts containing "{}" in gid...'.format(gid_contains))
+
+    action = 'rollback' if error else 'commit'
+    for node in nodes:
+        connstr = node[1]
+        with psycopg2.connect(connstr) as conn:
+            conn.set_session(autocommit=True) # for commit/abort prepared
+            with conn.cursor() as curs:
+                curs.execute("select gid from pg_prepared_xacts where gid ~ '.*shmnloader_t.*'")
+                gids = [gidt[0] for gidt in curs.fetchall()]
+                for gid in gids:
+                    curs.execute("{} prepared '{}'".format(action, gid))
+    print("Done")
