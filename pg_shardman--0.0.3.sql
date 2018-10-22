@@ -107,6 +107,7 @@ DECLARE
 	sys_id bigint;
 	conn_string_effective text = COALESCE(conn_string, super_conn_string);
 	conn_string_effective_user text;
+	alter_seq text = '';
 BEGIN
 	IF NOT shardman.is_shardlord()
 	THEN
@@ -227,6 +228,8 @@ BEGIN
 			create_tables, new_node_id, t.create_sql);
 		create_partitions := format('%s%s:SELECT create_hash_partitions(%L,%L,%L);',
 			create_partitions, new_node_id, quote_ident(t.relation), t.sharding_key, t.partitions_count);
+		alter_seq := format('%s%s:SELECT shardman.configure_seq(%L, %s);',
+			alter_seq, new_node_id, t.relation, new_node_id);
 		SELECT shardman.reconstruct_table_attrs(quote_ident(t.relation)) INTO table_attrs;
 		FOR part IN SELECT * FROM shardman.partitions WHERE relation=t.relation
 	    LOOP
@@ -263,6 +266,7 @@ BEGIN
 	PERFORM shardman.broadcast(create_tables);
 	-- Broadcast create hash partitions command
 	PERFORM shardman.broadcast(create_partitions, iso_level => 'read committed');
+	PERFORM shardman.broadcast(alter_seq);
 	-- Broadcast create foreign table commands
 	PERFORM shardman.broadcast(create_fdws);
 	-- Broadcast replace hash partition commands
@@ -324,6 +328,19 @@ BEGIN
 		END;
 END
 $$ LANGUAGE plpgsql;
+
+-- Configure each sequence on this table so that values different nodes generate
+-- don't intersect.
+-- rel_name must be unquoted
+CREATE FUNCTION configure_seq(rel_name name, node_id int) RETURNS void AS $$
+DECLARE
+  max_nodes int = 142;  -- interval
+  seq_name name;
+BEGIN
+  FOR seq_name IN SELECT relname FROM pg_class c WHERE c.relkind = 'S' AND relname ~ ('^' || rel_name || '_.*_seq$') LOOP
+      EXECUTE format('ALTER SEQUENCE %I RESTART %s INCREMENT %s', seq_name, node_id, max_nodes);
+  END LOOP;
+END $$ LANGUAGE plpgsql;
 
 -- Remove node: try to choose alternative from one of replicas of this nodes,
 -- exclude node from replication channels and remove foreign servers.
@@ -579,6 +596,7 @@ DECLARE
 	replace_parts text = '';
 	i int;
 	n_nodes int;
+	alter_seq text = '';
 BEGIN
 	IF EXISTS(SELECT relation FROM shardman.tables WHERE relation = rel_name_unquoted)
 	THEN
@@ -605,12 +623,15 @@ BEGIN
 			create_tables, node.id, create_table);
 		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
 			create_partitions, node.id, rel_name, expr, part_count);
+		alter_seq := format('%s%s:SELECT shardman.configure_seq(%L, %s);',
+			alter_seq, node.id, rel_name_unquoted, node.id);
 	END LOOP;
 
 	-- Broadcast create table commands
 	PERFORM shardman.broadcast(create_tables);
 	-- Broadcast create hash partitions command
 	PERFORM shardman.broadcast(create_partitions, iso_level => 'read committed');
+	PERFORM shardman.broadcast(alter_seq);
 
 	-- Get list of nodes in random order
 	SELECT ARRAY(SELECT id from shardman.nodes ORDER BY random()) INTO node_ids;
@@ -1606,6 +1627,10 @@ BEGIN
 							'%s:SELECT create_hash_partitions(%L,%L,%L);',
 							src_node.id, quote_ident(t.relation), t.sharding_key, t.partitions_count),
 							iso_level => 'read committed');
+						PERFORM shardman.broadcast(format(
+							'%s:SELECT shardman.configure_seq(%L, %s);',
+							src_node.id, t.relation, src_node.id));
+
 					END IF;
 					RAISE NOTICE 'Replace % with % at node %',
 						part.part_name, fdw_part_name, src_node.id;
@@ -1634,6 +1659,10 @@ BEGIN
 							'%s:SELECT create_hash_partitions(%L, %L, %L);',
 							src_node.id, quote_ident(t.relation), t.sharding_key, t.partitions_count),
 							iso_level => 'read committed');
+						PERFORM shardman.broadcast(format(
+							'%s:SELECT shardman.configure_seq(%L, %s);',
+							src_node.id, t.relation, src_node.id));
+
 					ELSE
 						RAISE NOTICE 'Replace % with % at node %',
 							fdw_part_name, part.part_name, src_node.id;
