@@ -1016,13 +1016,13 @@ BEGIN
 	-- Loop through all nodes
 	FOR node_id IN SELECT * from shardman.nodes
 	LOOP
-		cmds := format('%s%s:%s;', cmds, node_id, sql);
+		cmds := format('%s{%s:%s;}', cmds, node_id, sql);
 	END LOOP;
 
 	-- Execute command also at shardlord
 	IF including_shardlord
 	THEN
-		cmds := format('%s0:%s;', cmds, sql);
+		cmds := format('%s{0:%s;}', cmds, sql);
 	END IF;
 
 	PERFORM shardman.broadcast(cmds, two_phase => use_2pc);
