@@ -1786,6 +1786,16 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- Make sure table is created on shardlord (probably it doesn't after failover)
+CREATE FUNCTION shardlord_ensure_table(rel_name name) RETURNS void AS $$
+DECLARE
+    create_table text;
+BEGIN
+    PERFORM shardman.broadcast(format('0:DROP TABLE IF EXISTS %I CASCADE;', rel_name));
+    SELECT create_sql FROM shardman.tables WHERE relation = rel_name INTO create_table;
+    PERFORM shardman.broadcast(format('{0:%s}', create_table));
+END
+$$ LANGUAGE plpgsql;
 
 -- Alter table at shardlord and all nodes
 CREATE FUNCTION alter_table(rel regclass, alter_clause text) RETURNS void AS $$
@@ -1830,6 +1840,81 @@ BEGIN
 			   alters, repl.node_id, repl.part_name, alter_clause);
 	END LOOP;
 	PERFORM shardman.broadcast(alters);
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION create_index(create_clause text, idx_name name, rel_name name,
+                             index_clause text) RETURNS void AS $$
+DECLARE
+    repl shardman.replicas;
+    part shardman.partitions;
+    alters text = '';
+    create_table text;
+BEGIN
+    IF shardman.redirect_to_shardlord(format('create_index(%L,%L,%L)', create_clause, rel_name, index_clause))
+    THEN
+	RETURN;
+    END IF;
+
+    PERFORM shardman.shardlord_ensure_table(rel_name);
+    -- Alter root table everywhere
+    PERFORM shardman.forall(format('%s %I ON %I %s', create_clause, idx_name, rel_name,
+                                   index_clause),
+                                   including_shardlord=>true);
+    SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
+    UPDATE shardman.tables SET create_sql=create_table WHERE relation=rel_name;
+
+    -- Create index on all partitions and replicas with appropriate name
+    FOR part IN SELECT * FROM shardman.partitions LOOP
+	alters := format('%s%s:%s %I ON %I %s;',
+			 alters, part.node_id,
+                         create_clause, part.part_name || '_' || idx_name, part.part_name,
+                         index_clause);
+    END LOOP;
+    FOR repl IN SELECT * FROM shardman.replicas
+	LOOP
+	alters := format('%s%s:%s %I ON %I %s;',
+			 alters, repl.node_id,
+                         create_clause, repl.part_name || '_' || idx_name, repl.part_name,
+                         index_clause);
+    END LOOP;
+    PERFORM shardman.broadcast(alters);
+END
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION drop_index(idx_name name) RETURNS void AS $$
+DECLARE
+    repl shardman.replicas;
+    alters text = '';
+    create_table text;
+    rel_name name;
+BEGIN
+    IF shardman.redirect_to_shardlord(format('drop_index(%L)', idx_name))
+    THEN
+	RETURN;
+    END IF;
+
+    -- Find out relation
+    FOR rel_name IN SELECT relation FROM shardman.tables LOOP
+        PERFORM shardman.shardlord_ensure_table(rel_name);
+    END LOOP;
+    rel_name := shardman.broadcast(format('0:SELECT indrelid::regclass::name
+                                          FROM pg_index WHERE indexrelid::regclass::name = %L;',
+                                   idx_name));
+    -- Alter root table everywhere
+    PERFORM shardman.forall(format('DROP INDEX %I', idx_name),
+                                   including_shardlord=>true);
+    SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
+    UPDATE shardman.tables SET create_sql=create_table WHERE relation=rel_name;
+
+    -- Drop index on all replicas
+    FOR repl IN SELECT * FROM shardman.replicas
+	LOOP
+	alters := format('%s%s:DROP INDEX %I;',
+			 alters, repl.node_id,
+                         repl.part_name || '_' || idx_name, repl.part_name);
+    END LOOP;
+    PERFORM shardman.broadcast(alters);
 END
 $$ LANGUAGE plpgsql;
 

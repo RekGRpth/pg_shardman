@@ -327,18 +327,26 @@ destination node; for replica it is also necessary to specify the source node.
 
 ### DDL
 DDL support is very limited. Function `shardman.alter_table(relation regclass,
-alter_clause text)` alters root table at all nodes and updates its definition in
-metadata; it can be used for column addition, removal and renaming. However,
-changing column used as sharding key is not supported. NOT NULL constraint can
-also be created using this function. Foreign keys pointing to sharded tables are
-not supported. Though it is possible to create UNIQUE constraint, it will be
+alter_clause text)` alters root table and replicas at all nodes and updates table definition in
+metadata; it can be used for column addition, removal, renaming, type changing. However,
+changing column used as sharding key is not supported. NOT NULL and CHECK constraint can
+also be created using this function. This doesn't manage primary keys and unique
+constraints. Foreign keys from/to sharded tables are
+not supported. Though it is possible to create (manually) UNIQUE constraint, it will be
 enforced only on per-partition basis. Indexes which were created on table before
 sharding it will be included in table definiton and created on partitions and
-replicas too. `shardman.forall(sql text, use_2pc bool DEFAULT false,
-including_shardlord>bool DEFAULT false)` executes SQL statement on all nodes; it
-can be used to create indexes later. For that it is necessary to create an index
-on each partition separately, like described in [pg_pathman wiki](https://github.com/postgrespro/pg_pathman/wiki/How-do-I-create-indexes).
+replicas too.
 
+To create indexes later, use `shardman.create_index(create_clause text, idx_name
+name, rel_name name, index_clause text)` with args forming complete `CREATE INDEX`
+statement (except `ON`), e.g.
+`select shardman.create_index('create index if not exists', 'branchness_idx',"
+                " 'horns', 'using btree (branchness)')`.
+To drop index, use `shardman.drop_index(idx_name name)` like
+`select shardman.drop_index('branchness_idx');`
+
+Function `shardman.forall(sql text, use_2pc bool DEFAULT false,
+including_shardlord>bool DEFAULT false)` executes a bit of SQL on all nodes.
 ### Failover and Recovery
 
 #### Worker failover
