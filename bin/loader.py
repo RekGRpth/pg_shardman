@@ -203,9 +203,6 @@ def scatter_data(file_path, workers, nworkers, feedback_queue, args):
     file_path = args.file_path
     quotec = args.quote
     escapec = args.escape
-    print_progress = args.print_progress
-    progress = Progress(args.report_each_rows) if args.print_progress else None
-
 
     with open(file_path) as f:
         try:
