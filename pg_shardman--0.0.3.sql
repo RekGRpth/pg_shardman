@@ -1141,7 +1141,7 @@ BEGIN
 		    subs := format('%s%s:CREATE SUBSCRIPTION share_%s_%s CONNECTION %L PUBLICATION shared_tables WITH (copy_data=false, synchronous_commit=local);',
 				 subs, node.id, node.id, master_node_id, conn_string);
 		ELSE
-			subs := format('%s%s:ALTER SUBSCRIPTION share_%s_%s REFRESH PUBLICATIONS WITH (copy_data=false);',
+			subs := format('%s%s:ALTER SUBSCRIPTION share_%s_%s REFRESH PUBLICATION WITH (copy_data=false);',
 				 subs, node.id, node.id, master_node_id);
 		END IF;
 		fdws := format('%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
@@ -2108,16 +2108,27 @@ CREATE FUNCTION gen_create_rules_sql(rel_name text, fdw_name text) RETURNS text 
 DECLARE
 	pk text;
 	dst text;
+	dst_for_update text;
 	src text;
+	natts int;
 BEGIN
 	-- Construct list of attributes of the table for update/insert
-	SELECT INTO dst, src
+	SELECT INTO dst, src, natts
           string_agg(quote_ident(attname), ', '),
-		  string_agg('NEW.' || quote_ident(attname), ', ')
+          string_agg('NEW.' || quote_ident(attname), ', '),
+	  count(*)
     FROM   pg_attribute
     WHERE  attrelid = quote_ident(rel_name)::regclass
     AND    NOT attisdropped   -- no dropped (dead) columns
     AND    attnum > 0;
+
+    -- avoid ERROR: source for a multiple-column UPDATE item must be a
+    -- sub-SELECT or ROW() expression: wrap in () only if more than one column
+    IF natts > 1 THEN
+      dst_for_update := '(' || dst || ')';
+    ELSE
+      dst_for_update := dst;
+    END IF;
 
 	-- Construct primary key condition for update
 	SELECT INTO pk
@@ -2128,10 +2139,10 @@ BEGIN
     WHERE  i.indrelid = quote_ident(rel_name)::regclass
     AND    i.indisprimary;
 
-	RETURN format('CREATE OR REPLACE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET (%s) = (%s) WHERE %s;
+	RETURN format('CREATE OR REPLACE RULE on_update AS ON UPDATE TO %I DO INSTEAD UPDATE %I SET %s = (%s) WHERE %s;
 		           CREATE OR REPLACE RULE on_insert AS ON INSERT TO %I DO INSTEAD INSERT INTO %I (%s) VALUES (%s);
 		           CREATE OR REPLACE RULE on_delete AS ON DELETE TO %I DO INSTEAD DELETE FROM %I WHERE %s;',
-        rel_name, fdw_name, dst, src, pk,
+        rel_name, fdw_name, dst_for_update, src, pk,
 		rel_name, fdw_name, dst, src,
 		rel_name, fdw_name, pk);
 END
