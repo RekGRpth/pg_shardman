@@ -7,6 +7,7 @@ import datetime
 import traceback
 from multiprocessing import Process, Pipe, Queue
 import queue
+import sys
 
 class WorkerState:
     def __init__(self):
@@ -204,17 +205,22 @@ def scatter_data(file_path, workers, nworkers, feedback_queue, args):
     quotec = args.quote
     escapec = args.escape
 
-    with open(file_path) as f:
-        try:
-            for line in f:
-                workers[next_worker].parent_conn.send(line)
-                next_worker = (next_worker + 1) % nworkers
-        except Exception as e:
-            # something wrong; probably worker died and closed the pipe?
-            m = feedback_queue.get(block=True)
-            assert isinstance(m, ErrorMsg)
-            print("sending row failed with {} {}".format(str(e), traceback.format_exc()))
-            raise WorkerError(m)
+    if args.file_path is not None:
+        f = open(file_path)
+    else:
+        f = sys.stdin
+    try:
+        for line in f:
+            workers[next_worker].parent_conn.send(line)
+            next_worker = (next_worker + 1) % nworkers
+    except Exception as e:
+        # something wrong; probably worker died and closed the pipe?
+        m = feedback_queue.get(block=True)
+        assert isinstance(m, ErrorMsg)
+        print("sending row failed with {} {}".format(str(e), traceback.format_exc()))
+        raise WorkerError(m)
+    if args.file_path is not None:
+        f.close()
     return
 
     # All this stuff is here because csv allows to have CR and LF characters
@@ -328,13 +334,12 @@ Requires psycopg2 (though you probably already know it in since you are reading 
                         help='quote')
     parser.add_argument('-e', dest='escape', default='"', type=str,
                         help='escape')
+    parser.add_argument('--file-path', dest='file_path', default=None, type=str,
+                        help='CSV file path. If not provided, data is read from stdin.')
     parser.add_argument('lord_connstring', metavar='lord_connstring', type=str,
                         help='shardlord connstring')
     parser.add_argument('table_name', metavar='table_name', type=str,
                         help='Table name, must be quotted if needed')
-    parser.add_argument('file_path', metavar='file_path', type=str,
-                        help='csv file path')
-
 
     args = parser.parse_args()
     workers = []
