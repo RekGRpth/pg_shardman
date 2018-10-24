@@ -147,6 +147,8 @@ in 2PC. For that, set `logical_replication_2pc=shardman`.
 The notorious shortcoming of 2PC is that it is a blocking protocol: if the
 coordinator of transaction T has failed, T might hang in PREPAREd state on some
 nodes until the coordinator either returns or is excluded from the cluster.
+Manual intervention is required in this case; see function
+`shardman.recover_xacts()`.
 
 Similarly, if transactions affect only single nodes, plain PostgreSQL isolation
 rules are applicable. However, for distributed transactions we need distributed
@@ -351,15 +353,21 @@ including_shardlord>bool DEFAULT false)` executes a bit of SQL on all nodes.
 
 #### Worker failover
 
-`pg_shardman` doesn't support presently automatic failure detection and recovery. It
-has to be done manually by the DBA. If some node is down, its data is not
-available until either node rises or it is ruled out from the cluster by
-`rm_node` command. Moreover, if failed node holds replicas and sync replication
-is used, queries touching replicated partitions would block. When failed node is
-reestablished, data on it becomes reachable again and the node receives missed
-changes for holded replicas automatically. However, you should run
-`recover_xacts` (or `monitor`) functions to resolve possibly hanged distributed
-PREPAREd transactions, if 2PC is used.
+`pg_shardman` doesn't support presently automatic failure detection and
+recovery. It has to be done manually by the DBA. If some node is down, its data
+is not available until either node rises or it is ruled out from the cluster by
+`rm_node` command. This means any attempts to query data on it will result in
+ERROR. Existing transactions will be aborted while trying to commit or
+earlier. If 2PC is used and a participant has failed when transaction was
+already PREPAREd on some nodes, it is possible that prepared transactions will
+hang until manual intervention, see below. Moreover, if failed node holds
+replicas and sync replication is used, transactions touching replicated partitions
+will block. They will be released when node rises again or excluded from the
+cluster with `rm_node()`.
+When failed node is reestablished, data on it becomes reachable
+again and the node receives missed changes for holded replicas
+automatically. However, you should run `recover_xacts` (or `monitor`) functions
+to resolve possibly hanged distributed PREPAREd transactions, if 2PC is used.
 
 If failure is permanent and the node never intends to be up again, it should be
 excluded from the cluster with `rm_node` command. This function also promotes
