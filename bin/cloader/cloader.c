@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <libpq-fe.h>
 
@@ -28,6 +29,8 @@ typedef struct LoaderOptions
 	char quotec;
 	char escapec;
 	char *direct_connstr;
+	bool print_progress;
+	int report_every_rows;
 } LoaderOptions;
 static LoaderOptions lopt;
 
@@ -211,6 +214,30 @@ prepare_connections(LoaderState *lstate)
 	}
 }
 
+static void
+report_progress(int total_rows, int total_xacts, time_t starttm)
+{
+	time_t curtm;
+	long diffsec;
+	char humandiff[128];
+	long hours, minutes, seconds;
+
+	time(&curtm);
+	diffsec = (long) difftime(curtm, starttm);
+	hours = diffsec / 3600;
+	minutes = diffsec / 60;
+	seconds = diffsec % 60;
+	if (hours != 0)
+		snprintf(humandiff, sizeof(humandiff), "%ldh %ldm %lds", hours, minutes, seconds);
+	else if (minutes != 0)
+		snprintf(humandiff, sizeof(humandiff), "%ldm %lds", minutes, seconds);
+	else
+		snprintf(humandiff, sizeof(humandiff), "%lds", seconds);
+
+	printf("%d rows sent, %d xacts performed, %s elapsed\n",
+		   total_rows, total_xacts, humandiff);
+}
+
 /* returns true if ok, false otherwise */
 static int
 do_copy(LoaderState *lstate)
@@ -228,14 +255,20 @@ do_copy(LoaderState *lstate)
 	int total_xacts = 0;
 	int i;
 	bool fin_ok = true;
+	time_t starttm;
 
-	stream = fopen(lopt.file_path, "r");
+	if (lopt.file_path != NULL)
+		stream = fopen(lopt.file_path, "r");
+	else
+		stream = stdin;
 	if (stream == NULL)
 	{
 		perror("Failed to open CSV file");
 		cleanup_and_exit(lstate);
 	}
 
+	time(&starttm);
+	/* Doesn't work with CR/LF in data or not-CR line endings */
 	while ((linelen = getline(&line, &readbufallocated, stream)) != -1)
 	{
 		ConnState *conn_state = &lstate->conns[cs_idx];
@@ -250,10 +283,12 @@ do_copy(LoaderState *lstate)
 
 		conn_state->row_count++;
 		conn_state->total_row_count++;
+		total_rows++;
 		if (conn_state->row_count >= lopt.rows_per_xact)
 		{
 			/* Time to switch xact */
 			conn_state->xact_count++;
+			total_xacts++;
 			conn_state->row_count = 0;
 			if (PQputCopyEnd(conn_state->conn, NULL) <= 0)
 			{
@@ -330,10 +365,13 @@ do_copy(LoaderState *lstate)
 		}
 
 		cs_idx = (cs_idx + 1) % lopt.nconn;
+		if (lopt.print_progress && total_rows % lopt.report_every_rows == 0)
+			report_progress(total_rows, total_xacts, starttm);
 	}
 
 	free(line);
-	fclose(stream);
+	if (lopt.file_path != NULL)
+		fclose(stream);
 
 	/* The last xact */
 	if (ok)
@@ -343,6 +381,7 @@ do_copy(LoaderState *lstate)
 			ConnState *conn_state = &lstate->conns[i];
 
 			conn_state->xact_count++;
+			total_xacts++;
 			if (PQputCopyEnd(conn_state->conn, NULL) <= 0)
 			{
 				fprintf(stderr, "PQputCopyEnd failed: %s",
@@ -409,10 +448,10 @@ do_copy(LoaderState *lstate)
 
 		PQfinish(conn_state->conn);
 		conn_state->conn = NULL;
-		total_xacts += conn_state->xact_count;
-		total_rows += conn_state->total_row_count;
 	}
 
+	if (lopt.print_progress)
+		report_progress(total_rows, total_xacts, starttm);
 	if (lopt.no_twophase)
 	{
 		if (ok)
@@ -434,6 +473,7 @@ do_copy(LoaderState *lstate)
 		printf("Some errors occured. Trying to rollback all xacts containing \"shmn_loader_%s\" in gid...\n", lopt.table_name, total_xacts, total_rows);
 
 	snprintf(sql, SQLSIZE, "select gid from pg_prepared_xacts where gid ~ '.*shmnloader_%s.*'", lopt.table_name);
+	/* Doesn't work with direct connstr */
 	for (i = 0; i < lstate->numnodes; i++)
 	{
 		PGconn *conn;
@@ -442,6 +482,7 @@ do_copy(LoaderState *lstate)
 		Node *node = &lstate->nodes[i];
 		int j;
 		char sqlfin[SQLSIZE];
+		int node_id;
 
 		conn = PQconnectdb(node->connstr);
 		if (PQstatus(conn) != CONNECTION_OK)
@@ -493,7 +534,7 @@ static void
 usage(const char *progname)
 {
 	printf("%s Dummy loader for shardman\n\n", progname);
-	printf("Usage:\n  %s [OPTION]... <lord_connstring> <table_name> <file_path>\n\n", progname);
+	printf("Usage:\n  %s [OPTION]... <lord_connstring> <table_name> \n\n", progname);
 	printf("Options:\n");
 	printf("  -c, --num-conn=NUM       number of connections, default 1\n");
 	printf("  -r, --rows-per-xact=NUM  rows per xact, default 4095\n");
@@ -501,6 +542,9 @@ usage(const char *progname)
 	printf("  -d, --delimiter=DELIM    delimiter, default ','\n");
 	printf("  -q, --quote=QUOTE        quote, default '\"'\n");
 	printf("  -e, --escape=ESC         escape, default '\"'\n");
+	printf("  -P, --print-progress	   print progress);\n");
+	printf("  --report-every-rows=NUM  print progress every NUM rows, default 10000);\n");
+	printf("  -f, --file-path=FILEPATH path to CSV file; if not given, read from stdin.\n");
 	printf("  -?, --help               show this help, then exit\n");
 }
 
@@ -519,8 +563,11 @@ int main(int argc, char **argv)
 		{"delimiter", required_argument, NULL, 'd'},
 		{"quote", required_argument, NULL, 'q'},
 		{"escape", required_argument, NULL, 'e'},
+		{"print-progress", no_argument, NULL, 'P'},
+		{"report-every-rows", required_argument, NULL, 2},
+		{"file-path", required_argument, NULL, 'f'},
 		/* hidden opts */
-		{"direct-connstr", required_argument, NULL, 2},
+		{"direct-connstr", required_argument, NULL, 3},
 		{NULL, 0, NULL, 0} /* the last element must be zeros */
 	};
 
@@ -532,10 +579,13 @@ int main(int argc, char **argv)
 	lopt.delimiterc = ',';
 	lopt.quotec = '"';
 	lopt.escapec = '"';
+	lopt.print_progress = false;
+	lopt.report_every_rows = 10000;
+	lopt.file_path = NULL;
 
 	optind = 1;
 	/* : after opt means it has argument */
-	while ((c = getopt_long(argc, argv, "hc:r:d:q:e:", long_options, NULL)) != -1)
+	while ((c = getopt_long(argc, argv, "hc:r:d:q:e:Pf:", long_options, NULL)) != -1)
 	{
 		switch (c)
 		{
@@ -561,6 +611,12 @@ int main(int argc, char **argv)
 			case 'e':
 				lopt.escapec = optarg[0];
 				break;
+			case 'P':
+				lopt.print_progress = true;
+				break;
+			case 'f':
+				lopt.file_path = optarg;
+				break;
 
 			case 0:
 				/* This covers long options without short form, saved directly */
@@ -568,6 +624,9 @@ int main(int argc, char **argv)
 
 			/* options without short form not saved directly */
 			case 2:
+				lopt.report_every_rows = atoi(optarg);
+				break;
+			case 3:
 				lopt.direct_connstr = optarg;
 				break;
 
@@ -578,16 +637,14 @@ int main(int argc, char **argv)
 		}
 	}
 
-
 	/* Positional args */
-	if (argc - optind < 3)
+	if (argc - optind < 2)
 	{
 		fprintf(stderr, "Not enough positional arguments. Try \"%s --help\" for more information.\n", argv[0]);
 		exit(1);
 	}
 	lopt.lord_connstring = argv[optind++];
 	lopt.table_name = argv[optind++];
-	lopt.file_path = argv[optind++];
 
 	memset(&lstate, 0, sizeof(LoaderState));
 	learn_nodes_and_table(&lstate);
