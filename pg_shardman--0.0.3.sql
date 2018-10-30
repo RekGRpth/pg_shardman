@@ -3,7 +3,7 @@
  * pg_shardman.sql
  *   Sharding and replication using pg_pathman, postgres_fdw and logical replication
  *
- * Copyright (c) 2017, Postgres Professional
+ * Copyright (c) 2017-2018, Postgres Professional
  *
  * ------------------------------------------------------------------------
  */
