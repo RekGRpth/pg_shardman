@@ -12,3 +12,8 @@
       zone: "{{ zone }}"
       wait: yes
       assign_public_ip: yes
+      volumes:
+      - device_name: /dev/sdh
+        volume_size: 20
+        # volume_type: st1
+        iops: 1000g

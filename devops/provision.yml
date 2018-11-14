@@ -18,6 +18,23 @@
   - shell: /bin/true
     register: tags_not_specified
 
+  # format and mount additional volume, if needed
+  - name: format volume
+    filesystem:
+      fstype: ext4
+      dev: /dev/nvme1n1
+    become: yes
+    when: ec2 and volume
+
+  - name: mount volume
+    mount:
+      path: /mnt/
+      src: /dev/nvme1n1
+      fstype: ext4
+      state: mounted
+    become: yes
+    when: ec2 and volume
+
   - name: set Moscow timezone
     timezone:
       name: Europe/Moscow
@@ -64,6 +81,7 @@
     - libreadline-dev
     - zlib1g-dev
     - gdb
+    - sysstat
     - libevent-dev # for pgbouncer
     when: ansible_os_family == "Debian" and ec2
     become: yes

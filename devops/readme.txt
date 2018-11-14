@@ -43,7 +43,7 @@ Now you are ready to go.
 Short usage guide & Ansible cheatsheet:
 
 Build only PG on ec2:
-ansible-playbook -i inventory_ec2 --tags "build_pg"
+ansible-playbook -i inventory_ec2 provision.yml --tags "build_pg"
 Same on hardcoded nodes:
 ansible-playbook -i inventory_manual --tags "build_pg"
 Provision only the second node:
@@ -74,8 +74,10 @@ ansible-playbook -i inventory_ec2/ logs.yml
 tester.py attempts to automate this stuff, e.g.
 nohup ./tester.py tester_conf.json > tester.log 2>&1 &
 
-Start micro instances:
-ansible-playbook -i inventory_ec2/ ec2.yml --tags "micro" -e "count=2"
+Start instances:
+ansible-playbook -i inventory_ec2/ ec2.yml --tags "launch" -e "count=4 instance_type=c5.large"
+Check out volume options in ec2.yml and don't forget to remove them afterwards
+-- terminate doesn't destroy them.
 Terminate all ec2 instances:
 ansible-playbook -i inventory_ec2/ ec2.yml --tags "terminate"
 

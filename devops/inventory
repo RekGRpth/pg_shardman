@@ -32,8 +32,9 @@ pg_prefix="/tmp/pg"
 pg_src="{{pg_prefix}}/src"
 cflags="-O2"
 pg_dst="{{pg_prefix}}/install"
-pg_datadir="{{pg_prefix}}/data_{{pg_port}}"
+# pg_datadir="{{pg_prefix}}/data_{{pg_port}}"
 # pg_datadir="/mnt/data_{{pg_port}}"
+pg_datadir="/mnt/data_{{pg_port}}"
 pg_logfile="{{pg_datadir}}/pg.log"
 pg_conffile="{{pg_datadir}}/postgresql.conf"
 pg_port=5432
@@ -67,6 +68,8 @@ fg_path="{{ ansible_env.HOME }}/FlameGraph"
 
 test_id=""
 logs=logs
+
+volume = True
 
 [nodes:children]
 ec2
