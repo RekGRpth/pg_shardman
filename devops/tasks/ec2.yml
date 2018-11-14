@@ -16,4 +16,5 @@
       - device_name: /dev/sdh
         volume_size: 20
         # volume_type: st1
-        iops: 1000g
+        volume_type: io1
+        iops: 1000
