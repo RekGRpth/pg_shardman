@@ -1,0 +1,31 @@
+### Configure standalone pg with worker's conf
+
+---
+
+- hosts: shardlord
+  vars:
+    standalone_port: 5434
+    standalone_datadir: "/mnt/standalone"
+    standalone_log: "/mnt/standalone/postgresql.log"
+
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+
+  tasks:
+  - file: path={{ standalone_datadir }} state=absent
+  - name: create datadir
+    command: "initdb {{ standalone_datadir }}"
+
+  - name: copy postgresql.conf
+    template:
+      src=templates/postgresql.conf.worker.j2
+      dest="{{ standalone_datadir }}/postgresql.conf"
+
+  - name: pg_ctl start -l {{ standalone_log }}  -D {{standalone_datadir}}
+    command: "{{pg_dst}}/bin/pg_ctl start -D {{standalone_datadir}} -l {{ standalone_log }} -o '-p {{ standalone_port }}'"
+
+  - name: create whoami database
+    command: createdb -p {{ standalone_port }} {{ ansible_user }}
