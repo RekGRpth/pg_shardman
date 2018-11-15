@@ -1,0 +1,45 @@
+---
+
+- hosts: workers
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ fg_path }}:{{ ansible_env.PATH }}"
+  vars:
+    pgbench_opts: "-f /home/ubuntu/query_1_1.sql -T 10 -c 8"
+    test_id: query_1_1
+
+  tasks:
+  - name: vacuum analyze
+    command: >
+      psql -p {{ pg_port }} -U {{ ansible_user }} -c "VACUUM ANALYZE;"
+
+  - name: copy query script
+    synchronize:
+      src: /d/Yandex.Disk/work/postgrespro/fns/query_1_1.sql
+      dest: /home/ubuntu
+
+  - name: run pgbench -p {{ pg_port }} --report-latencies --no-vacuum {{ pgbench_opts }}
+    shell: >
+      pgbench -p {{ ( use_pgbouncer | bool ) | ternary(pgbouncer_port, pg_port) }} --report-latencies --no-vacuum
+      {{ pgbench_opts }} 2>&1 > "{{ test_id }}.out"
+
+  - name: clear log dir
+    local_action: file path="res/{{ test_id }}/" state=absent
+    run_once: true
+
+  - name: fetch pgbench exec times
+    fetch:
+      src: "query_1_1.out"
+      dest: res/{{ test_id }}/pgbench/{{ inventory_hostname }}.out
+      flat: yes
+
+  - name: grep tps
+    local_action: >
+      shell grep -h -R "tps.*including" res/{{ test_id }}/pgbench/ |
+      awk '{print $3}' > res/{{ test_id }}/tps.txt
+    run_once: true
+
+  - name: calc sum tps
+    local_action: >
+      shell echo -e "sum: \n`awk '{ sum += $1 } END { print sum }'
+      res/{{ test_id }}/tps.txt`" >> res/{{test_id}}/tps.txt
+    run_once: true

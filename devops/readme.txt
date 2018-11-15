@@ -76,8 +76,7 @@ nohup ./tester.py tester_conf.json > tester.log 2>&1 &
 
 Start instances:
 ansible-playbook -i inventory_ec2/ ec2.yml --tags "launch" -e "count=4 instance_type=c5.large"
-Check out volume options in ec2.yml and don't forget to remove them afterwards
--- terminate doesn't destroy them.
+Check out volume options in ec2.yml.
 Terminate all ec2 instances:
 ansible-playbook -i inventory_ec2/ ec2.yml --tags "terminate"
 

@@ -1,0 +1,35 @@
+---
+
+- hosts: shardlord
+  vars:
+    cloader_path: "{{ shardman_src }}/bin/cloader"
+
+  environment:
+    PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
+    LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+    CPATH: "{{ ansible_env.HOME }}/root/include"
+    LD_LIBRARY_PATH: "{{ ansible_env.HOME }}/root/lib"
+
+  tasks:
+  - name: copy raw data
+    synchronize:
+      src: /d/fnsdata/01_NBO_FORMA2.txt
+      dest: /mnt/
+
+  - name: copy ddl
+    synchronize:
+      src: /d/Yandex.Disk/work/postgrespro/fns/ddl_bit.sql
+      dest: /home/ubuntu
+
+  - name: exec ddl
+    command: psql -p {{ pg_port }} -f "/home/ubuntu/ddl_bit.sql"
+
+  - name: shard table
+    command: psql -p {{ pg_port }} -c "select shardman.create_hash_partitions('gnivcexport_nbo_forma2', 'id_taxpayer', {{ groups.ec2_workers | length }});"
+
+  - name: build cloader
+    command: make -C "{{ cloader_path }}"
+
+  - name: import data
+    command: >
+      "{{ cloader_path }}/cloader" --no-twophase -P --report-every-rows 100000 -r 1000000 -c "{{ (groups.ec2_workers | length) * 2 }}" -f /mnt/01_NBO_FORMA2.txt --delimiter '|' "port=5432" gnivcexport_nbo_forma2

@@ -4,6 +4,9 @@
 - hosts: nodes
   vars:
     ars_conf: "{{ ansible_env.HOME }}/ars_conf"
+    # volume path is /dev/xvdh on c4 instances and /dev/nvme1n1 on c5 ones, wow
+    volume_path: "/dev/xvdh"
+    # volume_path: "/dev/nvme1n1"
 
   environment:
     PATH: "{{ pg_dst }}/bin:{{ ansible_env.HOME }}/root/bin:{{ ansible_env.PATH }}"
@@ -22,14 +25,14 @@
   - name: format volume
     filesystem:
       fstype: ext4
-      dev: /dev/nvme1n1
+      dev: "{{ volume_path }}"
     become: yes
     when: ec2 and volume
 
   - name: mount volume
     mount:
       path: /mnt/
-      src: /dev/nvme1n1
+      src: "{{ volume_path }}"
       fstype: ext4
       state: mounted
     become: yes

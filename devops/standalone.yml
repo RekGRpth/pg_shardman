@@ -29,3 +29,25 @@
 
   - name: create whoami database
     command: createdb -p {{ standalone_port }} {{ ansible_user }}
+
+# now fns stuff
+  - name: copy raw data
+    synchronize:
+      src: /d/fnsdata/01_NBO_FORMA2.txt
+      dest: /mnt/
+
+  - name: copy ddl
+    synchronize:
+      src: /d/Yandex.Disk/work/postgrespro/fns/ddl_bit.sql
+      dest: /home/ubuntu
+
+  - name: exec ddl
+    command: psql -p {{ standalone_port }} -f "/home/ubuntu/ddl_bit.sql"
+
+  - name: import data
+    command: psql -p {{ standalone_port }} -c "copy gnivcexport_nbo_forma2 from '/mnt/01_NBO_FORMA2.txt' (format csv, delimiter '|');"
+
+  - name: copy query script
+    synchronize:
+      src: /d/Yandex.Disk/work/postgrespro/fns/query_1_1.sql
+      dest: /home/ubuntu

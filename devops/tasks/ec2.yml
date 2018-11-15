@@ -18,3 +18,4 @@
         # volume_type: st1
         volume_type: io1
         iops: 1000
+        delete_on_termination: true
